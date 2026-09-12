@@ -1,0 +1,65 @@
+[project]
+name = "capsizer"
+version = "0.1.0"
+description = "Open-loop load generator & container capacity sizing tool for Python/FastAPI and AI streaming services"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Capsizer Contributors" }
+]
+keywords = [
+    "performance",
+    "load-testing",
+    "open-loop",
+    "capacity-planning",
+    "capacity-sizing",
+    "cgroup",
+    "fastapi",
+    "uvicorn",
+    "sse-streaming",
+    "kubernetes"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Topic :: Software Development :: Testing :: Traffic Generation",
+    "Topic :: System :: Benchmark",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "httpx>=0.24.0",
+    "pyjwt>=2.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+capsizer-ramp = "ramp:main"
+capsizer-probe = "probe:main"
+capsizer-report = "report:main"
+ramp = "ramp:main"
+probe = "probe:main"
+report = "report:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scenarios"]
+extra-files = ["ramp.py", "probe.py", "report.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

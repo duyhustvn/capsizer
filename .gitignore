@@ -1,0 +1,33 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test data & logs (chứa log chạy thực tế, token, kết quả đo)
+*.jsonl
+*.csv
+/tmp/
+
+# Environment variables & secrets
+.env
+.env.*
+*secret*
+*.pem
+*.key
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDEs & OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
