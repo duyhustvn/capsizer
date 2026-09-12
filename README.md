@@ -24,7 +24,7 @@ Bộ công cụ giúp trả lời các câu hỏi cốt lõi về mặt kỹ thu
   - [report.py - Phân tích dữ liệu & Lập báo cáo](#reportpy---phân-tích-dữ-liệu--lập-báo-cáo)
 - [6. Kịch bản thực tế mẫu (End-to-End Walkthrough)](#6-kịch-bản-thực-tế-mẫu-end-to-end-walkthrough)
 - [7. Các lưu ý kỹ thuật quan trọng (Best Practices)](#7-các-lưu-ý-kỹ-thuật-quan-trọng-best-practices)
-- [8. So sánh ramp.py với Grafana k6](#8-so-sánh-ramppy-với-grafana-k6)
+- [8. Capsizer khác gì các bài kiểm thử hiệu năng truyền thống?](#8-capsizer-khác-gì-các-bài-kiểm-thử-hiệu-năng-truyền-thống)
 
 ---
 
@@ -36,15 +36,15 @@ Bộ công cụ giúp trả lời các câu hỏi cốt lõi về mặt kỹ thu
 
 ```mermaid
 flowchart TD
-    subgraph GeneratorHost["MÁY PHÁT TẢI (External Test Runner / VM / Laptop)"]
+    subgraph GeneratorHost["MÁY PHÁT TẢI - External Test Runner"]
         Ramp["ramp.py (Open-Loop Load Generator)"]
-        UserCSV[("token_pool.csv / UserPool")]
+        UserCSV[("users.csv / UserPool")]
         RampOut[("loadtest-ramp.jsonl")]
         Ramp -->|Đọc User/Token| UserCSV
         Ramp -->|Ghi kết quả request| RampOut
     end
 
-    subgraph K8sNode["KUBERNETES NODE / SERVER MỤC TIÊU"]
+    subgraph K8sNode["MÁY CHỦ MỤC TIÊU - Kubernetes Node"]
         subgraph TargetPod["TARGET POD / CONTAINER"]
             Uvicorn["FastAPI / Uvicorn (App Server)"]
             Probe["probe.py (Daemon lấy mẫu cgroup/TCP)"]
@@ -52,20 +52,20 @@ flowchart TD
             
             Probe -->|Ghi snapshot| ProbeOut
             Probe -.->|Theo dõi /health/live| Uvicorn
-            Probe -.->|Đọc /proc/net/tcp & /proc/pid| Uvicorn
-            Probe -.->|Đọc cpu.stat & cpu.max| CGroup["Linux cgroup (v1/v2)"]
+            Probe -.->|Đọc /proc/net/tcp và /proc/pid| Uvicorn
+            Probe -.->|Đọc cpu.stat và cpu.max| CGroup["Linux cgroup v1/v2"]
         end
     end
 
-    subgraph Analysis["MÁY PHÂN TÍCH (Analysis & Sizing)"]
+    subgraph Analysis["MÁY PHÂN TÍCH - Analysis & Sizing"]
         Report["report.py"]
-        ReportTable["Bảng phân tích + Capacity Sizing"]
+        ReportTable["Bảng phân tích và Capacity Sizing"]
         RampOut -->|Thu thập| Report
         ProbeOut -->|Thu thập| Report
-        Report -->|Tổng hợp & Đánh giá| ReportTable
+        Report -->|Tổng hợp và Đánh giá| ReportTable
     end
 
-    Ramp ==>|HTTP/1.1 POST /chat (SSE Streaming)| Uvicorn
+    Ramp ==>|"HTTP Request (SSE / REST)"| Uvicorn
 ```
 
 - **Máy phát tải (Generator Host)**: Chạy `ramp.py` từ bên ngoài Pod (máy trạm kỹ sư, VM kiểm thử hoặc Pod loadtest độc lập). **Tuyệt đối không chạy bộ tạo tải bên trong cùng container của ứng dụng** để tránh việc tiến trình phát tải tranh chấp CPU/RAM với ứng dụng mục tiêu.
@@ -534,93 +534,68 @@ Trong Kubernetes, `os.cpu_count()` thường trả về số core của máy ch�
 - Việc sinh ra quá nhiều thread trên một Pod có quota thấp sẽ dẫn đến tranh chấp CPU gay gắt, gây ra hiện tượng **CFS Throttling nặng** dù ứng dụng chưa đầy tải.
 - `probe.py` và `report.py` sẽ cảnh báo trực tiếp nếu phát hiện `nproc_visible > quota * 2`.
 
-### 2. Tắt Semantic Cache khi kiểm thử
-Để đo chính xác năng lực tính toán và xử lý của mô hình/dịch vụ, cần đảm bảo tính năng Semantic Cache đã được tắt (hoặc thêm cờ `--cache-bust` nếu chạy bản cũ). Nếu cache bật, các request trùng lặp sẽ trả về ngay lập tức, dẫn đến chỉ số $C$ đo được bị sai lệch so với thực tế.
-
-### 3. Kích thước User Pool (Tránh Rate-Limit tài khoản)
-Nếu số lượng tài khoản trong file CSV quá ít, một tài khoản sẽ bị tái sử dụng liên tục trong thời gian ngắn:
-$$\text{reuse\_interval} = \frac{\text{Tổng số User trong Pool}}{\text{RPS}}$$
-Nếu `reuse_interval < 120s`, request có nguy cơ bị chặn bởi tầng rate-limit cấp tài khoản thay vì phản ánh giới hạn của hệ thống. Hãy chuẩn bị file CSV có ít nhất `200 - 500` tài khoản cho các bài test tải lớn.
-
-### 4. Thời gian lấy mẫu Baseline tối thiểu 90s
+### 2. Thời gian lấy mẫu Baseline tối thiểu 90s
 Các ứng dụng thường có các cron job nội bộ chạy ngầm (ví dụ: đồng bộ cấu hình, cache nền theo chu kỳ 30 - 45s). Nếu đo baseline quá ngắn (< 90s), giá trị CPU nền sẽ bị dao động mạnh, dẫn đến việc tính toán chỉ số $C$ bị thiếu chính xác.
 
 ---
 
-## 8. So sánh ramp.py với Grafana k6
+## 8. Capsizer khác gì các bài kiểm thử hiệu năng truyền thống?
 
-### Bài test trong ramp.py có gì đặc biệt?
-`ramp.py` không đơn thuần là một công cụ phát request thông thường, mà được thiết kế chuyên biệt cho bài toán **Định chuẩn năng lực (Capacity Sizing & Tuning)** của các dịch vụ AI / Streaming:
-
-1. **Cơ chế Open-Loop đo chính xác sự ứ đọng hàng đợi:**
-   - Các bài test truyền thống thường theo cơ chế *Closed-Loop* (giữ số user/concurrency cố định, chờ response xong mới gửi tiếp). Khi server chậm, client tự chậm theo $\rightarrow$ **che giấu việc nghẽn hàng đợi**.
-   - `ramp.py` bắn tải độc lập theo lịch trình tuyệt đối ($1/\text{RPS}$). Khi server bắt đầu quá tải, request vẫn được phát đều đặn $\rightarrow$ bộc lộ rõ sự tích tụ trong TCP Accept Queue và sự sụt giảm của throughput thực tế (`achieved < offered`).
-
-2. **Bóc tách sâu luồng Streaming SSE (Server-Sent Events) của AI:**
-   - Các API AI Chatbot trả về dữ liệu dạng streaming từng token.
-   - `ramp.py` phân tích từng dòng sự kiện SSE theo thời gian thực:
-     - **TTFT (Time To First Token):** Thời điểm nhận `event: message` đầu tiên chứa nội dung trả lời (chỉ số quan trọng nhất với trải nghiệm người dùng AI).
-     - **Notice Latency:** Thời điểm nhận `event: notice` khi AI Agent bắt đầu gọi Tool / Function Calling.
-     - **End-of-Stream:** Bắt buộc nhận được `event: message_end` để xác nhận request hoàn thành trọn vẹn, không bị đứt kết nối giữa chừng do proxy/timeout.
-
-3. **Cơ chế Cooldown & Settle giữa các bậc tải:**
-   - Sau mỗi bậc RPS, `ramp.py` có giai đoạn **drain/settle** (`--settle`) để chờ các request dở dang hoàn tất, và giai đoạn **cooldown** (`--cooldown`) để server xả hết CPU, thu dọn rác (GC) và giải phóng event loop, đưa tài nguyên về mức nền (baseline) trước khi bước vào bậc tải tiếp theo.
-
-4. **Tự động ngắt khi chạm điểm gãy (`--stop-on-knee`):**
-   - Khi throughput hoàn thành thực tế tụt xuống dưới 90% mức yêu cầu (`achieved < 0.90 * offered`), kịch bản tự động ngắt sớm để bảo vệ cụm máy chủ và không lãng phí thời gian đo các bậc cao hơn khi hệ thống đã bão hòa.
-
-5. **Đồng bộ thời gian thực 100% với `probe.py` và `report.py`:**
-   - Mỗi request được gắn dấu thời gian epoch chính xác (`t_start`, `t_step_start`, `t_step_end`). Nhờ đó, `report.py` có thể đối chiếu khớp từng mili-giây với dữ liệu cgroup kernel (`probe.jsonl`) để tính toán **chỉ số $C$ (ms CPU / request)**, trần lý thuyết của Pod và số lượng worker tối ưu.
+### 1. Bản chất: Định chuẩn năng lực (Capacity Sizing) thay vì chỉ gây quá tải
+- **Kiểm thử tải truyền thống (Stress / Load Test):** Thường tập trung vào câu hỏi: *"Hệ thống chịu được tối đa bao nhiêu người dùng đồng thời (Concurrency / VUs) trước khi đứt kết nối hoặc trả về lỗi 5xx?"*
+- **Capsizer:** Trả lời các câu hỏi thiết kế hệ thống chuyên sâu hơn:
+  - Một request tiêu tốn chính xác bao nhiêu mili-giây CPU thực tế ($C$) trong cgroup?
+  - Với giới hạn CPU quota được cấp phát cho Pod, thông lượng tối đa theo lý thuyết là bao nhiêu?
+  - Cần chạy bao nhiêu tiến trình worker Uvicorn/Gunicorn là tối ưu để không bị lãng phí bộ nhớ hoặc tranh chấp GIL/CPU Throttling?
 
 ---
 
-### Dùng k6 thì có được không? Có tạo ra bài test giống hệt không?
-
-> **Trả lời:** **Có thể dùng k6**, nhưng **không thể tạo ra bài test giống hệt 100%** nếu không viết thêm script tùy biến phức tạp và adapter parse log.
-
-Thực tế, cả k6 và `ramp.py` đều có thể tái sử dụng chung file CSV danh sách người dùng (`users.csv`). Dưới đây là phân tích chi tiết:
-
-#### Những điểm k6 làm được:
-- **Cơ chế Open-loop:** k6 hỗ trợ rất tốt qua executor `constant-arrival-rate` hoặc `ramping-arrival-rate`.
-- **Hiệu năng phát tải:** k6 viết bằng Go nên có thể sinh tải hàng chục nghìn RPS từ 1 máy (vượt trội hơn Python nếu cần stress test quy mô lớn).
-- **User Pool xoay vòng:** k6 dùng `SharedArray` hoặc `papaparse` để luân phiên token từ CSV.
-
-#### Những điểm k6 gặp khó khăn hoặc khác biệt so với `ramp.py`:
-1. **Hỗ trợ SSE Streaming & đo TTFT:**
-   - Mặc định `http.post()` của k6 đợi tải toàn bộ response body về bộ nhớ rồi mới trả kết quả $\rightarrow$ **không đo được TTFT** một cách tự nhiên.
-   - Để đo TTFT trên k6, cần dùng extension thử nghiệm (`xk6-sse`) hoặc xử lý raw chunks, viết mã JavaScript phức tạp và khó bắt chính xác cấu trúc `event: message_end`.
-2. **Khoảng nghỉ Cooldown giữa các bậc độc lập:**
-   - Trong k6, các bậc tải thường chạy liên tục hoặc chuyển tiếp tuyến tính. Để tạo khoảng nghỉ hoàn toàn (ví dụ 20s) giữa các bậc để server hồi phục CPU nền, bạn phải cấu hình nhiều scenario nối tiếp nhau với `startTime` tính toán thủ công.
-3. **Điều kiện dừng động `--stop-on-knee`:**
-   - k6 có `thresholds` (ngắt khi error rate > 5%, p95 > 2s), nhưng không có sẵn threshold so sánh tỷ lệ thông lượng hoàn thành thực tế so với mục tiêu (`achieved < 90% offered`) để tự động ngắt tải khi qua điểm gãy.
-4. **Không tương thích trực tiếp với `report.py` ($C$-Model):**
-   - Đây là lý do cốt lõi bộ công cụ này ra đời: Định dạng log JSONL của `ramp.py` khớp chuẩn với `report.py` để tương quan trực tiếp với dữ liệu cgroup từ `probe.py`.
-   - Nếu dùng k6, bạn phải viết thêm adapter trích xuất metrics từ k6 để ghép nối với `probe.jsonl`.
+### 2. Cơ chế phát tải: Thuần Open-Loop (Arrival-Rate) thay vì Closed-Loop (VU-based)
+- **Cơ chế Closed-Loop (Truyền thống):** Client duy trì một lượng Virtual Users (VUs) cố định. Mỗi user gửi request, chờ nhận phản hồi xong mới gửi request tiếp theo. Khi server bắt đầu quá tải và phản hồi chậm lại, client cũng tự động gửi chậm theo $\rightarrow$ **vô tình che giấu hiện tượng ứ đọng hàng đợi (Queue Buildup)**.
+- **Cơ chế Open-Loop (Capsizer):** Client phát request theo mốc thời gian tuyệt đối ($1/\text{RPS}$) độc lập với việc request trước đó đã xử lý xong hay chưa. Khi server bị nghẽn, tải vẫn được dồn dập gửi đến $\rightarrow$ mô phỏng đúng hành vi người dùng thực tế và làm bộc lộ rõ hiện tượng phình to hàng đợi TCP (Accept Queue) và sụt giảm thông lượng thực tế (`achieved < offered`).
 
 ---
 
-### Bảng so sánh tổng hợp (ramp.py vs Grafana k6)
+### 3. Tối ưu cho AI / LLM Streaming (Đo TTFT thay vì Total Latency)
+- Với các API REST thông thường, độ trễ được tính từ lúc phát request đến khi nhận xong toàn bộ nội dung.
+- Với các dịch vụ Trợ lý ảo / Generative AI trả về dạng Server-Sent Events (SSE), trải nghiệm người dùng phụ thuộc chủ yếu vào **TTFT (Time To First Token)**. Capsizer bóc tách chuyên sâu luồng SSE theo thời gian thực:
+  - Bắt mốc nhận token đầu tiên (`event: message`) để tính TTFT.
+  - Bắt mốc agent gọi tool (`event: notice`) để đo độ trễ xử lý nghiệp vụ.
+  - Xác thực tín hiệu kết thúc luồng (`event: message_end`) để đảm bảo kết nối không bị ngắt giữa chừng do proxy/timeout.
 
-| Tiêu chí | `ramp.py` (Python) | Grafana `k6` |
+---
+
+### 4. Kết hợp viễn trắc cgroup & kernel (Không chỉ quan sát từ phía client)
+- Các công cụ thông thường chỉ đứng ở phía máy phát tải để đo lường mã trạng thái HTTP (200, 500) và thời gian phản hồi.
+- Capsizer sử dụng daemon `probe.py` chạy trực tiếp trong container để theo dõi sát sao "sức khỏe" tầng hệ điều hành:
+  - Tỷ lệ chu kỳ CPU bị bóp nghẽn bởi Linux CFS Quota (`nr_throttled / nr_periods`).
+  - Số lượng kết nối chờ xử lý trong TCP Accept Queue (`/proc/net/tcp`).
+  - Độ bận của Event Loop thông qua độ trễ endpoint `/health/live`.
+
+---
+
+### 5. Bảng so sánh tổng hợp
+
+| Tiêu chí | Kiểm thử tải truyền thống (Load / Stress Test) | Capsizer (Capacity Sizing & Calibration) |
 | :--- | :--- | :--- |
-| **Mục đích chính** | **Capacity Sizing & Tuning** (Định chuẩn năng lực, tìm điểm gãy CPU & sizing Pod/Worker) | **Load & Stress Testing** (Kiểm thử tải diện rộng cho toàn hệ thống) |
-| **Xử lý SSE Streaming & TTFT** | **Tự nhiên & chính xác** (đo TTFT, notice time, message_end) | Khó hơn nhiều (phải dùng module SSE thử nghiệm hoặc xử lý raw chunks) |
-| **Pacing Open-Loop** | Có sẵn (tính theo timestamp tuyệt đối $1/\text{RPS}$) | Có sẵn (`constant-arrival-rate`) |
-| **Cooldown giữa các bậc tải** | Có sẵn (`--cooldown` để giải phóng CPU/GC) | Phải cấu hình thủ công nhiều scenario |
-| **Tự ngắt khi vượt điểm gãy** | Có sẵn (`--stop-on-knee` khi achieved < 90%) | Phải viết custom threshold phức tạp |
-| **Năng lực phát tải tối đa** | Phù hợp cấp Pod / Instance (vài nghìn RPS) | **Cực lớn** (hàng chục nghìn RPS nhờ runtime Go) |
-| **Tích hợp với `report.py` ($C$-Model)** | **Tương thích 100%** | Cần viết thêm adapter chuyển đổi log |
+| **Mục tiêu cốt lõi** | Kiểm tra độ bền, tìm điểm sập của toàn hệ thống | Đo chi phí CPU ($C$), tìm điểm gãy tối ưu hóa Pod/Worker |
+| **Mô hình phát tải** | Thường là Closed-Loop (dựa theo số VU / Concurrency) | Thuần Open-Loop (phát theo arrival-rate độc lập $1/\text{RPS}$) |
+| **Hỗ trợ AI Streaming** | Thường xử lý response nguyên khối (khó đo TTFT) | Bóc tách từng chunk SSE stream (đo TTFT, notice, end-of-stream) |
+| **Nguồn dữ liệu** | Chỉ số đo từ phía Client (Response Time, Error Rate) | Đa chiều: Client metrics + Linux cgroup quota + CFS Throttling + TCP Queue |
+| **Khoảng nghỉ giữa các bậc** | Thường tăng tải liên tục | Có khoảng nghỉ Cooldown riêng biệt để server giải phóng CPU/GC |
+| **Ngắt bài test thông minh** | Dừng khi hết thời gian định sẵn hoặc tỷ lệ lỗi cao | Tự động ngắt khi qua điểm gãy (`achieved < 90% offered`) |
+| **Kết quả đầu ra** | Biểu đồ RPS và độ trễ qua Gateway | Khuyến nghị cấu hình Pod: trần RPS, số CPU quota, số worker tối ưu |
 
 ---
 
-### Khi nào nên dùng công cụ nào?
+### 6. Khi nào nên dùng công cụ nào?
 
-- **Nên dùng `ramp.py` khi:**
-  - Bạn cần **tinh chỉnh (tune) cấu hình cho Pod/Service**: tìm ra giới hạn của 1 Pod, đo chi phí CPU cho mỗi request ($C$), xác định xem nên đặt CPU quota là bao nhiêu core, chạy bao nhiêu worker Uvicorn là tối ưu.
-  - Bạn cần đo đạc chính xác **độ trễ nhận token đầu tiên (TTFT)** của mô hình AI Chatbot hỗ trợ streaming SSE.
-  - Cần bộ công cụ gọn nhẹ, chạy ngay không cần cài đặt thêm runtime Go hay k6 binary.
+- **Nên sử dụng Capsizer khi:**
+  - Bạn đang xây dựng hoặc triển khai ứng dụng Backend / AI Chatbot trên Kubernetes/Docker và cần tìm cấu hình tài nguyên chuẩn xác: cấp bao nhiêu CPU core, cấu hình bao nhiêu worker Uvicorn là vừa vặn nhất.
+  - Cần đo đạc chính xác độ trễ phản hồi token đầu tiên (TTFT) của mô hình AI.
+  - Cần tìm ra giới hạn bão hòa (knee point) của một Pod dịch vụ độc lập trước khi cấu hình Autoscaling (HPA).
 
-- **Nên dùng `k6` khi:**
-  - Bạn muốn bắn tải ở mức độ **toàn hệ thống (End-to-End Stress Test)** với hàng chục nghìn user đồng thời qua API Gateway / Ingress.
-  - Cần kiểm tra độ ổn định kéo dài nhiều giờ (Soak test), kiểm tra khả năng tự động co giãn (HPA) của toàn cụm Kubernetes hoặc test các kịch bản hành vi người dùng phức tạp (Multi-page browsing).
+- **Nên sử dụng các bài kiểm thử tải truyền thống diện rộng khi:**
+  - Bạn cần kiểm thử độ chịu tải của toàn bộ hệ thống từ đầu đến cuối (End-to-End Stress Test) qua nhiều tầng Load Balancer, CDN, API Gateway.
+  - Cần kiểm tra độ ổn định lâu dài (Soak test kéo dài 12 - 24 giờ) hoặc mô phỏng luồng hành vi phức tạp của người dùng trên website (duyệt trang, giỏ hàng, thanh toán).
 
