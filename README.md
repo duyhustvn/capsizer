@@ -133,12 +133,15 @@ Hệ thống được thiết kế theo kiến trúc tách biệt giữa **Runne
 | Tệp tin / Thư mục | Chức năng chính | Ngôn ngữ / Phụ thuộc | Vị trí thực thi |
 | :--- | :--- | :--- | :--- |
 | [`probe.py`](file:///home/vbox/projects/capsizer/probe.py) | Thu thập chỉ số hệ thống (cgroup quota, CFS throttling, TCP queue, socket states, worker threads/fds, health latency) | Python 3.10+ (Chỉ dùng thư viện chuẩn) | Bên trong Pod mục tiêu |
-| [`ramp.py`](file:///home/vbox/projects/capsizer/ramp.py) | **Core Runner Engine**: Điều phối nhịp phát tải Open-loop theo từng mức RPS, kiểm soát in-flight, stepping, settle và ghi log JSONL | Python 3.10+, `httpx` | Máy phát tải bên ngoài |
-| [`scenarios/`](file:///home/vbox/projects/capsizer/scenarios) | **Thư mục kịch bản kiểm thử API (tách riêng khỏi ramp.py)**: | | |
-| ├── [`base.py`](file:///home/vbox/projects/capsizer/scenarios/base.py) | Giao diện cơ sở `Scenario` (interface/protocol chuẩn để mở rộng) | Python 3.10+, `httpx` | Module kịch bản |
-| ├── [`chat_sse.py`](file:///home/vbox/projects/capsizer/scenarios/chat_sse.py) | **Bài test Chatbot SSE**: Đọc user pool CSV, sinh token HS256, gửi POST /chat, phân tích sự kiện SSE và đo TTFT | Python 3.10+, `httpx`, `pyjwt` | Kịch bản `chat-sse` |
-| └── [`rest.py`](file:///home/vbox/projects/capsizer/scenarios/rest.py) | **Bài test REST API**: Kiểm thử mọi endpoint HTTP (GET/POST/PUT/DELETE) với JSON body, đo response latency | Python 3.10+, `httpx` | Kịch bản `rest` |
 | [`report.py`](file:///home/vbox/projects/capsizer/report.py) | Phân tích và tương quan log `ramp.jsonl` và `probe.jsonl`, tính toán chỉ số $C$ và lập bảng capacity planning | Python 3.10+ (Chỉ dùng thư viện chuẩn) | Máy phân tích |
+| [`ramp.py`](file:///home/vbox/projects/capsizer/ramp.py) | **Wrapper CLI**: Cầu nối gọi nhanh `ramps/python/ramp.py` từ thư mục gốc | Python 3.10+ | Máy phát tải bên ngoài |
+| [`ramps/`](file:///home/vbox/projects/capsizer/ramps) | **Thư mục bộ phát tải (Load Generators)**: | | |
+| ├── [`golang/`](file:///home/vbox/projects/capsizer/ramps/golang) | **Bộ phát tải Go (Khuyên dùng khi tải cao ⚡⚡⚡)**: | | |
+| │   ├── [`main.go`](file:///home/vbox/projects/capsizer/ramps/golang/main.go) | Core Open-Loop Engine chạy bằng Goroutines, Connection Pooling lớn | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Máy phát tải |
+| │   └── [`scenarios/`](file:///home/vbox/projects/capsizer/ramps/golang/scenarios) | Kịch bản Go: `base.go`, `chat_sse.go`, `rest.go`, `registry.go` | Go 1.20+ | Module kịch bản Go |
+| └── [`python/`](file:///home/vbox/projects/capsizer/ramps/python) | **Bộ phát tải Python**: | | |
+|     ├── [`ramp.py`](file:///home/vbox/projects/capsizer/ramps/python/ramp.py) | Core Open-Loop Engine chạy bằng Python `asyncio` + `httpx` | Python 3.10+, `httpx` | Máy phát tải |
+|     └── [`scenarios/`](file:///home/vbox/projects/capsizer/ramps/python/scenarios) | Kịch bản Python: `base.py`, `chat_sse.py`, `rest.py`, `__init__.py` | Python 3.10+, `httpx` | Module kịch bản Python |
 | [`pyproject.toml`](file:///home/vbox/projects/capsizer/pyproject.toml) | Cấu hình dự án chuẩn PEP 621 (quản lý dependencies, metadata và lệnh CLI cho `uv` và `pip`) | TOML | Toàn dự án |
 | [`requirements.txt`](file:///home/vbox/projects/capsizer/requirements.txt) | Danh sách thư viện phụ thuộc phục vụ người dùng `pip` truyền thống | Plain text | Máy phát tải |
 
@@ -148,24 +151,35 @@ Hệ thống được thiết kế theo kiến trúc tách biệt giữa **Runne
 
 ### Yêu cầu
 - Python 3.10 trở lên trên cả máy phát tải và máy chủ đích.
+- (Tùy chọn) Go 1.20 trở lên nếu sử dụng bộ phát tải `ramps/golang`.
 - Hệ điều hành Linux (hỗ trợ cgroup v1 hoặc v2, đọc `/proc`).
 
 ### Cài đặt thư viện
 
-1. **Trên máy phát tải (chạy `ramp.py`):**
-   - **Cách 1: Sử dụng `uv` (Khuyên dùng - Nhanh nhất ⚡):**
+1. **Trên máy phát tải (chọn bộ phát tải Go hoặc Python):**
+   - **Cách 1: Sử dụng bộ phát tải Go `ramps/golang` (Khuyên dùng khi tải cao ⚡⚡⚡):**
+     *Không cần cài thêm thư viện (chỉ dùng Go standard library):*
      ```bash
-     # Khởi tạo môi trường ảo và cài đặt dependencies tự động (dựa trên pyproject.toml):
-     uv sync
+     # Chạy trực tiếp qua go run:
+     cd ramps/golang
+     go run main.go --help
 
-     # Chạy trực tiếp qua uv mà không cần kích hoạt venv thủ công:
-     uv run ramp.py --help
+     # Hoặc biên dịch thành binary độc lập (khuyên dùng khi dựng Docker/Pod loadtest):
+     go build -o ramp .
+     ./ramp --help
      ```
-   - **Cách 2: Sử dụng `pip` truyền thống:**
+   - **Cách 2: Sử dụng Python với `uv` (Khuyên dùng cho Python):**
+     ```bash
+     # Khởi tạo môi trường ảo và cài đặt dependencies tự động:
+     uv sync
+     uv run ramp --help
+     # Hoặc:
+     uv run python ramps/python/ramp.py --help
+     ```
+   - **Cách 3: Sử dụng Python với `pip` truyền thống:**
      ```bash
      pip install -r requirements.txt
-     # Hoặc cài đặt package ở chế độ editable:
-     pip install -e .
+     python3 ramps/python/ramp.py --help
      ```
 
 2. **Trên Pod / Container mục tiêu (chạy `probe.py`):**
