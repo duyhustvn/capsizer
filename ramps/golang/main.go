@@ -396,6 +396,24 @@ func main() {
 			fmt.Println("pool     : 1 token dùng chung (--user-token)")
 		}
 
+		// Rate-limit guard: cảnh báo nếu pool user quá nhỏ so với đỉnh tải
+		maxStep := 0.0
+		for _, s := range steps {
+			if s > maxStep {
+				maxStep = s
+			}
+		}
+		if maxStep > 0 {
+			cycleS := float64(pool.Len()) / maxStep
+			if cycleS < 120.0 {
+				if pool.Len() == 1 {
+					fmt.Fprintf(os.Stderr, "CẢNH BÁO: Đang dùng 1 token duy nhất cho đỉnh tải %.1f req/s. Nguy cơ chạm rate-limit của tài khoản thay vì đo công suất hệ thống.\n", maxStep)
+				} else {
+					fmt.Fprintf(os.Stderr, "CẢNH BÁO: Pool chỉ có %d user cho đỉnh tải %.1f req/s (chu kỳ lặp lại %.1fs < 120s). Nguy cơ chạm rate-limit của tài khoản thay vì đo công suất hệ thống.\n", pool.Len(), maxStep, cycleS)
+				}
+			}
+		}
+
 		scenario = scenarios.NewChatSSEScenario(
 			*targetURL,
 			headers,

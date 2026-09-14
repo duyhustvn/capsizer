@@ -22,10 +22,12 @@ from typing import Any
 # và loại khỏi tập dữ liệu dùng để tính trung vị chỉ số C:
 #   - KNEE_ACHIEVED_RATIO: Tỷ lệ RPS hoàn thành so với RPS yêu cầu (< 90% nghĩa là hàng đợi bắt đầu ứ đọng).
 #   - KNEE_ACCEPT_QUEUE: Số lượng kết nối chờ xử lý trong TCP accept queue (>= 1 nghĩa là worker không kịp accept).
+#   - KNEE_ACCEPT_SAMPLES: Số mẫu quan sát thấy accept queue >= KNEE_ACCEPT_QUEUE (>= 3 mẫu để tránh false knee do cold-start/nhiễu 1 nhịp).
 #   - KNEE_HEALTH_MS: Độ trễ phản hồi health check (> 1000ms là dấu hiệu event loop bị tắc nghẽn nghiêm trọng).
 #   - KNEE_THROTTLE_PCT: Tỷ lệ chu kỳ CPU bị bóp nghẽn bởi CFS quota (> 5% nghĩa là đã chạm trần quota được cấp).
 KNEE_ACHIEVED_RATIO = 0.90  # [Tạo tải] Throughput thực tế đạt được < 90% mức yêu cầu
-KNEE_ACCEPT_QUEUE = 1  # [Hệ điều hành] Hàng đợi kết nối accept queue > 0 kéo dài
+KNEE_ACCEPT_QUEUE = 1  # [Hệ điều hành] Hàng đợi kết nối accept queue > 0
+KNEE_ACCEPT_SAMPLES = 3  # [Hệ điều hành] Số mẫu tối thiểu thấy accept queue > 0 (chống false knee 1 mẫu thoáng qua)
 KNEE_HEALTH_MS = 1000.0  # [Event loop] Độ trễ endpoint /health/live vượt quá 1 giây
 KNEE_THROTTLE_PCT = 5.0  # [cgroup] Tỷ lệ chu kỳ CPU bị bóp nghẽn vượt quá 5%
 
@@ -230,6 +232,11 @@ def main() -> int:
             if d_thr is not None and d_per:
                 thr_pct = 100.0 * d_thr / d_per
             acceptq = max((x.get("tcp", {}).get("accept_queue", 0) or 0) for x in s)
+            acpt_samples = sum(
+                1
+                for x in s
+                if (x.get("tcp", {}).get("accept_queue", 0) or 0) >= KNEE_ACCEPT_QUEUE
+            )
             health_p99 = _pct(
                 [x["health_ms"] for x in s if x.get("health_ms") is not None], 99
             )
@@ -244,8 +251,8 @@ def main() -> int:
         reasons = []
         if achieved < KNEE_ACHIEVED_RATIO * w["rps"]:
             reasons.append("achieved<offered")
-        if acceptq is not None and acceptq >= KNEE_ACCEPT_QUEUE:
-            reasons.append("acceptQ>0")
+        if acpt_samples >= KNEE_ACCEPT_SAMPLES:
+            reasons.append(f"acptQ {acpt_samples} mẫu")
         if health_p99 is not None and health_p99 > KNEE_HEALTH_MS:
             reasons.append("health chậm")
         if thr_pct is not None and thr_pct > KNEE_THROTTLE_PCT:
@@ -307,14 +314,20 @@ def main() -> int:
             f"  Không đo được C ở bậc {noisy}: CPU lúc tải không cao hơn CPU nền. Nguyên nhân\n"
             "  thường gặp: cgroup chứa cả tiến trình khác ngoài app, hoặc bậc RPS quá nhẹ."
         )
-    if knees:
-        first = knees[0]
-        print(f"  Điểm gãy quan sát được           : {first['rps']:g} req/s offered")
-        last_ok = [r for r in rows if r["ok"]]
-        if last_ok:
+    last_ok = [r for r in rows if r["ok"]]
+    if last_ok:
+        last_ok_rps = last_ok[-1]["rps"]
+        print(f"  Bậc cuối còn khoẻ                : {last_ok_rps:g} req/s -> SLO")
+        # Điểm gãy quan sát được là bậc KNEE đầu tiên xuất hiện sau bậc khoẻ cuối cùng
+        subsequent_knees = [r for r in rows if not r["ok"] and r["rps"] > last_ok_rps]
+        if subsequent_knees:
             print(
-                f"  Bậc cuối còn khoẻ                : {last_ok[-1]['rps']:g} req/s -> SLO"
+                f"  Điểm gãy quan sát được           : {subsequent_knees[0]['rps']:g} req/s offered"
             )
+        else:
+            print("  Chưa chạm điểm gãy sau bậc khoẻ cuối cùng - nâng dải --steps lên và đo tiếp.")
+    elif knees:
+        print(f"  Điểm gãy quan sát được           : {knees[0]['rps']:g} req/s offered")
     else:
         print("  Chưa chạm điểm gãy - nâng dải --steps lên và đo tiếp.")
     print()

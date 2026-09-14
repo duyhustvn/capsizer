@@ -13,8 +13,20 @@ import httpx
 
 from .base import Scenario
 
+def find_default_users_csv() -> Path:
+    """Tìm đường dẫn mặc định đến users.csv (ưu tiên thư mục hiện tại, rồi thư mục gốc repo)."""
+    candidates = [
+        Path("users.csv"),
+        Path.cwd() / "users.csv",
+        Path(__file__).resolve().parents[2] / "users.csv",
+        Path(__file__).resolve().parents[3] / "users.csv",
+        Path(__file__).resolve().parent.parent / "users.csv",
+    ]
+    return next((c for c in candidates if c.is_file()), Path("users.csv"))
+
+
 # Đường dẫn mặc định đến file CSV chứa thông tin người dùng và token (nằm ở thư mục gốc của project)
-DEFAULT_USERS_CSV = Path(__file__).resolve().parent.parent / "users.csv"
+DEFAULT_USERS_CSV = find_default_users_csv()
 
 # Danh sách câu hỏi kiểm thử mẫu chung cho chatbot (dự phòng khi không cấu hình .env)
 DEFAULT_QUERIES = [
@@ -293,18 +305,64 @@ class ChatSSEScenario(Scenario):
 
         queries = resolve_queries(args)
 
-        users_csv = Path(args.users_csv) if args.users_csv else None
+        # Xác định file users_csv (truyền qua cờ hoặc tự động nạp users.csv nếu tồn tại)
+        users_csv: Path | None = None
+        if getattr(args, "users_csv", None):
+            p = Path(args.users_csv)
+            if p.is_file():
+                users_csv = p
+            else:
+                for cand in (
+                    Path.cwd() / p,
+                    Path(__file__).resolve().parents[2] / p,
+                    Path(__file__).resolve().parents[3] / p,
+                    Path(__file__).resolve().parent.parent / p,
+                ):
+                    if cand.is_file():
+                        users_csv = cand
+                        break
+                if not users_csv:
+                    print(
+                        f"CẢNH BÁO: không thấy {args.users_csv}, dùng --user-token.",
+                        file=sys.stderr,
+                    )
+        else:
+            def_csv = find_default_users_csv()
+            if def_csv.is_file():
+                users_csv = def_csv
+
         if users_csv and users_csv.is_file():
             pool = UserPool(load_users(users_csv))
             print(f"pool     : {len(pool)} user từ {users_csv.name}")
         else:
             pool = UserPool([("", args.user_token)])
             print("pool     : 1 token dùng chung (--user-token)")
-            if args.users_csv and args.users_csv != str(DEFAULT_USERS_CSV):
-                print(
-                    f"CẢNH BÁO: không thấy {users_csv}, dùng --user-token.",
-                    file=sys.stderr,
-                )
+
+        # Hàng rào kiểm tra Rate-limit của tài khoản: len(pool) / max(steps) < 120s
+        max_step = 0.0
+        steps_str = getattr(args, "steps", "")
+        if steps_str:
+            try:
+                max_step = max(float(s) for s in steps_str.split(",") if s.strip())
+            except ValueError:
+                pass
+
+        if max_step > 0:
+            cycle_s = len(pool) / max_step
+            if cycle_s < 120.0:
+                if len(pool) == 1:
+                    print(
+                        f"CẢNH BÁO: Đang dùng 1 token duy nhất cho đỉnh tải {max_step:g} req/s. "
+                        "Nguy cơ chạm rate-limit của tài khoản thay vì đo công suất hệ thống.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"CẢNH BÁO: Pool chỉ có {len(pool)} user cho đỉnh tải {max_step:g} req/s "
+                        f"(chu kỳ lặp lại {cycle_s:.1f}s < 120s). "
+                        "Nguy cơ chạm rate-limit của tài khoản thay vì đo công suất hệ thống.",
+                        file=sys.stderr,
+                    )
 
         return cls(
             url=args.url,

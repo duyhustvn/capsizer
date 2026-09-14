@@ -30,7 +30,13 @@ from typing import Any, TextIO
 import httpx
 
 # Nạp giao diện kịch bản và danh mục các kịch bản có sẵn
-from scenarios import REGISTRY, ChatSSEScenario, RestScenario, Scenario
+from scenarios import (
+    DEFAULT_USERS_CSV,
+    REGISTRY,
+    ChatSSEScenario,
+    RestScenario,
+    Scenario,
+)
 
 __all__ = ["Scenario", "ChatSSEScenario", "RestScenario", "main", "main_async"]
 
@@ -299,8 +305,8 @@ def main() -> int:
     # Cấu hình xác thực và dữ liệu Chatbot
     p.add_argument(
         "--users-csv",
-        default="",
-        help="CSV pool user (chứa cột token/user_token). Mặc định dùng users.csv nếu tồn tại.",
+        default=str(DEFAULT_USERS_CSV) if DEFAULT_USERS_CSV.is_file() else "",
+        help="CSV pool user (chứa cột token/user_token). Mặc định tự nạp users.csv nếu tồn tại.",
     )
     p.add_argument(
         "--user-token",
