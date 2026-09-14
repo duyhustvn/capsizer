@@ -136,6 +136,15 @@ def main() -> int:
         _baseline_cpu(probe, wins[0]["t0"]) if probe else (None, 0, 0.0)
     )
 
+    workers_seen = max(
+        (
+            int(s.get("workers", {}).get("n_workers", 0) or 0)
+            for s in probe
+            if s.get("type") != "probe_meta"
+        ),
+        default=0,
+    )
+
     print("=" * 132)
     print("CALIBRATE - KẾT QUẢ")
     print("=" * 132)
@@ -145,6 +154,8 @@ def main() -> int:
             f"nproc nhìn thấy : {meta.get('nproc_visible')} (core của NODE, không phải quota)"
         )
         print(f"executor threads: {meta.get('default_executor_max_workers')} / worker")
+        if workers_seen > 0:
+            print(f"workers quan sát: {workers_seen} worker")
     if baseline is not None:
         print(
             f"CPU nền (không tải)    : {baseline:.3f} core ({base_n} mẫu / {base_span:.0f}s)"
@@ -268,6 +279,10 @@ def main() -> int:
         c = statistics.median([r["c_ms"] for r in healthy])
         print(f"  C (trung vị các bậc còn khoẻ)   : {c:.1f} ms CPU / request")
         print(f"  Trần lý thuyết 1 worker (1 core) : {1000.0 / c:.1f} req/s")
+        if workers_seen > 1:
+            print(
+                f"  Trần lý thuyết {workers_seen} worker ({workers_seen} core): {workers_seen * 1000.0 / c:.1f} req/s"
+            )
         if quota:
             print(
                 f"  Trần lý thuyết pod ({quota:g} core)      : {quota * 1000.0 / c:.1f} req/s"
@@ -275,6 +290,11 @@ def main() -> int:
             print(
                 f"  Số worker hợp lý                 : {max(1, round(quota))} (= quota)"
             )
+            if workers_seen > 0 and workers_seen < round(quota):
+                print(
+                    f"  CẢNH BÁO: Số worker đang chạy ({workers_seen}) thấp hơn CPU quota ({quota:g} core). "
+                    f"Cần nâng lên {max(1, round(quota))} worker để khai thác tối đa năng lực pod."
+                )
     elif not any(r["ok"] for r in rows):
         print("  Chưa có bậc nào 'OK' -> hạ dải --steps xuống rồi đo lại.")
     else:
