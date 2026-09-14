@@ -97,7 +97,9 @@ def cpu_sample() -> dict[str, Any]:
             if k in out:
                 out[k] = int(v)
         return out
-    acct = _read(CG2 / "cpuacct/cpuacct.usage")  # cgroup v1: tính bằng nanogiây, chia 1000 về microgiây
+    acct = _read(
+        CG2 / "cpuacct/cpuacct.usage"
+    )  # cgroup v1: tính bằng nanogiây, chia 1000 về microgiây
     if acct:
         out["usage_usec"] = int(acct.strip()) // 1000
     v1 = _read(CG2 / "cpu/cpu.stat")
@@ -277,9 +279,7 @@ def worker_sample(pattern: str = "uvicorn") -> dict[str, Any]:
     # cao hơn thực tế (vd 3 thay vì 2, tức thổi phồng 50% một con số dùng để quy hoạch công suất).
     _HELPER_MARKERS = ("multiprocessing.resource_tracker", "multiprocessing.forkserver")
     target_pids = {
-        pid
-        for pid in target_pids
-        if not any(m in all_procs[pid]["cmd"] for m in _HELPER_MARKERS)
+        pid for pid in target_pids if not any(m in all_procs[pid]["cmd"] for m in _HELPER_MARKERS)
     }
 
     target_procs = [all_procs[pid] for pid in target_pids]
@@ -292,13 +292,15 @@ def worker_sample(pattern: str = "uvicorn") -> dict[str, Any]:
 
     for p in target_procs:
         role = "master" if p["pid"] in parent_pids else "worker"
-        procs.append({
-            "pid": p["pid"],
-            "role": role,
-            "fds": p["fds"],
-            "threads": p["threads"],
-            "cpu_ticks": p["cpu_ticks"],
-        })
+        procs.append(
+            {
+                "pid": p["pid"],
+                "role": role,
+                "fds": p["fds"],
+                "threads": p["threads"],
+                "cpu_ticks": p["cpu_ticks"],
+            }
+        )
         if role == "worker":
             workers.append(p)
         else:
@@ -418,7 +420,9 @@ def main() -> int:
                 if sleep > 0:
                     time.sleep(sleep)
                 else:
-                    next_t = time.monotonic()  # Chậm nhịp lấy mẫu -> đặt lại mốc thời gian tiếp theo
+                    next_t = (
+                        time.monotonic()
+                    )  # Chậm nhịp lấy mẫu -> đặt lại mốc thời gian tiếp theo
         except KeyboardInterrupt:
             print("\ndừng probe.")
     return 0

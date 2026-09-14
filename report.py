@@ -27,7 +27,9 @@ from typing import Any
 #   - KNEE_THROTTLE_PCT: Tỷ lệ chu kỳ CPU bị bóp nghẽn bởi CFS quota (> 5% nghĩa là đã chạm trần quota được cấp).
 KNEE_ACHIEVED_RATIO = 0.90  # [Tạo tải] Throughput thực tế đạt được < 90% mức yêu cầu
 KNEE_ACCEPT_QUEUE = 1  # [Hệ điều hành] Hàng đợi kết nối accept queue > 0
-KNEE_ACCEPT_SAMPLES = 3  # [Hệ điều hành] Số mẫu tối thiểu thấy accept queue > 0 (chống false knee 1 mẫu thoáng qua)
+KNEE_ACCEPT_SAMPLES = (
+    3  # [Hệ điều hành] Số mẫu tối thiểu thấy accept queue > 0 (chống false knee 1 mẫu thoáng qua)
+)
 KNEE_HEALTH_MS = 1000.0  # [Event loop] Độ trễ endpoint /health/live vượt quá 1 giây
 KNEE_THROTTLE_PCT = 5.0  # [cgroup] Tỷ lệ chu kỳ CPU bị bóp nghẽn vượt quá 5%
 
@@ -58,9 +60,7 @@ def _f(v: float | None, nd: int = 0) -> str:
     return "-" if v is None else f"{v:,.{nd}f}"
 
 
-def _windows(
-    ramp: list[dict[str, Any]], step_seconds: float | None
-) -> list[dict[str, Any]]:
+def _windows(ramp: list[dict[str, Any]], step_seconds: float | None) -> list[dict[str, Any]]:
     """Phân tách các bản ghi từ ramp.jsonl thành các khung thời gian tương ứng với từng mức RPS."""
     out, cur = [], None
     for r in ramp:
@@ -83,13 +83,9 @@ def _windows(
     return out
 
 
-def _probe_slice(
-    probe: list[dict[str, Any]], t0: float, t1: float
-) -> list[dict[str, Any]]:
+def _probe_slice(probe: list[dict[str, Any]], t0: float, t1: float) -> list[dict[str, Any]]:
     """Lọc các mẫu dữ liệu probe rơi vào khoảng thời gian [t0, t1] (bỏ qua bản ghi metadata)."""
-    return [
-        s for s in probe if s.get("type") != "probe_meta" and t0 <= s.get("t", 0) <= t1
-    ]
+    return [s for s in probe if s.get("type") != "probe_meta" and t0 <= s.get("t", 0) <= t1]
 
 
 def _delta(samples: list[dict[str, Any]], key: str) -> float | None:
@@ -100,13 +96,9 @@ def _delta(samples: list[dict[str, Any]], key: str) -> float | None:
     return vals[-1] - vals[0]
 
 
-def _baseline_cpu(
-    probe: list[dict[str, Any]], first_t0: float
-) -> tuple[float | None, int, float]:
+def _baseline_cpu(probe: list[dict[str, Any]], first_t0: float) -> tuple[float | None, int, float]:
     """Tính mức tiêu thụ CPU nền khi chưa có tải: trả về (số core, số mẫu, độ dài khoảng thời gian đo tính bằng giây)."""
-    pre = [
-        s for s in probe if s.get("type") != "probe_meta" and s.get("t", 0) < first_t0
-    ]
+    pre = [s for s in probe if s.get("type") != "probe_meta" and s.get("t", 0) < first_t0]
     if len(pre) < 3:
         return None, len(pre), 0.0
     span_s: float = float(pre[-1]["t"]) - float(pre[0]["t"])
@@ -134,9 +126,7 @@ def main() -> int:
         print("Không tìm thấy bậc nào trong file ramp.")
         return 1
 
-    baseline, base_n, base_span = (
-        _baseline_cpu(probe, wins[0]["t0"]) if probe else (None, 0, 0.0)
-    )
+    baseline, base_n, base_span = _baseline_cpu(probe, wins[0]["t0"]) if probe else (None, 0, 0.0)
 
     workers_seen = max(
         (
@@ -152,16 +142,12 @@ def main() -> int:
     print("=" * 132)
     if meta:
         print(f"cpu_quota_cores : {quota if quota is not None else 'không giới hạn'}")
-        print(
-            f"nproc nhìn thấy : {meta.get('nproc_visible')} (core của NODE, không phải quota)"
-        )
+        print(f"nproc nhìn thấy : {meta.get('nproc_visible')} (core của NODE, không phải quota)")
         print(f"executor threads: {meta.get('default_executor_max_workers')} / worker")
         if workers_seen > 0:
             print(f"workers quan sát: {workers_seen} worker")
     if baseline is not None:
-        print(
-            f"CPU nền (không tải)    : {baseline:.3f} core ({base_n} mẫu / {base_span:.0f}s)"
-        )
+        print(f"CPU nền (không tải)    : {baseline:.3f} core ({base_n} mẫu / {base_span:.0f}s)")
         # Cảnh báo nếu khoảng thời gian đo CPU nền ngắn hơn 90 giây
         if base_span < 90:
             print(
@@ -170,12 +156,8 @@ def main() -> int:
                 "Lần sau chờ 90-120s trước khi bắn tải."
             )
     elif probe:
-        print(
-            f"CPU nền                : KHÔNG đo được ({base_n} mẫu trước bậc đầu, cần >= 3)"
-        )
-        print(
-            "  -> probe bật muộn hơn ramp? C dưới đây chưa trừ nền nên bị thổi phồng."
-        )
+        print(f"CPU nền                : KHÔNG đo được ({base_n} mẫu trước bậc đầu, cần >= 3)")
+        print("  -> probe bật muộn hơn ramp? C dưới đây chưa trừ nền nên bị thổi phồng.")
     print()
 
     # Ý nghĩa các cột trong bảng kết quả:
@@ -202,9 +184,7 @@ def main() -> int:
     print("-" * 132)
 
     rows: list[dict[str, Any]] = []
-    noisy: list[
-        float
-    ] = []  # Danh sách mức RPS không tách biệt được mức tăng CPU so với CPU nền
+    noisy: list[float] = []  # Danh sách mức RPS không tách biệt được mức tăng CPU so với CPU nền
     for w in wins:
         dur = max(
             w["launch_s"], 1e-9
@@ -236,16 +216,10 @@ def main() -> int:
                 thr_pct = 100.0 * d_thr / d_per
             acceptq = max((x.get("tcp", {}).get("accept_queue", 0) or 0) for x in s)
             acpt_samples = sum(
-                1
-                for x in s
-                if (x.get("tcp", {}).get("accept_queue", 0) or 0) >= KNEE_ACCEPT_QUEUE
+                1 for x in s if (x.get("tcp", {}).get("accept_queue", 0) or 0) >= KNEE_ACCEPT_QUEUE
             )
-            health_p99 = _pct(
-                [x["health_ms"] for x in s if x.get("health_ms") is not None], 99
-            )
-            estab = max(
-                (x.get("tcp", {}).get("states", {}).get("ESTAB", 0) or 0) for x in s
-            )
+            health_p99 = _pct([x["health_ms"] for x in s if x.get("health_ms") is not None], 99)
+            estab = max((x.get("tcp", {}).get("states", {}).get("ESTAB", 0) or 0) for x in s)
             fdmax = max((x.get("workers", {}).get("fds_max") or 0) for x in s)
             thrd = max((x.get("workers", {}).get("threads_max") or 0) for x in s)
 
@@ -294,12 +268,8 @@ def main() -> int:
                 f"  Trần lý thuyết {workers_seen} worker ({workers_seen} core): {workers_seen * 1000.0 / c:.1f} req/s"
             )
         if quota:
-            print(
-                f"  Trần lý thuyết pod ({quota:g} core)      : {quota * 1000.0 / c:.1f} req/s"
-            )
-            print(
-                f"  Số worker hợp lý                 : {max(1, round(quota))} (= quota)"
-            )
+            print(f"  Trần lý thuyết pod ({quota:g} core)      : {quota * 1000.0 / c:.1f} req/s")
+            print(f"  Số worker hợp lý                 : {max(1, round(quota))} (= quota)")
             if workers_seen > 0 and workers_seen < round(quota):
                 print(
                     f"  CẢNH BÁO: Số worker đang chạy ({workers_seen}) thấp hơn CPU quota ({quota:g} core). "
@@ -308,9 +278,7 @@ def main() -> int:
     elif not any(r["ok"] for r in rows):
         print("  Chưa có bậc nào 'OK' -> hạ dải --steps xuống rồi đo lại.")
     else:
-        print(
-            "  Có bậc còn khoẻ nhưng KHÔNG tính được C -> thiếu --probe, hoặc probe không"
-        )
+        print("  Có bậc còn khoẻ nhưng KHÔNG tính được C -> thiếu --probe, hoặc probe không")
         print("  phủ cùng khoảng thời gian với ramp (xem cột cores/C_ms trống).")
     if noisy:
         print(
@@ -334,12 +302,8 @@ def main() -> int:
     else:
         print("  Chưa chạm điểm gãy - nâng dải --steps lên và đo tiếp.")
     print()
-    print(
-        "  Chênh giữa trần lý thuyết và điểm gãy quan sát được là phần bị mất vì GIL,"
-    )
-    print(
-        "  CFS throttling và tranh chấp thread. Chênh lớn -> xem cột thr% và thrd trước tiên."
-    )
+    print("  Chênh giữa trần lý thuyết và điểm gãy quan sát được là phần bị mất vì GIL,")
+    print("  CFS throttling và tranh chấp thread. Chênh lớn -> xem cột thr% và thrd trước tiên.")
     return 0
 
 

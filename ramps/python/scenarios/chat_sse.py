@@ -13,6 +13,7 @@ import httpx
 
 from .base import Scenario
 
+
 def find_default_users_csv() -> Path:
     """Tìm đường dẫn mặc định đến users.csv (ưu tiên thư mục hiện tại, rồi thư mục gốc repo)."""
     candidates = [
@@ -46,18 +47,22 @@ def load_dotenv(path: str | Path | None = None) -> dict[str, str]:
         p = Path(path)
         candidates.append(p)
         if not p.is_absolute():
-            candidates.extend([
-                Path.cwd() / p,
-                Path(__file__).resolve().parent.parent / p,
-                Path(__file__).resolve().parents[2] / p,
-            ])
+            candidates.extend(
+                [
+                    Path.cwd() / p,
+                    Path(__file__).resolve().parent.parent / p,
+                    Path(__file__).resolve().parents[2] / p,
+                ]
+            )
     else:
-        candidates.extend([
-            Path(".env"),
-            Path.cwd() / ".env",
-            Path(__file__).resolve().parent.parent / ".env",
-            Path(__file__).resolve().parents[2] / ".env",
-        ])
+        candidates.extend(
+            [
+                Path(".env"),
+                Path.cwd() / ".env",
+                Path(__file__).resolve().parent.parent / ".env",
+                Path(__file__).resolve().parents[2] / ".env",
+            ]
+        )
 
     target = next((c for c in candidates if c.is_file()), None)
     if not target:
@@ -291,9 +296,7 @@ class ChatSSEScenario(Scenario):
         self.cache_bust = cache_bust
 
     @classmethod
-    def from_args(
-        cls, args: argparse.Namespace, headers: dict[str, str]
-    ) -> ChatSSEScenario:
+    def from_args(cls, args: argparse.Namespace, headers: dict[str, str]) -> ChatSSEScenario:
         """Khởi tạo ChatSSEScenario từ các tham số dòng lệnh."""
         hdrs = dict(headers)
         if "Content-Type" not in hdrs:
