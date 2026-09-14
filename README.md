@@ -291,7 +291,8 @@ python3 ramp.py [OPTIONS]
 | `--user-token` | `loadtest-token` | Token dùng chung khi không sử dụng file CSV (cho kịch bản `chat-sse`) |
 | `--jwt` | `""` | JWT token có sẵn gửi trong header `Authorization: Bearer <token>` |
 | `--jwt-secret` | `$JWT_SECRET` | Secret ký HS256 JWT nếu chưa có sẵn token (quyền `super_admin`) |
-| `--queries` | `""` | File chứa danh sách câu hỏi kiểm thử cho chatbot (mỗi dòng một câu) |
+| `--queries` | `""` | File chứa danh sách câu hỏi kiểm thử cho chatbot (mỗi dòng một câu, ưu tiên cao hơn `.env`) |
+| `--env-file` | `.env` | File cấu hình môi trường chứa `CHAT_QUERIES`, `JWT_SECRET`,... |
 | `--insecure` | `False` | Bỏ qua kiểm tra chứng chỉ TLS (khi qua Ingress cert tự ký) |
 | `--cache-bust` | `False` | Thêm mã ngẫu nhiên vào câu hỏi để tránh cache |
 | `--stop-on-knee` | `False` | Tự động ngắt kịch bản khi `achieved < 90% offered` |

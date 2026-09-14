@@ -275,6 +275,7 @@ func main() {
 		jwtToken     = flag.String("jwt", "", "JWT dựng sẵn")
 		jwtSecret    = flag.String("jwt-secret", "", "secret ký token HS256; mặc định đọc biến môi trường JWT_SECRET")
 		queriesFile  = flag.String("queries", "", "file câu hỏi cho chatbot, mỗi dòng một câu")
+		envFile      = flag.String("env-file", ".env", "đường dẫn file .env nạp cấu hình (mặc định: .env)")
 		insecure     = flag.Bool("insecure", false, "bỏ qua verify chứng chỉ TLS (khi qua Ingress cert tự ký)")
 		cacheBust    = flag.Bool("cache-bust", false, "thêm mã ngẫu nhiên vào câu hỏi để tránh cache")
 		stopOnKnee   = flag.Bool("stop-on-knee", false, "dừng khi achieved < 90% offered")
@@ -285,6 +286,9 @@ func main() {
 	flag.Var(&headersFlag, "H", "thêm HTTP header tùy chọn (ví dụ: -H 'X-Api-Key: 123')")
 	flag.Var(&headersFlag, "header", "thêm HTTP header tùy chọn")
 	flag.Parse()
+
+	// Nạp biến môi trường từ .env nếu có
+	scenarios.LoadDotEnv(*envFile)
 
 	if *jwtSecret == "" {
 		*jwtSecret = os.Getenv("JWT_SECRET")
@@ -367,26 +371,7 @@ func main() {
 		)
 	} else {
 		// Default: chat-sse
-		queries := scenarios.DefaultQueries
-		if *queriesFile != "" {
-			content, err := os.ReadFile(*queriesFile)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "ERROR: đọc file queries thất bại: %v\n", err)
-				os.Exit(2)
-			}
-			var lines []string
-			for _, line := range strings.Split(string(content), "\n") {
-				line = strings.TrimSpace(line)
-				if line != "" {
-					lines = append(lines, line)
-				}
-			}
-			if len(lines) == 0 {
-				fmt.Fprintln(os.Stderr, "ERROR: file --queries rỗng")
-				os.Exit(2)
-			}
-			queries = lines
-		}
+		queries := scenarios.ResolveQueries(*queriesFile, *envFile)
 
 		csvFile := *usersCSV
 		if csvFile == "" {

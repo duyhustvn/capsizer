@@ -16,7 +16,7 @@ from .base import Scenario
 # Đường dẫn mặc định đến file CSV chứa thông tin người dùng và token (nằm ở thư mục gốc của project)
 DEFAULT_USERS_CSV = Path(__file__).resolve().parent.parent / "users.csv"
 
-# Danh sách câu hỏi kiểm thử mẫu chung cho chatbot
+# Danh sách câu hỏi kiểm thử mẫu chung cho chatbot (dự phòng khi không cấu hình .env)
 DEFAULT_QUERIES = [
     "Xin chào, bạn có thể hỗ trợ những tác vụ gì?",
     "Hãy tóm tắt ngắn gọn các điểm chính của tài liệu này",
@@ -25,6 +25,152 @@ DEFAULT_QUERIES = [
     "Gợi ý cho tôi một số giải pháp tối ưu hóa hiệu năng",
     "Chào bạn",
 ]
+
+
+def load_dotenv(path: str | Path | None = None) -> dict[str, str]:
+    """Tìm và nạp các biến môi trường từ file .env vào os.environ nếu chưa tồn tại."""
+    candidates: list[Path] = []
+    if path:
+        p = Path(path)
+        candidates.append(p)
+        if not p.is_absolute():
+            candidates.extend([
+                Path.cwd() / p,
+                Path(__file__).resolve().parent.parent / p,
+                Path(__file__).resolve().parents[2] / p,
+            ])
+    else:
+        candidates.extend([
+            Path(".env"),
+            Path.cwd() / ".env",
+            Path(__file__).resolve().parent.parent / ".env",
+            Path(__file__).resolve().parents[2] / ".env",
+        ])
+
+    target = next((c for c in candidates if c.is_file()), None)
+    if not target:
+        return {}
+
+    env_vars: dict[str, str] = {}
+    content = target.read_text("utf-8")
+    lines = content.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+
+        # Xử lý chuỗi multiline nằm trong dấu nháy kép hoặc đơn
+        if (v.startswith('"') and not (v.endswith('"') and len(v) > 1)) or (
+            v.startswith("'") and not (v.endswith("'") and len(v) > 1)
+        ):
+            quote_char = v[0]
+            val_parts = [v[1:]]
+            while i < len(lines):
+                next_line = lines[i]
+                i += 1
+                if next_line.rstrip().endswith(quote_char):
+                    val_parts.append(next_line.rstrip()[:-1])
+                    break
+                val_parts.append(next_line)
+            v = "\n".join(val_parts)
+        elif (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+            v = v[1:-1]
+
+        v = v.replace("\\n", "\n")
+        env_vars[k] = v
+        if k not in os.environ:
+            os.environ[k] = v
+
+    return env_vars
+
+
+def parse_queries(raw: str) -> list[str]:
+    """Phân tích chuỗi câu hỏi từ .env thành danh sách (hỗ trợ JSON array, xuống dòng, | hoặc ;)."""
+    raw = raw.strip()
+    if not raw:
+        return []
+    # 1. JSON array
+    if raw.startswith("[") and raw.endswith("]"):
+        try:
+            import json
+
+            data = json.loads(raw)
+            if isinstance(data, list):
+                res = [str(x).strip() for x in data if str(x).strip()]
+                if res:
+                    return res
+        except Exception:
+            pass
+    # 2. Xuống dòng
+    if "\n" in raw:
+        lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+        if lines:
+            return lines
+    # 3. Ký tự phân cách pipe (|)
+    if "|" in raw:
+        lines = [ln.strip() for ln in raw.split("|") if ln.strip()]
+        if lines:
+            return lines
+    # 4. Ký tự phân cách semicolon (;)
+    if ";" in raw:
+        lines = [ln.strip() for ln in raw.split(";") if ln.strip()]
+        if lines:
+            return lines
+    return [raw]
+
+
+def resolve_queries(args: argparse.Namespace) -> list[str]:
+    """Xác định danh sách câu hỏi kiểm thử theo thứ tự ưu tiên:
+    1. Cờ dòng lệnh --queries (file câu hỏi riêng biệt)
+    2. Biến CHAT_QUERIES_FILE hoặc QUERIES_FILE trong .env
+    3. Biến CHAT_QUERIES hoặc QUERIES trong .env (phân tách bởi |, xuống dòng, hoặc JSON array)
+    4. Danh sách câu hỏi mẫu mặc định DEFAULT_QUERIES
+    """
+    env_file = getattr(args, "env_file", ".env")
+    load_dotenv(env_file)
+
+    # 1. Tham số dòng lệnh --queries
+    if getattr(args, "queries", None):
+        p = Path(args.queries)
+        if not p.is_file():
+            raise FileNotFoundError(f"Không tìm thấy file --queries: {args.queries}")
+        lines = [ln.strip() for ln in p.read_text("utf-8").splitlines() if ln.strip()]
+        if not lines:
+            raise ValueError(f"File --queries rỗng: {args.queries}")
+        print(f"queries  : {len(lines)} câu hỏi nạp từ cờ --queries ({p.name})")
+        return lines
+
+    # 2. File được trỏ tới từ biến môi trường CHAT_QUERIES_FILE / QUERIES_FILE
+    queries_file = os.environ.get("CHAT_QUERIES_FILE") or os.environ.get("QUERIES_FILE")
+    if queries_file:
+        candidates = [
+            Path(queries_file),
+            Path.cwd() / queries_file,
+            Path(__file__).resolve().parents[2] / queries_file,
+        ]
+        target = next((c for c in candidates if c.is_file()), None)
+        if target:
+            lines = [ln.strip() for ln in target.read_text("utf-8").splitlines() if ln.strip()]
+            if lines:
+                print(f"queries  : {len(lines)} câu hỏi nạp từ file {target.name} (qua .env)")
+                return lines
+
+    # 3. Chuỗi danh sách câu hỏi trực tiếp trong CHAT_QUERIES / QUERIES
+    raw_env = os.environ.get("CHAT_QUERIES") or os.environ.get("QUERIES")
+    if raw_env:
+        parsed = parse_queries(raw_env)
+        if parsed:
+            print(f"queries  : {len(parsed)} câu hỏi nạp từ .env (CHAT_QUERIES)")
+            return parsed
+
+    # 4. Dự phòng mặc định
+    print("queries  : dùng danh sách câu hỏi mẫu mặc định (chưa cấu hình CHAT_QUERIES trong .env)")
+    return DEFAULT_QUERIES
 
 
 def _mint_jwt(secret: str, ttl_s: int = 7200) -> str:
@@ -145,12 +291,7 @@ class ChatSSEScenario(Scenario):
         if token and "Authorization" not in hdrs:
             hdrs["Authorization"] = f"Bearer {token}"
 
-        queries = DEFAULT_QUERIES
-        if args.queries:
-            lines = Path(args.queries).read_text("utf-8").splitlines()
-            queries = [ln.strip() for ln in lines if ln.strip()]
-            if not queries:
-                raise ValueError("File --queries rỗng")
+        queries = resolve_queries(args)
 
         users_csv = Path(args.users_csv) if args.users_csv else None
         if users_csv and users_csv.is_file():

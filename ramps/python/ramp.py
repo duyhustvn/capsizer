@@ -329,13 +329,22 @@ def main() -> int:
     p.add_argument(
         "--stop-on-knee", action="store_true", help="dừng khi achieved < 90%% offered"
     )
+    p.add_argument(
+        "--env-file",
+        default=".env",
+        help="đường dẫn file .env nạp cấu hình (mặc định: .env)",
+    )
     p.add_argument("--out", default="loadtest-ramp.jsonl")
     args = p.parse_args()
 
+    # Nạp biến môi trường từ .env nếu có
+    import os
+    from scenarios.chat_sse import load_dotenv
+
+    load_dotenv(args.env_file)
+
     # Đọc JWT_SECRET từ môi trường nếu chưa truyền
     if not args.jwt_secret:
-        import os
-
         args.jwt_secret = os.environ.get("JWT_SECRET", "")
 
     steps = [float(s) for s in args.steps.split(",") if s.strip()]
