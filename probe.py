@@ -268,6 +268,20 @@ def worker_sample(pattern: str = "uvicorn") -> dict[str, Any]:
                 target_pids.add(pid)
                 changed = True
 
+    # Loại các tiến trình phụ trợ của multiprocessing khỏi cây. Chúng là CON của master nên lọt
+    # vào theo PPID, nhưng không phục vụ request nào:
+    #   - resource_tracker: `python -c from multiprocessing.resource_tracker import main;main(6)`
+    #     Luôn có mặt khi dùng ngữ cảnh "spawn" (uvicorn --workers dùng spawn), 1 thread, ~4 fd.
+    #   - forkserver: tương tự với ngữ cảnh "forkserver".
+    # Không loại thì mỗi pod bị đếm dư đúng 1 "worker" -> report.py in "Trần lý thuyết N worker"
+    # cao hơn thực tế (vd 3 thay vì 2, tức thổi phồng 50% một con số dùng để quy hoạch công suất).
+    _HELPER_MARKERS = ("multiprocessing.resource_tracker", "multiprocessing.forkserver")
+    target_pids = {
+        pid
+        for pid in target_pids
+        if not any(m in all_procs[pid]["cmd"] for m in _HELPER_MARKERS)
+    }
+
     target_procs = [all_procs[pid] for pid in target_pids]
     # Tiến trình có con nằm trong target_pids đóng vai trò là master / supervisor
     parent_pids = {p["ppid"] for p in target_procs if p["ppid"] in target_pids}
