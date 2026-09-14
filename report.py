@@ -216,6 +216,9 @@ def main() -> int:
 
         cores = c_ms = thr_pct = None
         acceptq = health_p99 = estab = fdmax = thrd = None
+        # Khởi tạo acpt_samples = 0: nếu không có probe (hoặc probe lệch giờ so với ramp),
+        # ta không quan sát được hàng đợi TCP, tức không đủ bằng chứng để phán đoán quá tải do accept queue.
+        acpt_samples = 0
         if s:
             span_usec = (s[-1]["t"] - s[0]["t"]) * 1_000_000
             d_usage = _delta(s, "usage_usec")
