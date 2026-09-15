@@ -20,7 +20,7 @@ Bộ công cụ giúp trả lời các câu hỏi cốt lõi về mặt kỹ thu
 - [4. Hướng dẫn chạy từng bước (Workflow chuẩn)](#4-hướng-dẫn-chạy-từng-bước-workflow-chuẩn)
 - [5. Hướng dẫn chi tiết từng công cụ](#5-hướng-dẫn-chi-tiết-từng-công-cụ)
   - [probe.py - Thu thập chỉ số hệ thống](#probepy---thu-thập-chỉ-số-hệ-thống)
-  - [ramp.py - Bộ phát tải Open-Loop (Đa kịch bản)](#ramppy---bộ-phát-tải-open-loop-đa-kịch-bản-chat-sse-rest-api-custom-scenario)
+  - [ramps/golang - Bộ phát tải Open-Loop Go (Đa kịch bản)](#rampsgolang---bộ-phát-tải-open-loop-go-đa-kịch-bản-chat-sse-rest-api)
   - [report.py - Phân tích dữ liệu & Lập báo cáo](#reportpy---phân-tích-dữ-liệu--lập-báo-cáo)
 - [6. Kịch bản thực tế mẫu (End-to-End Walkthrough)](#6-kịch-bản-thực-tế-mẫu-end-to-end-walkthrough)
 - [7. Các lưu ý kỹ thuật quan trọng (Best Practices)](#7-các-lưu-ý-kỹ-thuật-quan-trọng-best-practices)
@@ -36,8 +36,8 @@ Bộ công cụ giúp trả lời các câu hỏi cốt lõi về mặt kỹ thu
 
 ```mermaid
 flowchart TD
-    subgraph GeneratorHost["MÁY PHÁT TẢI - External Test Runner"]
-        Ramp["ramp.py (Open-Loop Load Generator)"]
+    subgraph GeneratorHost["MÁY PHÁT TẢI - External Test Runner (Golang)"]
+        Ramp["ramps/golang (Open-Loop Load Generator)"]
         UserCSV[("users.csv / UserPool")]
         RampOut[("loadtest-ramp.jsonl")]
         Ramp -->|Đọc User/Token| UserCSV
@@ -68,7 +68,7 @@ flowchart TD
     Ramp ==>|"HTTP Request (SSE / REST)"| Uvicorn
 ```
 
-- **Máy phát tải (Generator Host)**: Chạy `ramp.py` từ bên ngoài Pod (máy trạm kỹ sư, VM kiểm thử hoặc Pod loadtest độc lập). **Tuyệt đối không chạy bộ tạo tải bên trong cùng container của ứng dụng** để tránh việc tiến trình phát tải tranh chấp CPU/RAM với ứng dụng mục tiêu.
+- **Máy phát tải (Generator Host)**: Chạy bộ phát tải Go (`ramps/golang`) từ bên ngoài Pod (máy trạm kỹ sư, VM kiểm thử hoặc Pod loadtest độc lập). **Tuyệt đối không chạy bộ tạo tải bên trong cùng container của ứng dụng** để tránh việc tiến trình phát tải tranh chấp CPU/RAM với ứng dụng mục tiêu.
 - **Pod / Container mục tiêu (Target Pod)**: Chạy `probe.py` ngầm (background) trực tiếp trong container của ứng dụng. Nhờ nằm chung Linux namespace và cgroup, `probe.py` có thể đọc trực tiếp các file ảo `/proc/net/tcp`, `/proc/<pid>/*` và `/sys/fs/cgroup` mà không cần cài thêm các công cụ bổ trợ như `ss`, `netstat` hay `iproute2`.
 - **Tổng hợp & Báo cáo (Analysis)**: Sau khi đợt kiểm thử kết thúc, cả 2 file `loadtest-ramp.jsonl` và `probe.jsonl` được đưa về để `report.py` đối chiếu theo dòng thời gian.
 
@@ -76,7 +76,7 @@ flowchart TD
 
 ### Cơ chế phát tải Open-Loop
 
-Khác với các công cụ kiểm thử tải truyền thống theo cơ chế **Closed-Loop** (chỉ gửi request mới khi request trước đó đã nhận xong hoặc bị giới hạn bởi số lượng VUs/concurrency cố định), `ramp.py` áp dụng mô hình **Open-Loop**:
+Khác với các công cụ kiểm thử tải truyền thống theo cơ chế **Closed-Loop** (chỉ gửi request mới khi request trước đó đã nhận xong hoặc bị giới hạn bởi số lượng VUs/concurrency cố định), bộ phát tải của Capsizer áp dụng mô hình **Open-Loop**:
 
 ```
 Closed-Loop (Mô hình truyền thống):
@@ -85,7 +85,7 @@ Closed-Loop (Mô hình truyền thống):
   Client <--- [Nhận Resp 1] <----------+ (Sau 5s)
   Client ---> [Gửi Req 2] (Bị chậm theo server => Che giấu hiện tượng sập hàng đợi!)
 
-Open-Loop (Mô hình của ramp.py):
+Open-Loop (Mô hình của Capsizer):
   t = 0.0s:  Client ---> [Gửi Req 1] -------------------> Server
   t = 0.2s:  Client ---> [Gửi Req 2] -------------------> Server
   t = 0.4s:  Client ---> [Gửi Req 3] -------------------> Server
@@ -134,53 +134,40 @@ Hệ thống được thiết kế theo kiến trúc tách biệt giữa **Runne
 | :--- | :--- | :--- | :--- |
 | [`probe.py`](file:///home/vbox/projects/capsizer/probe.py) | Thu thập chỉ số hệ thống (cgroup quota, CFS throttling, TCP queue, socket states, worker threads/fds, health latency) | Python 3.10+ (Chỉ dùng thư viện chuẩn) | Bên trong Pod mục tiêu |
 | [`report.py`](file:///home/vbox/projects/capsizer/report.py) | Phân tích và tương quan log `ramp.jsonl` và `probe.jsonl`, tính toán chỉ số $C$ và lập bảng capacity planning | Python 3.10+ (Chỉ dùng thư viện chuẩn) | Máy phân tích |
-| [`ramp.py`](file:///home/vbox/projects/capsizer/ramp.py) | **Wrapper CLI**: Cầu nối gọi nhanh `ramps/python/ramp.py` từ thư mục gốc | Python 3.10+ | Máy phát tải bên ngoài |
-| [`ramps/`](file:///home/vbox/projects/capsizer/ramps) | **Thư mục bộ phát tải (Load Generators)**: | | |
-| ├── [`golang/`](file:///home/vbox/projects/capsizer/ramps/golang) | **Bộ phát tải Go (Khuyên dùng khi tải cao ⚡⚡⚡)**: | | |
-| │   ├── [`main.go`](file:///home/vbox/projects/capsizer/ramps/golang/main.go) | Core Open-Loop Engine chạy bằng Goroutines, Connection Pooling lớn | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Máy phát tải |
-| │   └── [`scenarios/`](file:///home/vbox/projects/capsizer/ramps/golang/scenarios) | Kịch bản Go: `base.go`, `chat_sse.go`, `rest.go`, `registry.go` | Go 1.20+ | Module kịch bản Go |
-| └── [`python/`](file:///home/vbox/projects/capsizer/ramps/python) | **Bộ phát tải Python**: | | |
-|     ├── [`ramp.py`](file:///home/vbox/projects/capsizer/ramps/python/ramp.py) | Core Open-Loop Engine chạy bằng Python `asyncio` + `httpx` | Python 3.10+, `httpx` | Máy phát tải |
-|     └── [`scenarios/`](file:///home/vbox/projects/capsizer/ramps/python/scenarios) | Kịch bản Python: `base.py`, `chat_sse.py`, `rest.py`, `__init__.py` | Python 3.10+, `httpx` | Module kịch bản Python |
-| [`pyproject.toml`](file:///home/vbox/projects/capsizer/pyproject.toml) | Cấu hình dự án chuẩn PEP 621 (quản lý dependencies, metadata và lệnh CLI cho `uv` và `pip`) | TOML | Toàn dự án |
-| [`requirements.txt`](file:///home/vbox/projects/capsizer/requirements.txt) | Danh sách thư viện phụ thuộc phục vụ người dùng `pip` truyền thống | Plain text | Máy phát tải |
+| [`ramps/golang/`](file:///home/vbox/projects/capsizer/ramps/golang) | **Bộ phát tải Open-Loop Engine chạy bằng Go ⚡⚡⚡**: | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Máy phát tải bên ngoài |
+| ├── [`main.go`](file:///home/vbox/projects/capsizer/ramps/golang/main.go) | Core Open-Loop Engine chạy bằng Goroutines, Connection Pooling lớn, scheduler độ chính xác cao | Go 1.20+ | Máy phát tải |
+| └── [`scenarios/`](file:///home/vbox/projects/capsizer/ramps/golang/scenarios) | Kịch bản Go: `base.go`, `chat_sse.go`, `rest.go`, `registry.go` | Go 1.20+ | Module kịch bản Go |
+| [`pyproject.toml`](file:///home/vbox/projects/capsizer/pyproject.toml) | Cấu hình dự án Python (CLI entrypoints cho `probe.py` và `report.py`) | TOML | Toàn dự án |
 
 ---
 
 ## 3. Yêu cầu môi trường & Cài đặt
 
 ### Yêu cầu
-- Python 3.10 trở lên trên cả máy phát tải và máy chủ đích.
-- (Tùy chọn) Go 1.20 trở lên nếu sử dụng bộ phát tải `ramps/golang`.
+- **Go 1.20 trở lên** trên máy phát tải để chạy bộ tạo tải `ramps/golang`.
+- **Python 3.10 trở lên** (chỉ dùng thư viện chuẩn, không cần cài thêm package nào) để chạy `probe.py` và `report.py`.
 - Hệ điều hành Linux (hỗ trợ cgroup v1 hoặc v2, đọc `/proc`).
 
-### Cài đặt thư viện
+### Cài đặt & Sử dụng
 
-1. **Trên máy phát tải (chọn bộ phát tải Go hoặc Python):**
-   - **Cách 1: Sử dụng bộ phát tải Go `ramps/golang` (Khuyên dùng khi tải cao ⚡⚡⚡):**
-     *Không cần cài thêm thư viện (chỉ dùng Go standard library):*
-     ```bash
-     # Chạy trực tiếp qua go run:
-     cd ramps/golang
-     go run main.go --help
+1. **Trên máy phát tải (Bộ phát tải Go `ramps/golang`):**
+   *Không cần cài thêm thư viện bên ngoài (chỉ dùng Go standard library):*
+   ```bash
+   # Cách 1: Chạy trực tiếp qua go run:
+   cd ramps/golang
+   go run . --help
 
-     # Hoặc biên dịch thành binary độc lập (khuyên dùng khi dựng Docker/Pod loadtest):
-     go build -o ramp .
-     ./ramp --help
-     ```
-   - **Cách 2: Sử dụng Python với `uv` (Khuyên dùng cho Python):**
-     ```bash
-     # Khởi tạo môi trường ảo và cài đặt dependencies tự động:
-     uv sync
-     uv run ramp --help
-     # Hoặc:
-     uv run python ramps/python/ramp.py --help
-     ```
-   - **Cách 3: Sử dụng Python với `pip` truyền thống:**
-     ```bash
-     pip install -r requirements.txt
-     python3 ramps/python/ramp.py --help
-     ```
+   # Cách 2: Biên dịch thành binary độc lập (khuyên dùng khi dựng Docker/Pod loadtest):
+   cd ramps/golang
+   go build -o capsizer-ramp .
+   ./capsizer-ramp --help
+   ```
+
+2. **Trên Pod / Container mục tiêu (chạy `probe.py`):**
+   *Không cần cài đặt thêm bất kỳ thư viện nào.* `probe.py` chỉ sử dụng thư viện chuẩn của Python (`urllib`, `json`, `os`, `pathlib`, `time`).
+
+3. **Trên máy phân tích (chạy `report.py`):**
+   *Không cần cài đặt thêm thư viện.* `report.py` chỉ dùng thư viện chuẩn (`statistics`, `json`, `pathlib`).
 
 2. **Trên Pod / Container mục tiêu (chạy `probe.py`):**
    - **Không cần cài đặt thêm bất kỳ thư viện nào.** `probe.py` chỉ sử dụng thư viện chuẩn của Python (`urllib`, `json`, `os`, `pathlib`, `time`).
@@ -207,7 +194,7 @@ sequenceDiagram
     Dev->>Dev: Đợi 90 - 120 giây (không bắn tải)
     
     Note over Dev,Generator: Giai đoạn 2: Phát tải bậc thang
-    Dev->>Generator: Chạy ramp.py (--steps 1,2,4,8,16,32)
+    Dev->>Generator: Chạy ramps/golang (--steps 1,2,4,8,16,32)
     Generator->>Pod: Phát tải SSE POST /chat (open-loop)
     Generator->>Generator: Ghi log loadtest-ramp.jsonl
     
@@ -255,165 +242,161 @@ python3 probe.py [OPTIONS]
 
 ---
 
-### ramp.py - Bộ phát tải Open-Loop (Đa kịch bản: Chat SSE, REST API, Custom Scenario)
+### ramps/golang - Bộ phát tải Open-Loop Go (Đa kịch bản: Chat SSE, REST API)
 
-`ramp.py` được thiết kế theo mẫu **Strategy Pattern**: Core Open-Loop Engine độc lập với logic request, cho phép kiểm thử bất kỳ API nào thông qua việc lựa chọn kịch bản:
-1. `chat-sse` (mặc định): Đo endpoint Chatbot streaming SSE (`POST /chat`), đo TTFT.
+Bộ phát tải được viết bằng **Go (Golang)**, tận dụng tối đa cơ chế Goroutines nhẹ và HTTP connection pooling lớn để đạt độ chính xác lịch trình phát tải cực cao mà không bị nghẽn GIL:
+1. `chat-sse` (mặc định): Đo endpoint Chatbot streaming SSE (`POST /chat`), đo TTFT theo thời gian thực.
 2. `rest`: Đo mọi API REST tiêu chuẩn (GET, POST, PUT, DELETE,...), đo latency.
-3. Custom Scenario: Tải class kế thừa từ `Scenario` từ một file Python độc lập thông qua `--scenario-file`.
 
 #### Cú pháp dòng lệnh
 ```bash
-# Cách 1: Sử dụng uv (Khuyên dùng - tự động quản lý môi trường ảo):
-uv run ramp.py [OPTIONS]
+# Cách 1: Chạy trực tiếp qua go run:
+cd ramps/golang && go run . [OPTIONS]
 
-# Cách 2: Sử dụng python3 thông thường (sau khi đã cài đặt dependencies):
-python3 ramp.py [OPTIONS]
+# Cách 2: Biên dịch thành binary độc lập (Khuyên dùng khi triển khai Pod/VM tải):
+cd ramps/golang && go build -o capsizer-ramp .
+./capsizer-ramp [OPTIONS]
 ```
 
 #### Bảng tham số
 | Tham số | Giá trị mặc định | Giải thích |
 | :--- | :--- | :--- |
-| `--scenario` | `chat-sse` | Kịch bản kiểm thử: `chat-sse` (mặc định) hoặc `rest` |
-| `--scenario-file` | `""` | File Python chứa custom Scenario class (kế thừa từ `Scenario`) |
-| `--method` | `GET` | HTTP method cho kịch bản REST (`GET`, `POST`, `PUT`, `DELETE`,...) |
-| `-H`, `--header` | `None` | Thêm HTTP header tùy chọn (ví dụ: `-H 'Authorization: Bearer xxx' -H 'X-Api-Key: 123'`) |
-| `--body` | `""` | Chuỗi body gửi kèm cho request REST (chuỗi JSON hoặc chuỗi text thô) |
-| `--body-file` | `""` | Đường dẫn file chứa dữ liệu body cho request REST |
-| `--url` | `http://127.0.0.1:8000/chat` | URL endpoint nhận request |
-| `--steps` | `1,2,4,8,16,32` | Danh sách các mức RPS cần đo, phân tách bằng dấu phẩy |
-| `--step-seconds` | `60.0` | Thời gian phát tải ở mỗi mức RPS (giây) |
-| `--cooldown` | `20.0` | Thời gian nghỉ giải tỏa tải giữa 2 bậc RPS (giây) |
-| `--settle` | `60.0` | Thời gian chờ tối đa cho các request còn dở dang ở cuối mỗi bậc |
-| `--timeout` | `120.0` | Read timeout cho mỗi request (giây) |
-| `--max-inflight` | `2000` | Trần kết nối đồng thời tối đa của máy phát tải (bảo vệ máy phát tải) |
-| `--users-csv` | `users.csv` | Đường dẫn file CSV chứa danh sách user (cột `token` hoặc `user_token`) |
-| `--user-token` | `loadtest-token` | Token dùng chung khi không sử dụng file CSV (cho kịch bản `chat-sse`) |
-| `--jwt` | `""` | JWT token có sẵn gửi trong header `Authorization: Bearer <token>` |
-| `--jwt-secret` | `$JWT_SECRET` | Secret ký HS256 JWT nếu chưa có sẵn token (quyền `super_admin`) |
-| `--queries` | `""` | File chứa danh sách câu hỏi kiểm thử cho chatbot (mỗi dòng một câu, ưu tiên cao hơn `.env`) |
-| `--env-file` | `.env` | File cấu hình môi trường chứa `CHAT_QUERIES`, `JWT_SECRET`,... |
-| `--insecure` | `False` | Bỏ qua kiểm tra chứng chỉ TLS (khi qua Ingress cert tự ký) |
-| `--cache-bust` | `False` | Thêm mã ngẫu nhiên vào câu hỏi để tránh cache |
-| `--stop-on-knee` | `False` | Tự động ngắt kịch bản khi `achieved < 90% offered` |
-| `--out` | `loadtest-ramp.jsonl` | File JSONL xuất kết quả kiểm thử tải |
+| `-scenario` | `chat-sse` | Kịch bản kiểm thử: `chat-sse` (mặc định) hoặc `rest` |
+| `-method` | `GET` | HTTP method cho kịch bản REST (`GET`, `POST`, `PUT`, `DELETE`,...) |
+| `-H`, `-header` | `None` | Thêm HTTP header tùy chọn (ví dụ: `-H 'Authorization: Bearer xxx' -H 'X-Api-Key: 123'`) |
+| `-body` | `""` | Chuỗi body gửi kèm cho request REST (chuỗi JSON hoặc chuỗi text thô) |
+| `-body-file` | `""` | Đường dẫn file chứa dữ liệu body cho request REST |
+| `-url` | `http://127.0.0.1:8000/chat` | URL endpoint nhận request |
+| `-steps` | `1,2,4,8,16,32` | Danh sách các mức RPS cần đo, phân tách bằng dấu phẩy |
+| `-step-seconds` | `60.0` | Thời gian phát tải ở mỗi mức RPS (giây) |
+| `-cooldown` | `20.0` | Thời gian nghỉ giải tỏa tải giữa 2 bậc RPS (giây) |
+| `-settle` | `60.0` | Thời gian chờ tối đa cho các request dở dang cuối mỗi bậc |
+| `-timeout` | `120.0` | Read timeout cho mỗi request (giây) |
+| `-max-inflight` | `2000` | Trần kết nối đồng thời tối đa của máy phát tải (bảo vệ máy phát tải) |
+| `-users-csv` | `users.csv` | Đường dẫn file CSV chứa danh sách user (cột `token`, `user_token` hoặc fuzzy match) |
+| `-user-token` | `loadtest-token` | Token dùng chung khi không sử dụng file CSV (cho kịch bản `chat-sse`) |
+| `-jwt` | `""` | JWT token có sẵn gửi trong header `Authorization: Bearer <token>` |
+| `-jwt-secret` | `$JWT_SECRET` | Secret ký HS256 JWT nếu chưa có sẵn token (quyền `super_admin`) |
+| `-queries` | `""` | File chứa danh sách câu hỏi kiểm thử cho chatbot (mỗi dòng một câu, ưu tiên hơn `.env`) |
+| `-env-file` | `.env` | File cấu hình môi trường chứa `CHAT_QUERIES`, `JWT_SECRET`,... |
+| `-insecure` | `false` | Bỏ qua kiểm tra chứng chỉ TLS (khi qua Ingress cert tự ký) |
+| `-cache-bust` | `false` | Thêm mã ngẫu nhiên vào câu hỏi để tránh cache |
+| `-stop-on-knee` | `false` | Tự động ngắt kịch bản khi `achieved < 90% offered` |
+| `-out` | `loadtest-ramp.jsonl` | File JSONL xuất kết quả kiểm thử tải |
+
+*(Lưu ý: Bộ cờ của Go hỗ trợ cả cú pháp 1 gạch ngang `-flag` và 2 gạch ngang `--flag`).*
 
 #### Ví dụ chạy thực tế
 
 - **Ví dụ 1: Test API Chatbot streaming SSE (Kịch bản mặc định):**
   ```bash
   export JWT_SECRET="your-jwt-secret-key"
-  python3 ramp.py \
-    --scenario chat-sse \
-    --url "https://api.example.com/chat" \
-    --users-csv users.csv \
-    --steps "2,4,8,12,16" \
-    --step-seconds 60 \
-    --cooldown 20 \
-    --stop-on-knee \
-    --insecure \
-    --out loadtest-ramp.jsonl
+  cd ramps/golang
+  go run . \
+    -scenario chat-sse \
+    -url "https://api.example.com/chat" \
+    -users-csv users.csv \
+    -steps "2,4,8,12,16" \
+    -step-seconds 60 \
+    -cooldown 20 \
+    -stop-on-knee \
+    -insecure \
+    -out loadtest-ramp.jsonl
   ```
 
 - **Ví dụ 2: Test API REST GET thông thường (ví dụ: lấy danh sách items):**
   ```bash
-  python3 ramp.py \
-    --scenario rest \
-    --method GET \
-    --url "http://127.0.0.1:8000/api/v1/items" \
+  cd ramps/golang
+  go run . \
+    -scenario rest \
+    -method GET \
+    -url "http://127.0.0.1:8000/api/v1/items" \
     -H "Authorization: Bearer my-token" \
-    --steps "10,20,50,100" \
-    --step-seconds 30 \
-    --out loadtest-items.jsonl
+    -steps "10,20,50,100" \
+    -step-seconds 30 \
+    -out loadtest-items.jsonl
   ```
 
 - **Ví dụ 3: Test API REST POST với JSON Body (ví dụ: tìm kiếm search/embedding):**
   ```bash
-  python3 ramp.py \
-    --scenario rest \
-    --method POST \
-    --url "http://127.0.0.1:8000/api/v1/search" \
+  cd ramps/golang
+  go run . \
+    -scenario rest \
+    -method POST \
+    -url "http://127.0.0.1:8000/api/v1/search" \
     -H "Content-Type: application/json" \
     -H "X-Api-Key: secret123" \
-    --body '{"query": "an ninh mạng", "limit": 10}' \
-    --steps "5,10,20,40" \
-    --step-seconds 30 \
-    --out loadtest-search.jsonl
+    -body '{"query": "an ninh mạng", "limit": 10}' \
+    -steps "5,10,20,40" \
+    -step-seconds 30 \
+    -out loadtest-search.jsonl
   ```
 
-- **Ví dụ 4: Viết và chạy Custom Scenario bằng file Python riêng:**
-  Tạo file `custom_scenario.py`:
-  ```python
-  from ramp import Scenario
-  import time
+#### Cách thêm một kịch bản kiểm thử (Scenario) mới trong Go
 
-  class CustomUserScenario(Scenario):
-      name = "user-profile"
-      metric_label = "lat"
+Trong `ramps/golang`, mọi kịch bản đều cài đặt interface `Scenario` (định nghĩa tại `scenarios/base.go`):
 
-      async def execute(self, client):
-          t0 = time.perf_counter()
-          resp = await client.get("http://127.0.0.1:8000/api/v1/me", headers={"X-User-Id": "123"})
-          dur = (time.perf_counter() - t0) * 1000
-          return {
-              "type": "req",
-              "t_start": time.time(),
-              "ok": resp.status_code == 200,
-              "status": resp.status_code,
-              "total_ms": dur,
-              "ttft_ms": dur,
-              "err": None if resp.status_code == 200 else f"http_{resp.status_code}"
-          }
-  ```
-  Thực thi:
-  ```bash
-  python3 ramp.py --scenario-file custom_scenario.py --steps "5,10,20" --out loadtest-custom.jsonl
-  ```
-
-#### Cách thêm một kịch bản kiểm thử (Scenario) mới
-
-Bạn có thể dễ dàng mở rộng để kiểm thử bất kỳ dịch vụ hay API nào theo 2 cách:
-
-##### Cách 1: Thêm trực tiếp vào thư mục `scenarios/` (Khuyên dùng cho kịch bản dùng chung của dự án)
-1. Tạo file mới `scenarios/my_service.py` kế thừa từ `Scenario` (trong `scenarios/base.py`):
-   ```python
-   import time
-   import httpx
-   from .base import Scenario
-
-   class MyServiceScenario(Scenario):
-       name = "my-service"
-       metric_label = "lat"  # Hiển thị trên bảng kết quả: lat_p50, lat_p95
-
-       async def execute(self, client: httpx.AsyncClient):
-           t0 = time.perf_counter()
-           resp = await client.get("http://127.0.0.1:8000/api/v1/data")
-           dur = (time.perf_counter() - t0) * 1000
-           return {
-               "type": "req",
-               "t_start": time.time(),
-               "ok": resp.status_code == 200,
-               "status": resp.status_code,
-               "total_ms": dur,
-               "ttft_ms": dur,
-               "err": None if resp.status_code == 200 else f"http_{resp.status_code}",
-           }
-   ```
-2. Đăng ký kịch bản vào `REGISTRY` trong `scenarios/__init__.py`:
-   ```python
-   from .my_service import MyServiceScenario
-   REGISTRY["my-service"] = MyServiceScenario
-   ```
-3. Chạy qua dòng lệnh:
-   ```bash
-   python3 ramp.py --scenario my-service --steps 10,20,50
-   ```
-
-##### Cách 2: Nạp file kịch bản độc lập từ bên ngoài (Khuyên dùng cho kịch bản tạm thời hoặc ad-hoc)
-Tạo file Python ở bất kỳ thư mục nào (ví dụ `my_custom.py`) kế thừa từ `Scenario`, sau đó chạy:
-```bash
-python3 ramp.py --scenario-file ./my_custom.py --steps 5,10,20
+```go
+type Scenario interface {
+    Name() string
+    MetricLabel() string
+    Setup(ctx context.Context, client *http.Client) error
+    Execute(ctx context.Context, client *http.Client) Record
+}
 ```
+
+1. Tạo file mới trong `ramps/golang/scenarios/` (ví dụ `my_service.go`):
+   ```go
+   package scenarios
+
+   import (
+       "context"
+       "net/http"
+       "time"
+   )
+
+   type MyServiceScenario struct {
+       url string
+   }
+
+   func NewMyServiceScenario(url string) *MyServiceScenario {
+       return &MyServiceScenario{url: url}
+   }
+
+   func (s *MyServiceScenario) Name() string        { return "my-service" }
+   func (s *MyServiceScenario) MetricLabel() string { return "lat" }
+   func (s *MyServiceScenario) Setup(ctx context.Context, client *http.Client) error {
+       return nil
+   }
+
+   func (s *MyServiceScenario) Execute(ctx context.Context, client *http.Client) Record {
+       tStart := float64(time.Now().UnixNano()) / 1e9
+       t0 := time.Now()
+       rec := Record{Type: "req", TStart: tStart, Ok: false}
+
+       req, err := http.NewRequestWithContext(ctx, "GET", s.url, nil)
+       if err != nil {
+           rec.Err = strPtr(err.Error())
+           return rec
+       }
+       resp, err := client.Do(req)
+       elapsed := float64(time.Since(t0).Microseconds()) / 1000.0
+       rec.TotalMs = &elapsed
+       rec.TtftMs = &elapsed
+
+       if err != nil {
+           rec.Err = strPtr(err.Error())
+           return rec
+       }
+       defer resp.Body.Close()
+
+       rec.Status = &resp.StatusCode
+       rec.Ok = resp.StatusCode >= 200 && resp.StatusCode < 400
+       return rec
+   }
+   ```
+
+2. Đăng ký kịch bản vào hàm `main()` trong `ramps/golang/main.go` tương ứng với cờ `-scenario my-service`.
 
 ---
 
@@ -476,22 +459,22 @@ kubectl exec -n ${NAMESPACE} ${POD_NAME} -- \
 > [!IMPORTANT]
 > **Chờ tối thiểu 90 - 120 giây** trước khi chuyển sang bước 2. Điều này giúp `probe.py` đo được chính xác mức tiêu thụ CPU nền khi ứng dụng ở trạng thái nghỉ (idle baseline), tránh ảnh hưởng của các tác vụ nền định kỳ.
 
-### Bước 2: Khởi chạy bộ tạo tải `ramp.py`
+### Bước 2: Khởi chạy bộ tạo tải Go (`ramps/golang`)
 Mở terminal 2 (trên máy phát tải bên ngoài), thực thi lệnh:
 ```bash
 export JWT_SECRET="your-secret-key"
 
-# Chạy với uv (hoặc thay 'uv run' bằng 'python3'):
-uv run ramp.py \
-  --url "https://api.example.com/chat" \
-  --users-csv users.csv \
-  --steps "1,2,4,8,12,16" \
-  --step-seconds 60 \
-  --cooldown 20 \
-  --settle 60 \
-  --insecure \
-  --stop-on-knee \
-  --out /tmp/loadtest-ramp.jsonl
+cd ramps/golang
+go run . \
+  -url "https://api.example.com/chat" \
+  -users-csv users.csv \
+  -steps "1,2,4,8,12,16" \
+  -step-seconds 60 \
+  -cooldown 20 \
+  -settle 60 \
+  -insecure \
+  -stop-on-knee \
+  -out /tmp/loadtest-ramp.jsonl
 ```
 
 Quan sát terminal để theo dõi bảng tiến độ theo từng bậc RPS:
@@ -505,7 +488,7 @@ Quan sát terminal để theo dõi bảng tiến độ theo từng bậc RPS:
 ```
 
 ### Bước 3: Thu thập file `probe.jsonl` từ Pod về máy phân tích
-Sau khi `ramp.py` hoàn thành:
+Sau khi quá trình phát tải hoàn thành:
 1. Nhấn `Ctrl+C` ở terminal 1 để dừng `probe.py`.
 2. Tải file log từ Pod về:
    ```bash

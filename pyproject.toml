@@ -33,10 +33,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
 ]
-dependencies = [
-    "httpx>=0.24.0",
-    "pyjwt>=2.8.0",
-]
+dependencies = []
 
 [project.optional-dependencies]
 dev = [
@@ -45,10 +42,8 @@ dev = [
 ]
 
 [project.scripts]
-capsizer-ramp = "ramp:main"
 capsizer-probe = "probe:main"
 capsizer-report = "report:main"
-ramp = "ramp:main"
 probe = "probe:main"
 report = "report:main"
 
@@ -57,16 +52,21 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["ramps"]
-extra-files = ["ramp.py", "probe.py", "report.py"]
+extra-files = ["probe.py", "report.py"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
 
+[tool.ruff.lint]
+ignore = [
+    "BLE001",  # Bỏ qua blind exception cho CLI entrypoint và probe
+    "EXE001",  # Bỏ qua kiểm tra quyền executable của shebang
+    "S110",    # Bỏ qua try-except-pass
+]
+
 [tool.mypy]
 python_version = "3.10"
-mypy_path = ["ramps/python"]
 explicit_package_bases = true
 enable_error_code = ["possibly-undefined"]
 warn_unused_configs = true
