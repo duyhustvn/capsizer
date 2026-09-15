@@ -22,14 +22,7 @@ import (
 )
 
 // DefaultQueries danh sách câu hỏi kiểm thử mẫu chung cho chatbot (dự phòng khi không cấu hình .env).
-var DefaultQueries = []string{
-	"Xin chào, bạn có thể hỗ trợ những tác vụ gì?",
-	"Hãy tóm tắt ngắn gọn các điểm chính của tài liệu này",
-	"Hướng dẫn tôi cách tích hợp API vào hệ thống",
-	"Giải thích giúp tôi nguyên lý hoạt động của kiến trúc microservices",
-	"Gợi ý cho tôi một số giải pháp tối ưu hóa hiệu năng",
-	"Chào bạn",
-}
+var DefaultQueries = []string{}
 
 // LoadDotEnv tìm và nạp các biến môi trường từ file .env vào process (os.Setenv) nếu chưa tồn tại.
 func LoadDotEnv(path string) map[string]string {
@@ -337,8 +330,21 @@ func LoadUsers(csvPath string) ([]User, error) {
 		}
 	}
 
+	// Lượt 2: Tìm kiếm gần đúng (fuzzy match) nếu chưa tìm thấy khớp chính xác.
+	// Nhận diện bất kỳ cột nào chứa chuỗi "token" (không phân biệt hoa/thường, ví dụ: "tokenUserChatbot", "auth_token",...).
+	// Cơ chế này giúp tự động tương thích với các định dạng CSV từ nhiều nguồn, tránh việc LoadUsers báo lỗi
+	// khiến hệ thống tự động rơi về chế độ dùng 1 token dùng chung làm nghẽn rate-limit của tài khoản.
 	if tokenCol == -1 {
-		return nil, fmt.Errorf("%s: không tìm thấy cột chứa token (token hoặc user_token)", csvPath)
+		for i, h := range header {
+			if strings.Contains(strings.ToLower(strings.TrimSpace(h)), "token") {
+				tokenCol = i
+				break
+			}
+		}
+	}
+
+	if tokenCol == -1 {
+		return nil, fmt.Errorf("%s: không tìm thấy cột nào chứa token trong header %v", csvPath, header)
 	}
 
 	var users []User
@@ -456,7 +462,11 @@ func (s *ChatSSEScenario) Execute(ctx context.Context, client *http.Client) Reco
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		rec.Err = strPtr(err.Error())
+		if errors.Is(err, context.Canceled) {
+			rec.Err = strPtr("abandoned")
+		} else {
+			rec.Err = strPtr(err.Error())
+		}
 		elapsed := float64(time.Since(t0).Microseconds()) / 1000.0
 		rec.TotalMs = &elapsed
 		return rec
@@ -494,7 +504,14 @@ func (s *ChatSSEScenario) Execute(ctx context.Context, client *http.Client) Reco
 			}
 		}
 		if err != nil {
-			if err != io.EOF && !errors.Is(err, context.Canceled) {
+			if errors.Is(err, context.Canceled) {
+				// Request bị hủy bởi step runner khi hết thời gian settle cuối bậc kiểm thử.
+				// Đánh dấu err = "abandoned" để đồng bộ với bản Python; report.py nhận diện chính xác
+				// chuỗi lỗi này làm một trong các chỉ số phát hiện điểm gãy quá tải (knee condition).
+				if rec.Err == nil {
+					rec.Err = strPtr("abandoned")
+				}
+			} else if err != io.EOF {
 				if rec.Err == nil {
 					rec.Err = strPtr(err.Error())
 				}

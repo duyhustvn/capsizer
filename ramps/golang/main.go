@@ -50,6 +50,12 @@ func unixTime(t time.Time) float64 {
 	return float64(t.UnixNano()) / 1e9
 }
 
+// strPtrMain trả về con trỏ tới chuỗi, dùng để gán các trường kiểu *string trong scenarios.Record
+// khi tạo bản ghi bổ sung (synthetic record) ở package main.
+func strPtrMain(s string) *string {
+	return &s
+}
+
 func percentile(xs []float64, p float64) *float64 {
 	if len(xs) == 0 {
 		return nil
@@ -127,7 +133,6 @@ func runStep(
 	var maxInflightSeen atomic.Int64
 	var dropped atomic.Int64
 
-	recordsChan := make(chan scenarios.Record, maxInflight*2+1000)
 	var wg sync.WaitGroup
 
 	stepDeadline := time.Now().Add(time.Duration(stepSeconds * float64(time.Second)))
@@ -137,27 +142,38 @@ func runStep(
 	stepCtx, cancelStep := context.WithCancel(ctx)
 	defer cancelStep()
 
-	// Thu thập kết quả bất đồng bộ từ các goroutine
-	var records []scenarios.Record
-	collectorDone := make(chan struct{})
-	go func() {
-		for r := range recordsChan {
+	// Thu thập kết quả request bằng slice được bảo vệ bởi mutex thay cho buffered channel.
+	// Cơ chế này đảm bảo an toàn khi hết thời gian settle: cờ collecting sẽ được đặt về false;
+	// các goroutine hoàn tất muộn sau deadline sẽ an toàn bỏ qua record thay vì gửi vào channel
+	// đã đóng gây panic "send on closed channel" làm sập tiến trình test tải.
+	var (
+		recMu      sync.Mutex
+		records    []scenarios.Record
+		collecting = true
+	)
+	addRecord := func(r scenarios.Record) {
+		recMu.Lock()
+		defer recMu.Unlock()
+		if collecting {
 			records = append(records, r)
 		}
-		close(collectorDone)
-	}()
+	}
 
+	// Dùng nhãn launchLoop để lệnh break thoát hẳn vòng lặp for khi context bị hủy (ctx.Done())
+	// hoặc quá deadline bước test. Trong Go, lệnh break không nhãn bên trong select chỉ thoát khỏi
+	// khối select chứ không dừng vòng lặp bao ngoài.
+launchLoop:
 	for {
 		select {
 		case <-ctx.Done():
-			break
+			break launchLoop
 		default:
 		}
 
 		targetTime := startTime.Add(time.Duration(float64(n) * float64(interval)))
 		now := time.Now()
 		if targetTime.After(stepDeadline) || now.After(stepDeadline) {
-			break
+			break launchLoop
 		}
 
 		delay := targetTime.Sub(now)
@@ -188,7 +204,7 @@ func runStep(
 			}()
 
 			rec := scenario.Execute(stepCtx, client)
-			recordsChan <- rec
+			addRecord(rec)
 		}()
 	}
 
@@ -211,8 +227,24 @@ func runStep(
 		}
 	}
 
-	close(recordsChan)
-	<-collectorDone
+	// Dừng thu thập record: từ thời điểm này, các goroutine về muộn sẽ bị addRecord() bỏ qua
+	// để bảo vệ slice records khỏi race condition khi đọc và ghi file.
+	recMu.Lock()
+	collecting = false
+	launched := n - dropped.Load()
+	abandoned := launched - int64(len(records))
+
+	// Các request đã phát ra nhưng không kịp phản hồi trong thời gian settle được ghi nhận là "abandoned".
+	// Điều này đồng bộ hành vi với bản Python: report.py dùng chuỗi err == "abandoned" làm tín hiệu nhận diện
+	// điểm gãy quá tải (knee). Bổ sung các bản ghi còn thiếu giúp số lượng record khớp đúng với tổng request đã gửi.
+	for i := int64(0); i < abandoned; i++ {
+		records = append(records, scenarios.Record{
+			Type: "req",
+			Ok:   false,
+			Err:  strPtrMain("abandoned"),
+		})
+	}
+	recMu.Unlock()
 
 	tStepEnd := unixTime(time.Now())
 
@@ -394,6 +426,26 @@ func main() {
 		} else {
 			pool = scenarios.NewUserPool([]scenarios.User{{ID: "", Token: *userToken}})
 			fmt.Println("pool     : 1 token dùng chung (--user-token)")
+		}
+
+		// Kiểm tra kích thước pool user (Rate-limit guard):
+		// Nếu chu kỳ lặp lại token (cycleS = pool.Len() / maxStep) nhỏ hơn ngưỡng an toàn (120s),
+		// cảnh báo nguy cơ chạm rate-limit của từng tài khoản thay vì đo tải thực tế của hệ thống.
+		maxStep := 0.0
+		for _, s := range steps {
+			if s > maxStep {
+				maxStep = s
+			}
+		}
+		if maxStep > 0 {
+			cycleS := float64(pool.Len()) / maxStep
+			if cycleS < 120.0 {
+				if pool.Len() == 1 {
+					fmt.Fprintf(os.Stderr, "CẢNH BÁO: Đang dùng 1 token duy nhất cho đỉnh tải %.1f req/s. Nguy cơ chạm rate-limit của tài khoản thay vì đo công suất hệ thống.\n", maxStep)
+				} else {
+					fmt.Fprintf(os.Stderr, "CẢNH BÁO: Pool chỉ có %d user cho đỉnh tải %.1f req/s (chu kỳ lặp lại %.1fs < 120s). Nguy cơ chạm rate-limit của tài khoản thay vì đo công suất hệ thống.\n", pool.Len(), maxStep, cycleS)
+				}
+			}
 		}
 
 		scenario = scenarios.NewChatSSEScenario(
