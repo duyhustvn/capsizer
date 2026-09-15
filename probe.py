@@ -97,7 +97,9 @@ def cpu_sample() -> dict[str, Any]:
             if k in out:
                 out[k] = int(v)
         return out
-    acct = _read(CG2 / "cpuacct/cpuacct.usage")  # cgroup v1: tính bằng nanogiây, chia 1000 về microgiây
+    acct = _read(
+        CG2 / "cpuacct/cpuacct.usage"
+    )  # cgroup v1: tính bằng nanogiây, chia 1000 về microgiây
     if acct:
         out["usage_usec"] = int(acct.strip()) // 1000
     v1 = _read(CG2 / "cpu/cpu.stat")
@@ -181,52 +183,145 @@ def tcp_sample(port: int) -> dict[str, Any]:
     return {"states": counts, **listen}
 
 
-def worker_sample() -> dict[str, Any]:
-    """Thu thập thông tin về tài nguyên của các tiến trình uvicorn (PID, file descriptor, thread, CPU ticks).
+def worker_sample(pattern: str = "uvicorn") -> dict[str, Any]:
+    """Thu thập thông tin về tài nguyên của các tiến trình uvicorn / ASGI server (PID, file descriptor, thread, CPU ticks).
+
+    Hỗ trợ cả chế độ đơn tiến trình và đa tiến trình (master-worker / multiprocess cluster):
+      - Tự động nhận diện tiến trình master (khớp pattern như uvicorn, gunicorn, granian, fastapi,...).
+      - Truy vết cây tiến trình để phát hiện tất cả các worker con (dù cmdline bị che hoặc chạy qua multiprocessing.spawn).
+      - Tính toán fds_max và threads_max dựa trên các worker trực tiếp gánh tải.
 
     Thông tin thu thập bao gồm:
-      - n_procs: Số lượng tiến trình uvicorn đang chạy (tiến trình master và các worker).
+      - n_procs: Tổng số lượng tiến trình đang chạy (cả master và worker).
+      - n_workers: Số lượng worker thực tế gánh tải.
       - fds_total: Tổng số file descriptor đang mở trên tất cả các tiến trình.
-      - fds_max: Số file descriptor lớn nhất của một tiến trình đơn lẻ.
+      - fds_max: Số file descriptor lớn nhất của một tiến trình worker.
       - threads_max: Số lượng OS thread lớn nhất trong một tiến trình worker.
-      - procs: Danh sách chi tiết từng tiến trình kèm CPU ticks (utime + stime).
+      - procs: Danh sách chi tiết từng tiến trình kèm role ('master' hoặc 'worker').
     """
-    procs: list[dict[str, Any]] = []
-    fd_counts: list[int] = []
-    thread_counts: list[int] = []
+    all_procs: dict[int, dict[str, Any]] = {}
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
-        cmd = _read(f"/proc/{entry}/cmdline")
-        if not cmd or "uvicorn" not in cmd.replace("\x00", " "):
+        pid = int(entry)
+        stat = _read(f"/proc/{pid}/stat")
+        if not stat:
             continue
-        try:
-            fds = len(os.listdir(f"/proc/{entry}/fd"))
-            fd_counts.append(fds)
-        except OSError:
-            fds = -1
-        threads: int | None = None
-        status = _read(f"/proc/{entry}/status")
+        rparen = stat.rfind(")")
+        if rparen < 0:
+            continue
+        tail = stat[rparen + 2 :].split()
+        if len(tail) < 13:
+            continue
+        ppid = int(tail[1])
+        ticks = int(tail[11]) + int(tail[12])  # utime + stime (CPU ticks)
+
+        cmd_raw = _read(f"/proc/{pid}/cmdline") or ""
+        cmd = cmd_raw.replace("\x00", " ").strip()
+
+        threads = None
+        status = _read(f"/proc/{pid}/status")
         if status:
             for line in status.splitlines():
                 if line.startswith("Threads:"):
-                    threads = int(line.split()[1])
-                    thread_counts.append(threads)
+                    try:
+                        threads = int(line.split()[1])
+                    except (IndexError, ValueError):
+                        pass
                     break
-        ticks = None
-        stat = _read(f"/proc/{entry}/stat")
-        if stat:
-            # Trường comm nằm trong ngoặc và có thể chứa khoảng trắng -> cắt từ ")" cuối cùng.
-            tail = stat[stat.rfind(")") + 2 :].split()
-            if len(tail) > 12:
-                ticks = int(tail[11]) + int(tail[12])  # utime + stime (CPU ticks)
-        procs.append({"pid": int(entry), "fds": fds, "threads": threads, "cpu_ticks": ticks})
+
+        try:
+            fds = len(os.listdir(f"/proc/{pid}/fd"))
+        except OSError:
+            fds = -1
+
+        all_procs[pid] = {
+            "pid": pid,
+            "ppid": ppid,
+            "cmd": cmd,
+            "threads": threads,
+            "fds": fds,
+            "cpu_ticks": ticks,
+        }
+
+    keywords = [k.strip().lower() for k in pattern.split("|") if k.strip()]
+    master_pids: set[int] = set()
+    for pid, p in all_procs.items():
+        cmd_lower = p["cmd"].lower()
+        if any(kw in cmd_lower for kw in keywords):
+            master_pids.add(pid)
+
+    # Dự phòng: nếu không tìm thấy tiến trình nào khớp từ khóa mặc định 'uvicorn',
+    # tự động thử với các ASGI/WSGI server phổ biến khác
+    if not master_pids and pattern == "uvicorn":
+        fallback_kws = ["gunicorn", "granian", "hypercorn", "fastapi"]
+        for pid, p in all_procs.items():
+            cmd_lower = p["cmd"].lower()
+            if any(kw in cmd_lower for kw in fallback_kws):
+                master_pids.add(pid)
+
+    # Mở rộng tập tiến trình để bao gồm tất cả các con/cháu (descendants) của master
+    target_pids = set(master_pids)
+    changed = True
+    while changed:
+        changed = False
+        for pid, p in all_procs.items():
+            if pid not in target_pids and p["ppid"] in target_pids:
+                target_pids.add(pid)
+                changed = True
+
+    # Loại các tiến trình phụ trợ của multiprocessing khỏi cây. Chúng là CON của master nên lọt
+    # vào theo PPID, nhưng không phục vụ request nào:
+    #   - resource_tracker: `python -c from multiprocessing.resource_tracker import main;main(6)`
+    #     Luôn có mặt khi dùng ngữ cảnh "spawn" (uvicorn --workers dùng spawn), 1 thread, ~4 fd.
+    #   - forkserver: tương tự với ngữ cảnh "forkserver".
+    # Không loại thì mỗi pod bị đếm dư đúng 1 "worker" -> report.py in "Trần lý thuyết N worker"
+    # cao hơn thực tế (vd 3 thay vì 2, tức thổi phồng 50% một con số dùng để quy hoạch công suất).
+    _HELPER_MARKERS = ("multiprocessing.resource_tracker", "multiprocessing.forkserver")
+    target_pids = {
+        pid for pid in target_pids if not any(m in all_procs[pid]["cmd"] for m in _HELPER_MARKERS)
+    }
+
+    target_procs = [all_procs[pid] for pid in target_pids]
+    # Tiến trình có con nằm trong target_pids đóng vai trò là master / supervisor
+    parent_pids = {p["ppid"] for p in target_procs if p["ppid"] in target_pids}
+
+    workers: list[dict[str, Any]] = []
+    masters: list[dict[str, Any]] = []
+    procs: list[dict[str, Any]] = []
+
+    for p in target_procs:
+        role = "master" if p["pid"] in parent_pids else "worker"
+        procs.append(
+            {
+                "pid": p["pid"],
+                "role": role,
+                "fds": p["fds"],
+                "threads": p["threads"],
+                "cpu_ticks": p["cpu_ticks"],
+            }
+        )
+        if role == "worker":
+            workers.append(p)
+        else:
+            masters.append(p)
+
     procs.sort(key=lambda p: p["pid"])
+
+    # Ưu tiên lấy fds_max và threads_max của nhóm worker trực tiếp nhận request.
+    # Nếu không phân tách được worker (chạy 1 tiến trình duy nhất), lấy từ toàn bộ target_procs.
+    active_workers = workers if workers else target_procs
+
+    worker_fds = [p["fds"] for p in active_workers if p["fds"] >= 0]
+    worker_threads = [p["threads"] for p in active_workers if p["threads"] is not None]
+    all_fds = [p["fds"] for p in target_procs if p["fds"] >= 0]
+
     return {
-        "n_procs": len(procs),
-        "fds_total": sum(fd_counts),
-        "fds_max": max(fd_counts, default=None),
-        "threads_max": max(thread_counts, default=None),
+        "n_procs": len(target_procs),
+        "n_workers": len(workers) if workers else len(target_procs),
+        "fds_total": sum(all_fds),
+        "fds_max": max(worker_fds, default=None),
+        "threads_max": max(worker_threads, default=None),
         "procs": procs,
     }
 
@@ -261,7 +356,7 @@ def snapshot(args: argparse.Namespace) -> dict[str, Any]:
         s.update(cpu_sample())
         s["mem_bytes"] = mem_bytes()
         s["tcp"] = tcp_sample(args.port)
-        s["workers"] = worker_sample()
+        s["workers"] = worker_sample(pattern=getattr(args, "proc_pattern", "uvicorn"))
     s.update(health_sample(args.target.rstrip("/") + "/health/live", args.health_timeout))
     return s
 
@@ -282,6 +377,11 @@ def main() -> int:
     p.add_argument("--health-timeout", type=float, default=5.0)
     p.add_argument("--no-cgroup", action="store_true", help="chạy ngoài pod: chỉ đo health")
     p.add_argument("--once", action="store_true", help="in một snapshot rồi thoát")
+    p.add_argument(
+        "--proc-pattern",
+        default="uvicorn",
+        help="từ khóa lọc tiến trình ứng dụng (mặc định: uvicorn, hỗ trợ uvicorn, gunicorn, granian,...)",
+    )
     args = p.parse_args()
 
     quota = cpu_quota_cores()
@@ -320,7 +420,9 @@ def main() -> int:
                 if sleep > 0:
                     time.sleep(sleep)
                 else:
-                    next_t = time.monotonic()  # Chậm nhịp lấy mẫu -> đặt lại mốc thời gian tiếp theo
+                    next_t = (
+                        time.monotonic()
+                    )  # Chậm nhịp lấy mẫu -> đặt lại mốc thời gian tiếp theo
         except KeyboardInterrupt:
             print("\ndừng probe.")
     return 0

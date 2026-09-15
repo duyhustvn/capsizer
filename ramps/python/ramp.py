@@ -30,7 +30,13 @@ from typing import Any, TextIO
 import httpx
 
 # Nạp giao diện kịch bản và danh mục các kịch bản có sẵn
-from scenarios import REGISTRY, ChatSSEScenario, RestScenario, Scenario
+from scenarios import (
+    DEFAULT_USERS_CSV,
+    REGISTRY,
+    ChatSSEScenario,
+    RestScenario,
+    Scenario,
+)
 
 __all__ = ["Scenario", "ChatSSEScenario", "RestScenario", "main", "main_async"]
 
@@ -123,9 +129,7 @@ async def _run_step(
         try:
             records.append(task.result())
         except asyncio.CancelledError:
-            records.append(
-                {"type": "req", "ok": False, "err": "abandoned", "total_ms": None}
-            )
+            records.append({"type": "req", "ok": False, "err": "abandoned", "total_ms": None})
 
     t_step_start = time.time()
     out.write(json.dumps({"type": "step_start", "rps": rps, "t": t_step_start}) + "\n")
@@ -213,9 +217,7 @@ async def main_async(
     }
     out.write(json.dumps(meta) + "\n")
 
-    async with httpx.AsyncClient(
-        limits=limits, http2=False, verify=not args.insecure
-    ) as client:
+    async with httpx.AsyncClient(limits=limits, http2=False, verify=not args.insecure) as client:
         await scenario.setup(client)
         for rps in steps:
             s = await _run_step(client, args, scenario, rps, out)
@@ -277,30 +279,18 @@ def main() -> int:
 
     # Cấu hình bài test tải chung
     p.add_argument("--url", default="http://127.0.0.1:8000/chat")
-    p.add_argument(
-        "--steps", default="1,2,4,8,16,32", help="danh sách RPS, cách nhau dấu phẩy"
-    )
-    p.add_argument(
-        "--step-seconds", type=float, default=60.0, help="độ dài mỗi bậc (giây)"
-    )
-    p.add_argument(
-        "--cooldown", type=float, default=20.0, help="nghỉ giữa hai bậc (giây)"
-    )
-    p.add_argument(
-        "--settle", type=float, default=60.0, help="chờ tối đa cho in-flight cuối bậc"
-    )
-    p.add_argument(
-        "--timeout", type=float, default=120.0, help="read timeout mỗi request (giây)"
-    )
-    p.add_argument(
-        "--max-inflight", type=int, default=2000, help="trần in-flight của MÁY BẮN TẢI"
-    )
+    p.add_argument("--steps", default="1,2,4,8,16,32", help="danh sách RPS, cách nhau dấu phẩy")
+    p.add_argument("--step-seconds", type=float, default=60.0, help="độ dài mỗi bậc (giây)")
+    p.add_argument("--cooldown", type=float, default=20.0, help="nghỉ giữa hai bậc (giây)")
+    p.add_argument("--settle", type=float, default=60.0, help="chờ tối đa cho in-flight cuối bậc")
+    p.add_argument("--timeout", type=float, default=120.0, help="read timeout mỗi request (giây)")
+    p.add_argument("--max-inflight", type=int, default=2000, help="trần in-flight của MÁY BẮN TẢI")
 
     # Cấu hình xác thực và dữ liệu Chatbot
     p.add_argument(
         "--users-csv",
-        default="",
-        help="CSV pool user (chứa cột token/user_token). Mặc định dùng users.csv nếu tồn tại.",
+        default=str(DEFAULT_USERS_CSV) if DEFAULT_USERS_CSV.is_file() else "",
+        help="CSV pool user (chứa cột token/user_token). Mặc định tự nạp users.csv nếu tồn tại.",
     )
     p.add_argument(
         "--user-token",
@@ -313,9 +303,7 @@ def main() -> int:
         default="",
         help="secret ký token HS256; mặc định đọc biến môi trường JWT_SECRET",
     )
-    p.add_argument(
-        "--queries", default="", help="file câu hỏi cho chatbot, mỗi dòng một câu"
-    )
+    p.add_argument("--queries", default="", help="file câu hỏi cho chatbot, mỗi dòng một câu")
     p.add_argument(
         "--insecure",
         action="store_true",
@@ -326,9 +314,7 @@ def main() -> int:
         action="store_true",
         help="thêm mã ngẫu nhiên vào câu hỏi để tránh cache",
     )
-    p.add_argument(
-        "--stop-on-knee", action="store_true", help="dừng khi achieved < 90%% offered"
-    )
+    p.add_argument("--stop-on-knee", action="store_true", help="dừng khi achieved < 90%% offered")
     p.add_argument(
         "--env-file",
         default=".env",
