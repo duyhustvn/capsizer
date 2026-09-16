@@ -56,6 +56,21 @@ func strPtrMain(s string) *string {
 	return &s
 }
 
+const (
+	colorReset  = "\033[0m"
+	colorGreen  = "\033[1;32m"
+	colorYellow = "\033[1;33m"
+	colorBlue   = "\033[1;36m"
+)
+
+func isTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
 func percentile(xs []float64, p float64) *float64 {
 	if len(xs) == 0 {
 		return nil
@@ -116,11 +131,15 @@ func runStep(
 	ctx context.Context,
 	client *http.Client,
 	scenario scenarios.Scenario,
+	stepIdx int,
+	totalSteps int,
 	rps float64,
 	stepSeconds float64,
 	settleSeconds float64,
 	maxInflight int,
 	outWriter *bufio.Writer,
+	statusFilePath string,
+	term bool,
 ) (StepResult, error) {
 	interval := time.Duration(float64(time.Second) / rps)
 
@@ -132,11 +151,11 @@ func runStep(
 	var inflight atomic.Int64
 	var maxInflightSeen atomic.Int64
 	var dropped atomic.Int64
+	var n atomic.Int64
 
 	var wg sync.WaitGroup
 
 	stepDeadline := time.Now().Add(time.Duration(stepSeconds * float64(time.Second)))
-	n := int64(0)
 	startTime := time.Now()
 
 	stepCtx, cancelStep := context.WithCancel(ctx)
@@ -159,6 +178,72 @@ func runStep(
 		}
 	}
 
+	// Goroutine cập nhật trạng thái thời gian thực (Zero overhead: chạy nền độc lập mỗi 250ms)
+	var phase atomic.Int32 // 0: RAMPING (đang bắn tải), 1: SETTLING (đang chờ request dở dang)
+	var settleStartNano atomic.Int64
+	doneStatus := make(chan struct{})
+
+	updateStatus := func(now time.Time) {
+		curInflight := inflight.Load()
+		curDropped := dropped.Load()
+		curSent := n.Load() - curDropped
+		curPhase := phase.Load()
+
+		if curPhase == 0 {
+			elapsed := now.Sub(startTime).Seconds()
+			if elapsed > stepSeconds {
+				elapsed = stepSeconds
+			}
+			remain := stepSeconds - elapsed
+			if remain < 0 {
+				remain = 0
+			}
+
+			if term {
+				fmt.Fprintf(os.Stdout, "\r\033[K%s[▶ BẮN TẢI - ĐO TÀI NGUYÊN]%s Bậc %d/%d (%.1f rps) | Đã chạy: %.0fs/%.0fs (còn %.0fs) | Inflight: %d | Đã phát: %d",
+					colorGreen, colorReset, stepIdx, totalSteps, rps, elapsed, stepSeconds, remain, curInflight, curSent)
+			}
+			if statusFilePath != "" {
+				_ = os.WriteFile(statusFilePath, []byte(fmt.Sprintf(
+					"PHASE=RAMPING\nSTEP=%d/%d\nRPS=%.1f\nELAPSED=%.1fs\nDURATION=%.0fs\nREMAIN=%.1fs\nINFLIGHT=%d\nSENT=%d\nDROPPED=%d\nSHOULD_COLLECT=YES\nACTION=DANG_BAN_TAI_THU_THAP_NGAY\n",
+					stepIdx, totalSteps, rps, elapsed, stepSeconds, remain, curInflight, curSent, curDropped)), 0644)
+			}
+		} else {
+			sNano := settleStartNano.Load()
+			elapsedSettle := 0.0
+			if sNano > 0 {
+				elapsedSettle = float64(now.UnixNano()-sNano) / 1e9
+			}
+			remainSettle := settleSeconds - elapsedSettle
+			if remainSettle < 0 {
+				remainSettle = 0
+			}
+
+			if term {
+				fmt.Fprintf(os.Stdout, "\r\033[K%s[⏳ CHỜ SETTLE - CÒN REQUEST]%s Bậc %d/%d (%.1f rps) | Chờ %d req dở dang... | Settle còn: %.0fs/%.0fs",
+					colorYellow, colorReset, stepIdx, totalSteps, rps, curInflight, remainSettle, settleSeconds)
+			}
+			if statusFilePath != "" {
+				_ = os.WriteFile(statusFilePath, []byte(fmt.Sprintf(
+					"PHASE=SETTLING\nSTEP=%d/%d\nRPS=%.1f\nINFLIGHT=%d\nREMAIN_SETTLE=%.0fs\nSETTLE_TIMEOUT=%.0fs\nSHOULD_COLLECT=YES\nACTION=DANG_DOI_REQUEST_DO_DANG_HOAN_TAT\n",
+					stepIdx, totalSteps, rps, curInflight, remainSettle, settleSeconds)), 0644)
+			}
+		}
+	}
+
+	go func() {
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-doneStatus:
+				return
+			case now := <-ticker.C:
+				updateStatus(now)
+			}
+		}
+	}()
+
 	// Dùng nhãn launchLoop để lệnh break thoát hẳn vòng lặp for khi context bị hủy (ctx.Done())
 	// hoặc quá deadline bước test. Trong Go, lệnh break không nhãn bên trong select chỉ thoát khỏi
 	// khối select chứ không dừng vòng lặp bao ngoài.
@@ -170,7 +255,8 @@ launchLoop:
 		default:
 		}
 
-		targetTime := startTime.Add(time.Duration(float64(n) * float64(interval)))
+		curN := n.Load()
+		targetTime := startTime.Add(time.Duration(float64(curN) * float64(interval)))
 		now := time.Now()
 		if targetTime.After(stepDeadline) || now.After(stepDeadline) {
 			break launchLoop
@@ -180,7 +266,7 @@ launchLoop:
 		if delay > 0 {
 			time.Sleep(delay)
 		}
-		n++
+		n.Add(1)
 
 		curInflight := inflight.Load()
 		if curInflight >= int64(maxInflight) {
@@ -208,6 +294,11 @@ launchLoop:
 		}()
 	}
 
+	// Chuyển sang giai đoạn chờ settle các request in-flight dở dang
+	settleStartNano.Store(time.Now().UnixNano())
+	phase.Store(1)
+	updateStatus(time.Now())
+
 	// Giai đoạn thu hồi (settle/drain) các request dở dang cuối bước
 	settleDone := make(chan struct{})
 	go func() {
@@ -227,11 +318,17 @@ launchLoop:
 		}
 	}
 
+	// Dừng goroutine hiển thị trạng thái động và xóa sạch dòng trạng thái
+	close(doneStatus)
+	if term {
+		fmt.Print("\r\033[K")
+	}
+
 	// Dừng thu thập record: từ thời điểm này, các goroutine về muộn sẽ bị addRecord() bỏ qua
 	// để bảo vệ slice records khỏi race condition khi đọc và ghi file.
 	recMu.Lock()
 	collecting = false
-	launched := n - dropped.Load()
+	launched := n.Load() - dropped.Load()
 	abandoned := launched - int64(len(records))
 
 	// Các request đã phát ra nhưng không kịp phản hồi trong thời gian settle được ghi nhận là "abandoned".
@@ -274,7 +371,7 @@ launchLoop:
 
 	return StepResult{
 		RpsOffered:         rps,
-		Sent:               int(n - dropped.Load()),
+		Sent:               int(n.Load() - dropped.Load()),
 		DroppedByGenerator: int(dropped.Load()),
 		CompletedOk:        completedOk,
 		Errors:             errorsCount,
@@ -312,6 +409,7 @@ func main() {
 		cacheBust    = flag.Bool("cache-bust", false, "thêm mã ngẫu nhiên vào câu hỏi để tránh cache")
 		stopOnKnee   = flag.Bool("stop-on-knee", false, "dừng khi achieved < 90% offered")
 		outFile      = flag.String("out", "loadtest-ramp.jsonl", "file JSONL xuất kết quả kiểm thử tải")
+		statusFile   = flag.String("status-file", "/tmp/capsizer-status.txt", "file ghi trạng thái thời gian thực (để tách panel riêng theo dõi hoặc cho script giám sát)")
 	)
 
 	var headersFlag headerList
@@ -518,11 +616,19 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	term := isTerminal()
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
+		if term {
+			fmt.Print("\r\033[K")
+		}
 		fmt.Println("\nNhận tín hiệu dừng (Ctrl+C). Đang hoàn tất...")
+		if *statusFile != "" {
+			_ = os.WriteFile(*statusFile, []byte("PHASE=INTERRUPTED\nSHOULD_COLLECT=NO\nACTION=DUNG_TIEN_TRINH_KIEM_THU\n"), 0644)
+		}
 		cancel()
 	}()
 
@@ -538,7 +644,7 @@ func main() {
 		default:
 		}
 
-		res, err := runStep(ctx, client, scenario, rps, *stepSeconds, *settle, *maxInflight, outWriter)
+		res, err := runStep(ctx, client, scenario, i+1, len(steps), rps, *stepSeconds, *settle, *maxInflight, outWriter, *statusFile, term)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR khi chạy bậc %.1f: %v\n", rps, err)
 			break
@@ -555,12 +661,41 @@ func main() {
 		}
 
 		if i < len(steps)-1 && *cooldown > 0 {
-			select {
-			case <-ctx.Done():
-				break
-			case <-time.After(time.Duration(*cooldown * float64(time.Second))):
+			cooldownStart := time.Now()
+			cooldownTicker := time.NewTicker(250 * time.Millisecond)
+			cooldownDone := false
+
+			for !cooldownDone {
+				select {
+				case <-ctx.Done():
+					cooldownDone = true
+				case now := <-cooldownTicker.C:
+					elapsed := now.Sub(cooldownStart).Seconds()
+					remain := *cooldown - elapsed
+					if remain <= 0 {
+						cooldownDone = true
+						break
+					}
+					if term {
+						fmt.Fprintf(os.Stdout, "\r\033[K%s[☕ NGHỈ COOLDOWN - KHÔNG THU THẬP]%s Nghỉ xả tải giữa 2 bậc... còn %.0fs/%.0fs",
+							colorBlue, colorReset, remain, *cooldown)
+					}
+					if *statusFile != "" {
+						_ = os.WriteFile(*statusFile, []byte(fmt.Sprintf(
+							"PHASE=COOLDOWN\nSTEP_AFTER=%d/%d\nREMAIN=%.0fs\nTOTAL=%.0fs\nSHOULD_COLLECT=NO\nACTION=HE_THONG_DANG_NGHI_KHONG_THU_THAP\n",
+							i+1, len(steps), remain, *cooldown)), 0644)
+					}
+				}
+			}
+			cooldownTicker.Stop()
+			if term {
+				fmt.Print("\r\033[K")
 			}
 		}
+	}
+
+	if *statusFile != "" {
+		_ = os.WriteFile(*statusFile, []byte("PHASE=FINISHED\nSHOULD_COLLECT=NO\nACTION=HOAN_TAT_RAMP\n"), 0644)
 	}
 
 	_ = outWriter.Flush()
