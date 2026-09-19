@@ -46,6 +46,34 @@ func NewRestScenario(
 func (s *RestScenario) Name() string        { return "rest" }
 func (s *RestScenario) MetricLabel() string { return "lat" }
 func (s *RestScenario) Setup(ctx context.Context, client *http.Client) error {
+	// Thực hiện 1 request smoke-test / dry-run:
+	// 1. Kiểm tra kết nối, URL, Authentication (fail-fast)
+	// 2. Làm ấm connection pool (TCP/TLS handshake) của http.Client
+	// 3. Đánh thức backend/worker lần đầu
+	t0 := time.Now()
+	setupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	rec := s.Execute(setupCtx, client)
+	elapsed := time.Since(t0)
+
+	if !rec.Ok {
+		errDetail := "unknown error"
+		if rec.Err != nil {
+			errDetail = *rec.Err
+		}
+		statusStr := "không có HTTP response"
+		if rec.Status != nil {
+			statusStr = fmt.Sprintf("HTTP %d", *rec.Status)
+		}
+		return fmt.Errorf("warmup thất bại (%s): %s", statusStr, errDetail)
+	}
+
+	statusCode := 0
+	if rec.Status != nil {
+		statusCode = *rec.Status
+	}
+	fmt.Printf("warmup   : kiểm tra kết nối & làm ấm connection pool... OK (status: %d, latency: %v)\n", statusCode, elapsed.Round(time.Millisecond))
 	return nil
 }
 

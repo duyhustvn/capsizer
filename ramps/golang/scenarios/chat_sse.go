@@ -21,9 +21,6 @@ import (
 	"time"
 )
 
-// DefaultQueries danh sách câu hỏi kiểm thử mẫu chung cho chatbot (dự phòng khi không cấu hình .env).
-var DefaultQueries = []string{}
-
 // LoadDotEnv tìm và nạp các biến môi trường từ file .env vào process (os.Setenv) nếu chưa tồn tại.
 func LoadDotEnv(path string) map[string]string {
 	var candidates []string
@@ -241,9 +238,8 @@ func ResolveQueries(queriesFile string, envFile string) []string {
 		}
 	}
 
-	// 4. Dự phòng mặc định
-	fmt.Println("queries  : dùng danh sách câu hỏi mẫu mặc định (chưa cấu hình CHAT_QUERIES trong .env)")
-	return DefaultQueries
+	// Không tìm thấy câu hỏi từ cờ dòng lệnh hoặc cấu hình .env
+	return nil
 }
 
 // MintJWT sinh JWT HS256 nội bộ với role super_admin.
@@ -396,9 +392,6 @@ func NewChatSSEScenario(
 	if _, ok := hdrs["Content-Type"]; !ok {
 		hdrs["Content-Type"] = "application/json"
 	}
-	if len(queries) == 0 {
-		queries = DefaultQueries
-	}
 	return &ChatSSEScenario{
 		url:       url,
 		headers:   hdrs,
@@ -412,11 +405,42 @@ func NewChatSSEScenario(
 func (s *ChatSSEScenario) Name() string        { return "chat-sse" }
 func (s *ChatSSEScenario) MetricLabel() string { return "ttft" }
 func (s *ChatSSEScenario) Setup(ctx context.Context, client *http.Client) error {
+	// Thực hiện 1 request smoke-test / dry-run:
+	// 1. Kiểm tra kết nối, URL, Authentication (fail-fast)
+	// 2. Làm ấm connection pool (TCP/TLS handshake) của http.Client
+	// 3. Đánh thức backend/worker lần đầu
+	t0 := time.Now()
+	setupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	rec := s.Execute(setupCtx, client)
+	elapsed := time.Since(t0)
+
+	if !rec.Ok {
+		errDetail := "unknown error"
+		if rec.Err != nil {
+			errDetail = *rec.Err
+		}
+		statusStr := "không có HTTP response"
+		if rec.Status != nil {
+			statusStr = fmt.Sprintf("HTTP %d", *rec.Status)
+		}
+		return fmt.Errorf("warmup thất bại (%s): %s", statusStr, errDetail)
+	}
+
+	ttftStr := "-"
+	if rec.TtftMs != nil {
+		ttftStr = fmt.Sprintf("%.0fms", *rec.TtftMs)
+	}
+	fmt.Printf("warmup   : kiểm tra kết nối & làm ấm connection pool... OK (TTFT: %s, total: %v)\n", ttftStr, elapsed.Round(time.Millisecond))
 	return nil
 }
 
 func (s *ChatSSEScenario) Execute(ctx context.Context, client *http.Client) Record {
-	q := s.queries[rand.Intn(len(s.queries))]
+	q := "Xin chào"
+	if len(s.queries) > 0 {
+		q = s.queries[rand.Intn(len(s.queries))]
+	}
 	if s.cacheBust {
 		q = fmt.Sprintf("%s (ma tham chieu %d)", q, rand.Intn(900000)+100000)
 	}

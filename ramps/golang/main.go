@@ -410,6 +410,8 @@ func main() {
 		stopOnKnee   = flag.Bool("stop-on-knee", false, "dừng khi achieved < 90% offered")
 		outFile      = flag.String("out", "loadtest-ramp.jsonl", "file JSONL xuất kết quả kiểm thử tải")
 		statusFile   = flag.String("status-file", "/tmp/capsizer-status.txt", "file ghi trạng thái thời gian thực (để tách panel riêng theo dõi hoặc cho script giám sát)")
+		baselineWait = flag.Float64("baseline-wait", 90.0, "thời gian chờ đo CPU nền trước khi bắn bậc 1 (giây; 0 để bỏ qua)")
+		skipWarmup   = flag.Bool("skip-warmup", false, "bỏ qua request warmup/smoke-test trước khi bắt đầu")
 	)
 
 	var headersFlag headerList
@@ -502,6 +504,10 @@ func main() {
 	} else {
 		// Default: chat-sse
 		queries := scenarios.ResolveQueries(*queriesFile, *envFile)
+		if len(queries) == 0 {
+			fmt.Fprintln(os.Stderr, "ERROR: không tìm thấy danh sách câu hỏi kiểm thử. Vui lòng cung cấp file câu hỏi qua cờ --queries hoặc khai báo CHAT_QUERIES / CHAT_QUERIES_FILE trong .env")
+			os.Exit(2)
+		}
 
 		csvFile := *usersCSV
 		if csvFile == "" {
@@ -580,18 +586,6 @@ func main() {
 	_, _ = outWriter.Write(append(runMetaBytes, '\n'))
 	_ = outWriter.Flush()
 
-	fmt.Printf("target   : %s\n", *targetURL)
-	fmt.Printf("scenario : %s\n", scenario.Name())
-	fmt.Printf("steps    : %v x %.0fs (settle %.0fs)\n", steps, *stepSeconds, *settle)
-	fmt.Printf("out      : %s\n", *outFile)
-
-	p50Lbl := fmt.Sprintf("%s_p50", scenario.MetricLabel())
-	p95Lbl := fmt.Sprintf("%s_p95", scenario.MetricLabel())
-	hdr := fmt.Sprintf("%8s %9s %6s %5s %5s %9s %9s %9s",
-		"offered", "achieved", "ok", "err", "drop", p50Lbl, p95Lbl, "inflight")
-	fmt.Println(hdr)
-	fmt.Println(strings.Repeat("-", len(hdr)))
-
 	// Cấu hình HTTP client hiệu năng cao với Connection Pooling lớn
 	capConn := *maxInflight + 64
 	transport := &http.Transport{
@@ -632,10 +626,65 @@ func main() {
 		cancel()
 	}()
 
-	if err := scenario.Setup(ctx, client); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: setup kịch bản thất bại: %v\n", err)
-		os.Exit(2)
+	fmt.Printf("target   : %s\n", *targetURL)
+	fmt.Printf("scenario : %s\n", scenario.Name())
+	fmt.Printf("steps    : %v x %.0fs (settle %.0fs)\n", steps, *stepSeconds, *settle)
+	fmt.Printf("out      : %s\n", *outFile)
+
+	// 1. Thực hiện Warmup / Smoke test (1 request dry-run làm ấm kết nối và kiểm tra tính sẵn sàng)
+	if !*skipWarmup {
+		if err := scenario.Setup(ctx, client); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(2)
+		}
 	}
+
+	// 2. Chờ đo CPU nền (Idle Baseline) đồng nhất trước khi phát tải
+	if *baselineWait > 0 {
+		baseStart := time.Now()
+		ticker := time.NewTicker(250 * time.Millisecond)
+		baseDone := false
+
+		for !baseDone {
+			select {
+			case <-ctx.Done():
+				baseDone = true
+			case now := <-ticker.C:
+				elapsed := now.Sub(baseStart).Seconds()
+				remain := *baselineWait - elapsed
+				if remain <= 0 {
+					baseDone = true
+					break
+				}
+				if term {
+					fmt.Fprintf(os.Stdout, "\r\033[K%s[⏳ ĐO CPU NỀN - BASELINE]%s Để hệ thống nghỉ để probe đo CPU nền... còn %.0fs/%.0fs",
+						colorBlue, colorReset, remain, *baselineWait)
+				}
+				if *statusFile != "" {
+					_ = os.WriteFile(*statusFile, []byte(fmt.Sprintf(
+						"PHASE=BASELINE\nREMAIN=%.0fs\nTOTAL=%.0fs\nSHOULD_COLLECT=YES\nACTION=DANG_DO_CPU_NEN_IDLE\n",
+						remain, *baselineWait)), 0644)
+				}
+			}
+		}
+		ticker.Stop()
+		if term {
+			fmt.Print("\r\033[K")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		fmt.Printf("baseline : hoàn tất đo CPU nền (%.0fs). Bắt đầu phát tải...\n", *baselineWait)
+	}
+
+	p50Lbl := fmt.Sprintf("%s_p50", scenario.MetricLabel())
+	p95Lbl := fmt.Sprintf("%s_p95", scenario.MetricLabel())
+	hdr := fmt.Sprintf("%8s %9s %6s %5s %5s %9s %9s %9s",
+		"offered", "achieved", "ok", "err", "drop", p50Lbl, p95Lbl, "inflight")
+	fmt.Println(hdr)
+	fmt.Println(strings.Repeat("-", len(hdr)))
 
 	for i, rps := range steps {
 		select {

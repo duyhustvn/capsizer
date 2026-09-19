@@ -189,13 +189,14 @@ sequenceDiagram
     participant Generator as Máy Phát Tải (Ramp)
     participant Analyzer as Máy Phân Tích (Report)
 
-    Note over Dev,Pod: Giai đoạn 1: Đo CPU nền (Idle Baseline)
+    Note over Dev,Pod: Giai đoạn 1: Khởi động probe trên Pod
     Dev->>Pod: Khởi động probe.py ngầm (ghi probe.jsonl)
-    Dev->>Dev: Đợi 90 - 120 giây (không bắn tải)
     
-    Note over Dev,Generator: Giai đoạn 2: Phát tải bậc thang
+    Note over Dev,Generator: Giai đoạn 2: Khởi chạy bộ tạo tải Go (Tự động hóa hoàn toàn)
     Dev->>Generator: Chạy ramps/golang (--steps 1,2,4,8,16,32)
-    Generator->>Pod: Phát tải SSE POST /chat (open-loop)
+    Generator->>Pod: a. Warmup 1 req (kiểm tra kết nối & làm ấm connection pool)
+    Generator->>Generator: b. Tự động đếm lùi 90s để probe đo CPU nền chuẩn xác
+    Generator->>Pod: c. Bắt đầu phát tải bậc thang Open-Loop
     Generator->>Generator: Ghi log loadtest-ramp.jsonl
     
     Note over Dev,Pod: Giai đoạn 3: Dừng đo & Thu thập dữ liệu
@@ -277,11 +278,13 @@ cd ramps/golang && go build -o capsizer-ramp .
 | `-user-token` | `loadtest-token` | Token dùng chung khi không sử dụng file CSV (cho kịch bản `chat-sse`) |
 | `-jwt` | `""` | JWT token có sẵn gửi trong header `Authorization: Bearer <token>` |
 | `-jwt-secret` | `$JWT_SECRET` | Secret ký HS256 JWT nếu chưa có sẵn token (quyền `super_admin`) |
-| `-queries` | `""` | File chứa danh sách câu hỏi kiểm thử cho chatbot (mỗi dòng một câu, ưu tiên hơn `.env`) |
+| `-queries` | `""` | File chứa danh sách câu hỏi kiểm thử cho chatbot (bắt buộc cho `chat-sse` nếu không cấu hình `.env`, mỗi dòng một câu) |
 | `-env-file` | `.env` | File cấu hình môi trường chứa `CHAT_QUERIES`, `JWT_SECRET`,... |
 | `-insecure` | `false` | Bỏ qua kiểm tra chứng chỉ TLS (khi qua Ingress cert tự ký) |
 | `-cache-bust` | `false` | Thêm mã ngẫu nhiên vào câu hỏi để tránh cache |
 | `-stop-on-knee` | `false` | Tự động ngắt kịch bản khi `achieved < 90% offered` |
+| `-baseline-wait` | `90.0` | Thời gian chờ hệ thống nghỉ để đo CPU nền chuẩn xác trước bậc 1 (giây; đặt `0` để bỏ qua) |
+| `-skip-warmup` | `false` | Bỏ qua bước kiểm tra kết nối & làm ấm connection pool ban đầu |
 | `-out` | `loadtest-ramp.jsonl` | File JSONL xuất kết quả kiểm thử tải |
 
 *(Lưu ý: Bộ cờ của Go hỗ trợ cả cú pháp 1 gạch ngang `-flag` và 2 gạch ngang `--flag`).*
@@ -295,10 +298,12 @@ cd ramps/golang && go build -o capsizer-ramp .
   go run . \
     -scenario chat-sse \
     -url "https://api.example.com/chat" \
+    -queries queries.txt \
     -users-csv users.csv \
     -steps "2,4,8,12,16" \
     -step-seconds 60 \
     -cooldown 20 \
+    -baseline-wait 90 \
     -stop-on-knee \
     -insecure \
     -out loadtest-ramp.jsonl
@@ -456,8 +461,8 @@ kubectl cp probe.py ${NAMESPACE}/${POD_NAME}:/tmp/probe.py
 kubectl exec -n ${NAMESPACE} ${POD_NAME} -- \
   python3 /tmp/probe.py --port 8000 --out /tmp/probe.jsonl
 ```
-> [!IMPORTANT]
-> **Chờ tối thiểu 90 - 120 giây** trước khi chuyển sang bước 2. Điều này giúp `probe.py` đo được chính xác mức tiêu thụ CPU nền khi ứng dụng ở trạng thái nghỉ (idle baseline), tránh ảnh hưởng của các tác vụ nền định kỳ.
+> [!TIP]
+> **Tự động hóa hoàn toàn việc lấy CPU nền:** Bạn không cần phải bấm giờ chờ đợi thủ công! Ngay sau khi bật `probe.py` ở terminal 1, bạn có thể chuyển sang terminal 2 để khởi chạy `ramps/golang` ngay lập tức. Bộ tạo tải Go sẽ tự động thực hiện warmup và đếm lùi chính xác 90 giây (`-baseline-wait 90`) để `probe.py` thu thập CPU nền trước khi bắt đầu phát tải Bậc 1.
 
 ### Bước 2: Khởi chạy bộ tạo tải Go (`ramps/golang`)
 Mở terminal 2 (trên máy phát tải bên ngoài), thực thi lệnh:
@@ -467,11 +472,13 @@ export JWT_SECRET="your-secret-key"
 cd ramps/golang
 go run . \
   -url "https://api.example.com/chat" \
+  -queries queries.txt \
   -users-csv users.csv \
   -steps "1,2,4,8,12,16" \
   -step-seconds 60 \
   -cooldown 20 \
   -settle 60 \
+  -baseline-wait 90 \
   -insecure \
   -stop-on-knee \
   -out /tmp/loadtest-ramp.jsonl
