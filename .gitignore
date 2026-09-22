@@ -32,3 +32,8 @@ build/
 .idea/
 .DS_Store
 *.swp
+
+# Go binaries
+probe
+probe-*
+*.exe
