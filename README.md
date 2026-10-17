@@ -1,11 +1,11 @@
 # Capsizer: Bộ công cụ kiểm thử tải & Định chuẩn hiệu năng (Capacity Sizing)
 
-Bộ công cụ chuyên dụng dùng để đo lường, kiểm thử tải và định chuẩn hiệu năng (benchmarking & capacity sizing) cho các dịch vụ Backend / AI Chatbot (FastAPI, Uvicorn, SSE Streaming).
+Bộ công cụ chuyên dụng viết bằng **Golang** dùng để đo lường, kiểm thử tải và định chuẩn hiệu năng (benchmarking & capacity sizing) cho các dịch vụ Backend / AI Chatbot (FastAPI, Uvicorn, Gin, Echo, SSE Streaming,...).
 
 Bộ công cụ giúp trả lời các câu hỏi cốt lõi về mặt kỹ thuật:
 1. **Thông lượng tối đa (Max RPS)** mà một Pod / Instance có thể chịu được trước khi gãy là bao nhiêu?
 2. **Chi phí CPU cho mỗi request ($C$)** là bao nhiêu mili-giây?
-3. **Cấu hình bao nhiêu worker Uvicorn và cấp bao nhiêu CPU core (cgroup quota)** là tối ưu?
+3. **Cấu hình bao nhiêu worker và cấp bao nhiêu CPU core (cgroup quota)** là tối ưu?
 4. **Điểm gãy (knee point / saturation point)** xảy ra do đâu: nghẽn CPU (CFS throttling), nghẽn Event Loop hay ứ đọng hàng đợi TCP (accept queue)?
 
 ---
@@ -19,9 +19,9 @@ Bộ công cụ giúp trả lời các câu hỏi cốt lõi về mặt kỹ thu
 - [3. Yêu cầu môi trường & Cài đặt](#3-yêu-cầu-môi-trường--cài-đặt)
 - [4. Hướng dẫn chạy từng bước (Workflow chuẩn)](#4-hướng-dẫn-chạy-từng-bước-workflow-chuẩn)
 - [5. Hướng dẫn chi tiết từng công cụ](#5-hướng-dẫn-chi-tiết-từng-công-cụ)
-  - [probe.py & probe.go - Thu thập chỉ số hệ thống (Python & Golang)](#probepy--probego---thu-thập-chỉ-số-hệ-thống-python--golang)
+  - [probe.go - Thu thập chỉ số hệ thống (Static Binary)](#probego---thu-thập-chỉ-số-hệ-thống-static-binary)
   - [ramps/golang - Bộ phát tải Open-Loop Go (Đa kịch bản)](#rampsgolang---bộ-phát-tải-open-loop-go-đa-kịch-bản-chat-sse-rest-api)
-  - [report.py - Phân tích dữ liệu & Lập báo cáo](#reportpy---phân-tích-dữ-liệu--lập-báo-cáo)
+  - [report.go - Phân tích dữ liệu & Lập báo cáo](#reportgo---phân-tích-dữ-liệu--lập-báo-cáo)
 - [6. Kịch bản thực tế mẫu (End-to-End Walkthrough)](#6-kịch-bản-thực-tế-mẫu-end-to-end-walkthrough)
 - [7. Các lưu ý kỹ thuật quan trọng (Best Practices)](#7-các-lưu-ý-kỹ-thuật-quan-trọng-best-practices)
 - [8. Capsizer khác gì các bài kiểm thử hiệu năng truyền thống?](#8-capsizer-khác-gì-các-bài-kiểm-thử-hiệu-năng-truyền-thống)
@@ -47,7 +47,7 @@ flowchart TD
     subgraph K8sNode["MÁY CHỦ MỤC TIÊU - Kubernetes Node"]
         subgraph TargetPod["TARGET POD / CONTAINER"]
             AppServer["App Server (FastAPI / Gin / Echo / ...)"]
-            Probe["probe.py (Python) / probe (Go Static Binary)"]
+            Probe["probe (Go Static Binary từ probe.go)"]
             ProbeOut[("probe.jsonl")]
             
             Probe -->|Ghi snapshot| ProbeOut
@@ -57,8 +57,8 @@ flowchart TD
         end
     end
 
-    subgraph Analysis["MÁY PHÂN TÍCH - Analysis & Sizing"]
-        Report["report.py"]
+    subgraph Analysis["MÁY PHÂN TÍCH - Analysis & Sizing (Golang)"]
+        Report["report.go"]
         ReportTable["Bảng phân tích và Capacity Sizing"]
         RampOut -->|Thu thập| Report
         ProbeOut -->|Thu thập| Report
@@ -68,11 +68,9 @@ flowchart TD
     Ramp ==>|"HTTP Request (SSE / REST)"| AppServer
 ```
 
-- **Máy phát tải (Generator Host)**: Chạy bộ phát tải Go (`ramps/golang`) từ bên ngoài Pod (máy trạm kỹ sư, VM kiểm thử hoặc Pod loadtest độc lập). **Tuyệt đối không chạy bộ tạo tải bên trong cùng container của ứng dụng** để tránh việc tiến trình phát tải tranh chấp CPU/RAM với ứng dụng mục tiêu.
-- **Pod / Container mục tiêu (Target Pod)**: Chạy daemon probe ngầm (background) trực tiếp trong container của ứng dụng. Nhờ nằm chung Linux namespace và cgroup, probe có thể đọc trực tiếp các file ảo `/proc/net/tcp`, `/proc/<pid>/*` và `/sys/fs/cgroup` mà không cần cài thêm các công cụ bổ trợ như `ss`, `netstat` hay `iproute2`.
-  - **Với container Python (FastAPI, Flask, Django,...)**: Sử dụng trực tiếp [`probe.py`](file:///home/vbox/projects/capsizer/probe.py).
-  - **Với container Golang hoặc container tối giản (`distroless`, `alpine`, `scratch` không có Python)**: Sử dụng [`probe.go`](file:///home/vbox/projects/capsizer/probe.go) biên dịch thành file binary tĩnh (`probe`), siêu nhẹ (~6MB), chạy độc lập mà không cần bất kỳ runtime hay thư viện nào.
-- **Tổng hợp & Báo cáo (Analysis)**: Sau khi đợt kiểm thử kết thúc, cả 2 file `loadtest-ramp.jsonl` và `probe.jsonl` được đưa về để `report.py` đối chiếu theo dòng thời gian.
+- **Máy phát tải (Generator Host)**: Chạy bộ phát tải Go ([`ramps/golang`](file:///home/vbox/projects/capsizer/ramps/golang)) từ bên ngoài Pod (máy trạm kỹ sư, VM kiểm thử hoặc Pod loadtest độc lập). **Tuyệt đối không chạy bộ tạo tải bên trong cùng container của ứng dụng** để tránh việc tiến trình phát tải tranh chấp CPU/RAM với ứng dụng mục tiêu.
+- **Pod / Container mục tiêu (Target Pod)**: Chạy daemon [`probe.go`](file:///home/vbox/projects/capsizer/probe.go) (được biên dịch thành file binary tĩnh `probe` siêu nhẹ ~6MB) trực tiếp trong container của ứng dụng. Nhờ nằm chung Linux namespace và cgroup, `probe` đọc trực tiếp các file ảo `/proc/net/tcp`, `/proc/<pid>/*` và `/sys/fs/cgroup` mà không cần bất kỳ runtime (Python/Node) hay công cụ bổ trợ (`ss`, `netstat`, `iproute2`) nào. Chạy được trên mọi loại container kể cả `distroless`, `alpine`, `scratch`.
+- **Tổng hợp & Báo cáo (Analysis)**: Sau khi đợt kiểm thử kết thúc, cả 2 file `loadtest-ramp.jsonl` và `probe.jsonl` được đưa về để [`report.go`](file:///home/vbox/projects/capsizer/report.go) đối chiếu theo dòng thời gian.
 
 ---
 
@@ -115,7 +113,7 @@ Hệ thống tính toán năng lực xử lý dựa trên định luật công s
 3. **Trần lý thuyết của Pod được cấp $N$ core CPU quota**:
    $$\text{RPS}_{\text{max, Pod}} = \frac{N \times 1000}{C} \quad (\text{req/s})$$
 
-4. **Số lượng Worker Uvicorn tối ưu**:
+4. **Số lượng Worker tối ưu**:
    $$\text{Số Worker} \approx \text{CPU Quota Cores} \quad (\text{ví dụ: quota 2.0 cores} \rightarrow 2 \text{ workers})$$
 
 5. **Nhận diện điểm gãy (Knee Detection Criteria)**:
@@ -130,26 +128,23 @@ Hệ thống tính toán năng lực xử lý dựa trên định luật công s
 
 ## 2. Các thành phần trong bộ công cụ
 
-Hệ thống được thiết kế theo kiến trúc tách biệt giữa **Runner Engine** (điều phối tải) và **Test Scenarios** (kịch bản kiểm thử API cụ thể):
+Toàn bộ hệ thống được viết bằng **Golang** (chỉ sử dụng Go standard library, không phụ thuộc thư viện ngoài), thiết kế tách biệt giữa **Runner Engine** (điều phối tải), **System Probe** (thu thập chỉ số OS/cgroup) và **Report Analyzer** (phân tích định chuẩn):
 
 | Tệp tin / Thư mục | Chức năng chính | Ngôn ngữ / Phụ thuộc | Vị trí thực thi |
 | :--- | :--- | :--- | :--- |
-| [`probe.py`](file:///home/vbox/projects/capsizer/probe.py) | Thu thập chỉ số hệ thống (cgroup quota, CFS throttling, TCP queue, socket states, worker threads/fds, health latency) cho Pod có Python | Python 3.10+ (Chỉ dùng thư viện chuẩn) | Bên trong Pod mục tiêu (Python) |
-| [`probe.go`](file:///home/vbox/projects/capsizer/probe.go) | Daemon lấy mẫu hệ thống biên dịch tĩnh (static binary), tối ưu cho container Golang hoặc container tối giản (Distroless, Alpine, Scratch) không có Python | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Bên trong Pod mục tiêu (Golang / Minimal Image) |
-| [`report.py`](file:///home/vbox/projects/capsizer/report.py) | Phân tích và tương quan log `ramp.jsonl` và `probe.jsonl`, tính toán chỉ số $C$ và lập bảng capacity planning | Python 3.10+ (Chỉ dùng thư viện chuẩn) | Máy phân tích |
+| [`probe.go`](file:///home/vbox/projects/capsizer/probe.go) | Daemon thu thập chỉ số hệ thống (cgroup quota, CFS throttling, TCP queue, socket states, worker threads/fds, health latency). Biên dịch thành static binary chạy trên mọi container (Python, Golang, Distroless, Alpine, Scratch) | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Bên trong Pod mục tiêu |
+| [`report.go`](file:///home/vbox/projects/capsizer/report.go) | Phân tích và tương quan log `ramp.jsonl` và `probe.jsonl`, tính toán chỉ số $C$ và lập bảng capacity planning | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Máy phân tích |
 | [`ramps/golang/`](file:///home/vbox/projects/capsizer/ramps/golang) | **Bộ phát tải Open-Loop Engine chạy bằng Go ⚡⚡⚡**: | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Máy phát tải bên ngoài |
 | ├── [`main.go`](file:///home/vbox/projects/capsizer/ramps/golang/main.go) | Core Open-Loop Engine chạy bằng Goroutines, Connection Pooling lớn, scheduler độ chính xác cao | Go 1.20+ | Máy phát tải |
 | └── [`scenarios/`](file:///home/vbox/projects/capsizer/ramps/golang/scenarios) | Kịch bản Go: `base.go`, `chat_sse.go`, `rest.go`, `registry.go` | Go 1.20+ | Module kịch bản Go |
-| [`pyproject.toml`](file:///home/vbox/projects/capsizer/pyproject.toml) | Cấu hình dự án Python (CLI entrypoints cho `probe.py` và `report.py`) | TOML | Toàn dự án |
 
 ---
 
 ## 3. Yêu cầu môi trường & Cài đặt
 
 ### Yêu cầu
-- **Go 1.20 trở lên** trên máy phát tải để chạy bộ tạo tải `ramps/golang` và biên dịch `probe.go`.
-- **Python 3.10 trở lên** (chỉ dùng thư viện chuẩn, không cần cài thêm package nào) để chạy `report.py` (và `probe.py` nếu Pod dùng Python).
-- Hệ điều hành Linux (hỗ trợ cgroup v1 hoặc v2, đọc `/proc`).
+- **Go 1.20 trở lên** trên máy phát tải / máy phân tích để chạy hoặc biên dịch `ramps/golang`, `probe.go` và `report.go`.
+- Hệ điều hành Linux trên Pod mục tiêu (hỗ trợ cgroup v1 hoặc v2, đọc `/proc`).
 
 ### Cài đặt & Sử dụng
 
@@ -166,27 +161,26 @@ Hệ thống được thiết kế theo kiến trúc tách biệt giữa **Runne
    ./capsizer-ramp --help
    ```
 
-2. **Trên Pod / Container mục tiêu (chạy daemon probe lấy mẫu cgroup/TCP):**
-   - **Với Pod Python (FastAPI, Flask, Django,...):**
-     *Không cần cài đặt thư viện ngoài.* Chạy trực tiếp bằng Python:
-     ```bash
-     kubectl cp probe.py ${NAMESPACE}/${POD_NAME}:/tmp/probe.py
-     kubectl exec -it ${NAMESPACE}/${POD_NAME} -- python3 /tmp/probe.py --port 8000 --out /tmp/probe.jsonl
-     ```
-   - **Với Pod Golang hoặc container tối giản (Distroless, Alpine, Scratch không có Python):**
-     Biên dịch tĩnh `probe.go` thành binary độc lập trên máy dev/CI rồi copy vào Pod:
-     ```bash
-     # Biên dịch file thực thi tĩnh (Linux x86_64)
-     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o probe probe.go
+2. **Trên Pod / Container mục tiêu (chạy daemon `probe` lấy mẫu cgroup/TCP):**
+   Biên dịch tĩnh [`probe.go`](file:///home/vbox/projects/capsizer/probe.go) thành binary độc lập trên máy dev/CI rồi copy vào Pod:
+   ```bash
+   # Biên dịch file thực thi tĩnh (Linux x86_64)
+   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o probe probe.go
 
-     # Copy vào pod và chạy trực tiếp (không cần bất kỳ runtime hay thư viện nào)
-     kubectl cp probe ${NAMESPACE}/${POD_NAME}:/tmp/probe
-     kubectl exec -it ${NAMESPACE}/${POD_NAME} -- /tmp/probe --port 8000 --out /tmp/probe.jsonl
-     ```
+   # Copy vào pod và chạy trực tiếp (không cần bất kỳ runtime hay thư viện nào)
+   kubectl cp probe ${NAMESPACE}/${POD_NAME}:/tmp/probe
+   kubectl exec -it ${NAMESPACE}/${POD_NAME} -- /tmp/probe --port 8000 --out /tmp/probe.jsonl
+   ```
 
-3. **Trên máy phân tích (chạy `report.py`):**
-   - **Không cần cài đặt thêm thư viện.** `report.py` chỉ dùng thư viện chuẩn (`statistics`, `json`, `pathlib`).
-   - Có thể chạy trực tiếp: `python3 report.py --ramp <ramp.jsonl> --probe <probe.jsonl>`
+3. **Trên máy phân tích (chạy `report.go`):**
+   ```bash
+   # Cách 1: Chạy trực tiếp qua go run:
+   go run report.go --ramp <ramp.jsonl> --probe <probe.jsonl>
+
+   # Cách 2: Biên dịch thành binary:
+   go build -o report report.go
+   ./report --ramp <ramp.jsonl> --probe <probe.jsonl>
+   ```
 
 ---
 
@@ -203,7 +197,7 @@ sequenceDiagram
     participant Analyzer as Máy Phân Tích (Report)
 
     Note over Dev,Pod: Giai đoạn 1: Khởi động probe trên Pod
-    Dev->>Pod: Khởi động probe.py ngầm (ghi probe.jsonl)
+    Dev->>Pod: Khởi động ./probe ngầm (ghi probe.jsonl)
     
     Note over Dev,Generator: Giai đoạn 2: Khởi chạy bộ tạo tải Go (Tự động hóa hoàn toàn)
     Dev->>Generator: Chạy ramps/golang (--steps 1,2,4,8,16,32)
@@ -213,11 +207,11 @@ sequenceDiagram
     Generator->>Generator: Ghi log loadtest-ramp.jsonl
     
     Note over Dev,Pod: Giai đoạn 3: Dừng đo & Thu thập dữ liệu
-    Dev->>Pod: Dừng tiến trình probe.py (Ctrl+C hoặc kill)
+    Dev->>Pod: Dừng tiến trình probe (Ctrl+C hoặc kill)
     Dev->>Pod: Tải probe.jsonl về máy kiểm thử (kubectl cp)
     
     Note over Dev,Analyzer: Giai đoạn 4: Dựng báo cáo
-    Dev->>Analyzer: python3 report.py --ramp loadtest-ramp.jsonl --probe probe.jsonl
+    Dev->>Analyzer: go run report.go --ramp loadtest-ramp.jsonl --probe probe.jsonl
     Analyzer-->>Dev: Xuất bảng phân tích & Khuyến nghị Capacity Sizing
 ```
 
@@ -225,13 +219,11 @@ sequenceDiagram
 
 ## 5. Hướng dẫn chi tiết từng công cụ
 
-### probe.py & probe.go - Thu thập chỉ số hệ thống (Python & Golang)
+### probe.go - Thu thập chỉ số hệ thống (Static Binary)
 
-Capsizer cung cấp 2 phiên bản probe tương thích **100% về định dạng dữ liệu đầu ra JSON Lines**:
-1. **[`probe.py`](file:///home/vbox/projects/capsizer/probe.py)**: Dành cho Pod Python (FastAPI, Uvicorn, Gunicorn, Django, Flask,...). Chạy trực tiếp qua `python3` mà không cần cài thêm package.
-2. **[`probe.go`](file:///home/vbox/projects/capsizer/probe.go)**: Dành cho Pod Golang hoặc container tối giản (**Distroless**, **Alpine**, **Scratch**) không có Python runtime. Chỉ dùng thư viện chuẩn của Go, biên dịch thành một file binary tĩnh độc lập (static binary ~6MB), chạy được trên mọi container Linux.
+[`probe.go`](file:///home/vbox/projects/capsizer/probe.go) chỉ dùng thư viện chuẩn của Go, biên dịch thành một file binary tĩnh độc lập (static binary ~6MB), chạy được trên mọi container Linux (kể cả container Python FastAPI/Uvicorn, container Golang hay các image tối giản **Distroless**, **Alpine**, **Scratch** không có shell hay runtime).
 
-#### Biên dịch tĩnh `probe.go` (Dành cho container Go / Distroless)
+#### Biên dịch tĩnh `probe.go`
 Biên dịch ngay trên máy phát tải hoặc trong quy trình CI/CD:
 ```bash
 # Biên dịch cho Linux x86_64 (amd64)
@@ -243,10 +235,10 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o probe probe.g
 
 #### Cú pháp dòng lệnh
 ```bash
-# Chạy phiên bản Python
-python3 probe.py [OPTIONS]
+# Chạy trực tiếp qua go run
+go run probe.go [OPTIONS]
 
-# Hoặc chạy binary Go (đã biên dịch)
+# Hoặc chạy binary tĩnh đã biên dịch
 ./probe [OPTIONS]
 ```
 
@@ -258,17 +250,12 @@ python3 probe.py [OPTIONS]
 | `--port` / `-port` | `8000` | Cổng dịch vụ của ứng dụng (để lọc TCP socket & đo Accept Queue) |
 | `--target` / `-target` | `http://127.0.0.1:8000` | URL gốc của dịch vụ để kiểm tra health check |
 | `--health-timeout` / `-health-timeout` | `5.0` | Thời gian timeout khi kiểm tra endpoint `/health/live` (giây) |
-| `--no-cgroup` / `-no-cgroup` | `False` | Bỏ qua thu thập cgroup/proc (dùng khi chạy từ ngoài Pod, chỉ đo health check) |
-| `--once` / `-once` | `False` | In 1 snapshot metadata và dữ liệu ra màn hình rồi thoát ngay |
-| `--proc-pattern` / `-proc-pattern` | `""` (Go) / `"uvicorn"` (Py) | Từ khóa lọc tiến trình ứng dụng. Với `probe.go`, để trống sẽ tự động nhận diện PID 1 của container |
+| `--no-cgroup` / `-no-cgroup` | `false` | Bỏ qua thu thập cgroup/proc (dùng khi chạy từ ngoài Pod, chỉ đo health check) |
+| `--once` / `-once` | `false` | In 1 snapshot metadata và dữ liệu ra màn hình rồi thoát ngay |
+| `--proc-pattern` / `-proc-pattern` | `""` | Từ khóa lọc tiến trình ứng dụng (ví dụ `"uvicorn"`). Để trống sẽ tự động nhận diện PID 1 của container và cây tiến trình con |
 
 #### Ví dụ chạy
-- **Chạy thường trực trong container Python:**
-  ```bash
-  python3 probe.py --port 8000 --out /tmp/probe.jsonl
-  ```
-
-- **Chạy thường trực trong container Go (hoặc Distroless / Alpine):**
+- **Chạy thường trực trong container:**
   ```bash
   # Copy binary tĩnh vào container và khởi chạy
   kubectl cp probe ${NAMESPACE}/${POD_NAME}:/tmp/probe
@@ -277,10 +264,6 @@ python3 probe.py [OPTIONS]
 
 - **Kiểm tra nhanh thông số cgroup quota và nproc của container:**
   ```bash
-  # Python:
-  python3 probe.py --once
-
-  # Golang:
   ./probe --once
   ```
 
@@ -288,7 +271,7 @@ python3 probe.py [OPTIONS]
 
 ### ramps/golang - Bộ phát tải Open-Loop Go (Đa kịch bản: Chat SSE, REST API)
 
-Bộ phát tải được viết bằng **Go (Golang)**, tận dụng tối đa cơ chế Goroutines nhẹ và HTTP connection pooling lớn để đạt độ chính xác lịch trình phát tải cực cao mà không bị nghẽn GIL:
+Bộ phát tải được viết bằng **Go (Golang)**, tận dụng tối đa cơ chế Goroutines nhẹ và HTTP connection pooling lớn để đạt độ chính xác lịch trình phát tải cực cao:
 1. `chat-sse` (mặc định): Đo endpoint Chatbot streaming SSE (`POST /chat`), đo TTFT theo thời gian thực.
 2. `rest`: Đo mọi API REST tiêu chuẩn (GET, POST, PUT, DELETE,...), đo latency.
 
@@ -382,7 +365,7 @@ cd ramps/golang && go build -o capsizer-ramp .
 
 #### Cách thêm một kịch bản kiểm thử (Scenario) mới trong Go
 
-Trong `ramps/golang`, mọi kịch bản đều cài đặt interface `Scenario` (định nghĩa tại `scenarios/base.go`):
+Trong `ramps/golang`, mọi kịch bản đều cài đặt interface `Scenario` (định nghĩa tại [`scenarios/base.go`](file:///home/vbox/projects/capsizer/ramps/golang/scenarios/base.go)):
 
 ```go
 type Scenario interface {
@@ -444,30 +427,35 @@ type Scenario interface {
    }
    ```
 
-2. Đăng ký kịch bản vào hàm `main()` trong `ramps/golang/main.go` tương ứng với cờ `-scenario my-service`.
+2. Đăng ký kịch bản vào hàm `main()` trong [`ramps/golang/main.go`](file:///home/vbox/projects/capsizer/ramps/golang/main.go) tương ứng với cờ `-scenario my-service`.
 
 ---
 
-### report.py - Phân tích dữ liệu & Lập báo cáo
+### report.go - Phân tích dữ liệu & Lập báo cáo
 
 #### Cú pháp dòng lệnh
 ```bash
-python3 report.py --ramp <file-ramp.jsonl> [--probe <file-probe.jsonl>]
+# Chạy trực tiếp qua go run
+go run report.go --ramp <file-ramp.jsonl> [--probe <file-probe.jsonl>]
+
+# Hoặc biên dịch thành binary
+go build -o report report.go
+./report --ramp <file-ramp.jsonl> [--probe <file-probe.jsonl>]
 ```
 
 #### Bảng tham số
 | Tham số | Bắt buộc | Giải thích |
 | :--- | :--- | :--- |
-| `--ramp` | **Có** | File JSONL chứa kết quả phát tải từ `ramp.py` |
-| `--probe` | Không | File JSONL chứa chỉ số hệ thống từ `probe.py` |
+| `--ramp` / `-ramp` | **Có** | File JSONL chứa kết quả phát tải từ `ramps/golang` |
+| `--probe` / `-probe` | Không | File JSONL chứa chỉ số hệ thống từ `probe.go` |
 
-#### Giải thích các cột trong bảng kết quả của `report.py`
+#### Giải thích các cột trong bảng kết quả của `report.go`
 ```text
  offer  achiev    ok  err  ttftP50  ttftP95  cores    C_ms   thr%  acptQ  hlthP99  estab  fdMax  thrd  verdict
 ------------------------------------------------------------------------------------------------------------
    2.0    2.00   120    0      230      450   0.45   180.2    0.0      0       12     18     42    16  OK
    4.0    3.98   239    1      310      620   0.88   185.1    1.2      0       15     34     45    16  OK
-   8.0    6.50   390   90     2100     5400   1.98   190.5   18.5      4     1250     75     52    18  KNEE: achieved<offered, acceptQ>0, throttled
+   8.0    6.50   390   90    2,100    5,400   1.98   190.5   18.5      4    1,250     75     52    18  KNEE: achieved<offered, acptQ 10 mẫu, throttled
 ```
 
 - `offer`: Mức RPS mục tiêu phát ra từ bộ tạo tải.
@@ -488,27 +476,13 @@ python3 report.py --ramp <file-ramp.jsonl> [--probe <file-probe.jsonl>]
 
 ## 6. Kịch bản thực tế mẫu (End-to-End Walkthrough)
 
-Dưới đây là kịch bản đo kiểm thực tế một Pod FastAPI/Uvicorn trên cụm Kubernetes:
+Dưới đây là kịch bản đo kiểm thực tế một Pod dịch vụ trên cụm Kubernetes:
 
-### Bước 1: Khởi động probe trên Pod và lấy CPU nền
-Mở terminal 1, kết nối vào Pod và chạy daemon probe tương ứng với loại container của bạn:
+### Bước 1: Biên dịch và khởi động `probe` trên Pod để lấy CPU nền
+Mở terminal 1, biên dịch binary `probe` và đẩy vào Pod mục tiêu:
 
-#### Trường hợp A: Pod Python (FastAPI / Uvicorn / Gunicorn)
 ```bash
 POD_NAME="app-deployment-78b958c97-xyz12"
-NAMESPACE="default"
-
-# 1. Copy probe.py vào pod nếu chưa có sẵn
-kubectl cp probe.py ${NAMESPACE}/${POD_NAME}:/tmp/probe.py
-
-# 2. Khởi chạy probe ngầm trong pod
-kubectl exec -n ${NAMESPACE} ${POD_NAME} -- \
-  python3 /tmp/probe.py --port 8000 --out /tmp/probe.jsonl
-```
-
-#### Trường hợp B: Pod Golang hoặc Container tối giản (Distroless / Alpine / Scratch)
-```bash
-POD_NAME="go-service-65c789d45-abc34"
 NAMESPACE="default"
 
 # 1. Biên dịch static binary một lần duy nhất trên máy phát tải / CI
@@ -517,13 +491,13 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o probe probe.g
 # 2. Copy binary vào pod
 kubectl cp probe ${NAMESPACE}/${POD_NAME}:/tmp/probe
 
-# 3. Khởi chạy probe ngầm trong pod (tự động nhận diện ứng dụng Go tại PID 1)
+# 3. Khởi chạy probe trong pod (tự động nhận diện ứng dụng tại PID 1 và các worker con)
 kubectl exec -n ${NAMESPACE} ${POD_NAME} -- \
   /tmp/probe --port 8000 --out /tmp/probe.jsonl
 ```
 
 > [!TIP]
-> **Tự động hóa hoàn toàn việc lấy CPU nền:** Bạn không cần phải bấm giờ chờ đợi thủ công! Ngay sau khi bật probe (`probe.py` hoặc `probe.go`) ở terminal 1, bạn có thể chuyển sang terminal 2 để khởi chạy `ramps/golang` ngay lập tức. Bộ tạo tải Go sẽ tự động thực hiện warmup và đếm lùi chính xác 90 giây (`-baseline-wait 90`) để probe thu thập CPU nền trước khi bắt đầu phát tải Bậc 1.
+> **Tự động hóa hoàn toàn việc lấy CPU nền:** Bạn không cần phải bấm giờ chờ đợi thủ công! Ngay sau khi bật `probe` ở terminal 1, bạn có thể chuyển sang terminal 2 để khởi chạy `ramps/golang` ngay lập tức. Bộ tạo tải Go sẽ tự động thực hiện warmup và đếm lùi chính xác 90 giây (`-baseline-wait 90`) để `probe` thu thập CPU nền trước khi bắt đầu phát tải Bậc 1.
 
 ### Bước 2: Khởi chạy bộ tạo tải Go (`ramps/golang`)
 Mở terminal 2 (trên máy phát tải bên ngoài), thực thi lệnh:
@@ -557,19 +531,19 @@ Quan sát terminal để theo dõi bảng tiến độ theo từng bậc RPS:
 
 ### Bước 3: Thu thập file `probe.jsonl` từ Pod về máy phân tích
 Sau khi quá trình phát tải hoàn thành:
-1. Nhấn `Ctrl+C` ở terminal 1 để dừng `probe.py`.
+1. Nhấn `Ctrl+C` ở terminal 1 để dừng `probe`.
 2. Tải file log từ Pod về:
    ```bash
    kubectl cp ${NAMESPACE}/${POD_NAME}:/tmp/probe.jsonl /tmp/probe.jsonl
    ```
 
 ### Bước 4: Dựng báo cáo và đọc kết quả
-Chạy lệnh phân tích:
+Chạy lệnh phân tích bằng `report.go`:
 ```bash
-python3 report.py --ramp /tmp/loadtest-ramp.jsonl --probe /tmp/probe.jsonl
+go run report.go --ramp /tmp/loadtest-ramp.jsonl --probe /tmp/probe.jsonl
 ```
 
-**Mẫu kết luận xuất ra từ `report.py`:**
+**Mẫu kết luận xuất ra từ `report.go`:**
 ```text
 ====================================================================================================
 CALIBRATE - KẾT QUẢ
@@ -586,8 +560,8 @@ KẾT LUẬN
   Trần lý thuyết 1 worker (1 core) : 5.7 req/s
   Trần lý thuyết pod (2 core)      : 11.4 req/s
   Số worker hợp lý                 : 2 (= quota)
-  Điểm gãy quan sát được           : 8 req/s offered
   Bậc cuối còn khoẻ                : 4 req/s -> SLO
+  Điểm gãy quan sát được           : 8 req/s offered
 ```
 
 ---
@@ -595,17 +569,17 @@ KẾT LUẬN
 ## 7. Các lưu ý kỹ thuật quan trọng (Best Practices)
 
 ### 1. Hiện tượng "Phình Thread Pool" (`nproc_visible` vs `cpu_quota_cores`)
-Trong Kubernetes, `os.cpu_count()` thường trả về số core của máy chủ vật lý (Node, ví dụ 64 core), chứ không phải mức giới hạn CPU Quota của Pod (ví dụ 2 core).
-- Nhiều thư viện Python và `asyncio` mặc định khởi tạo ThreadPoolExecutor dựa trên `os.cpu_count()`.
+Trong Kubernetes, số core hiển thị từ hệ điều hành (`runtime.NumCPU()` hoặc `os.cpu_count()`) thường trả về số core của máy chủ vật lý (Node, ví dụ 64 core), chứ không phải mức giới hạn CPU Quota của Pod (ví dụ 2 core).
+- Nhiều runtime và thư viện mặc định khởi tạo thread pool / `GOMAXPROCS` dựa trên số core của Node.
 - Việc sinh ra quá nhiều thread trên một Pod có quota thấp sẽ dẫn đến tranh chấp CPU gay gắt, gây ra hiện tượng **CFS Throttling nặng** dù ứng dụng chưa đầy tải.
-- `probe.py` và `report.py` sẽ cảnh báo trực tiếp nếu phát hiện `nproc_visible > quota * 2`.
+- `probe.go` và `report.go` sẽ cảnh báo trực tiếp nếu phát hiện `nproc_visible > quota * 2`.
 
 ### 2. Thời gian lấy mẫu Baseline tối thiểu 90s
 Các ứng dụng thường có các cron job nội bộ chạy ngầm (ví dụ: đồng bộ cấu hình, cache nền theo chu kỳ 30 - 45s). Nếu đo baseline quá ngắn (< 90s), giá trị CPU nền sẽ bị dao động mạnh, dẫn đến việc tính toán chỉ số $C$ bị thiếu chính xác.
 
-### 3. Giám sát Container Go với `probe.go`: Goroutines vs OS Threads & Distroless Images
-- **Mô hình tiến trình Go**: Khác với Python (thường dùng multi-process master-worker như Uvicorn), các ứng dụng Go chạy dạng đơn tiến trình và điều phối hàng nghìn concurrent Goroutines trên một số lượng nhỏ OS Threads (`runtime.GOMAXPROCS`). Trường `threads_max` trong `probe.go` sẽ phản ánh chính xác số lượng OS thread thật sự mà Go runtime đang sử dụng (thường từ 8 đến 24 threads).
-- **Container Distroless / Scratch**: Hầu hết container Go trong môi trường production không có sẵn shell (`/bin/sh`) hay Python. File binary `probe` được biên dịch tĩnh hoàn toàn (`CGO_ENABLED=0`), có thể chạy trực tiếp thông qua `kubectl exec pod -- /tmp/probe ...` mà không cần bất kỳ công cụ phụ trợ nào.
+### 3. Giám sát Container với `probe.go`: Multi-worker vs Single-process & Distroless Images
+- **Mô hình tiến trình**: `probe.go` tự động nhận diện cả ứng dụng đa tiến trình (master-worker như Uvicorn/Gunicorn) lẫn ứng dụng đơn tiến trình (như Go `runtime.GOMAXPROCS`). Trường `threads_max` và `n_workers` sẽ phản ánh chính xác số lượng OS thread và worker thực tế đang gánh tải.
+- **Container Distroless / Scratch**: Hầu hết container tối giản trong môi trường production không có sẵn shell (`/bin/sh`) hay Python. File binary `probe` được biên dịch tĩnh hoàn toàn (`CGO_ENABLED=0`), có thể chạy trực tiếp thông qua `kubectl exec pod -- /tmp/probe ...` mà không cần bất kỳ công cụ phụ trợ nào.
 
 ---
 
@@ -616,7 +590,7 @@ Các ứng dụng thường có các cron job nội bộ chạy ngầm (ví dụ
 - **Capsizer:** Trả lời các câu hỏi thiết kế hệ thống chuyên sâu hơn:
   - Một request tiêu tốn chính xác bao nhiêu mili-giây CPU thực tế ($C$) trong cgroup?
   - Với giới hạn CPU quota được cấp phát cho Pod, thông lượng tối đa theo lý thuyết là bao nhiêu?
-  - Cần chạy bao nhiêu tiến trình worker Uvicorn/Gunicorn là tối ưu để không bị lãng phí bộ nhớ hoặc tranh chấp GIL/CPU Throttling?
+  - Cần chạy bao nhiêu tiến trình worker là tối ưu để không bị lãng phí bộ nhớ hoặc tranh chấp CPU Throttling?
 
 ---
 
@@ -637,7 +611,7 @@ Các ứng dụng thường có các cron job nội bộ chạy ngầm (ví dụ
 
 ### 4. Kết hợp viễn trắc cgroup & kernel (Không chỉ quan sát từ phía client)
 - Các công cụ thông thường chỉ đứng ở phía máy phát tải để đo lường mã trạng thái HTTP (200, 500) và thời gian phản hồi.
-- Capsizer sử dụng daemon `probe.py` hoặc `probe.go` chạy trực tiếp trong container để theo dõi sát sao "sức khỏe" tầng hệ điều hành:
+- Capsizer sử dụng daemon `probe.go` chạy trực tiếp trong container để theo dõi sát sao "sức khỏe" tầng hệ điều hành:
   - Tỷ lệ chu kỳ CPU bị bóp nghẽn bởi Linux CFS Quota (`nr_throttled / nr_periods`).
   - Số lượng kết nối chờ xử lý trong TCP Accept Queue (`/proc/net/tcp`).
   - Phân bố trạng thái kết nối TCP (ESTAB, TIME_WAIT, SYN_RECV,...).
@@ -662,11 +636,10 @@ Các ứng dụng thường có các cron job nội bộ chạy ngầm (ví dụ
 ### 6. Khi nào nên dùng công cụ nào?
 
 - **Nên sử dụng Capsizer khi:**
-  - Bạn đang xây dựng hoặc triển khai ứng dụng Backend / AI Chatbot trên Kubernetes/Docker và cần tìm cấu hình tài nguyên chuẩn xác: cấp bao nhiêu CPU core, cấu hình bao nhiêu worker Uvicorn là vừa vặn nhất.
+  - Bạn đang xây dựng hoặc triển khai ứng dụng Backend / AI Chatbot trên Kubernetes/Docker và cần tìm cấu hình tài nguyên chuẩn xác: cấp bao nhiêu CPU core, cấu hình bao nhiêu worker là vừa vặn nhất.
   - Cần đo đạc chính xác độ trễ phản hồi token đầu tiên (TTFT) của mô hình AI.
   - Cần tìm ra giới hạn bão hòa (knee point) của một Pod dịch vụ độc lập trước khi cấu hình Autoscaling (HPA).
 
 - **Nên sử dụng các bài kiểm thử tải truyền thống diện rộng khi:**
   - Bạn cần kiểm thử độ chịu tải của toàn bộ hệ thống từ đầu đến cuối (End-to-End Stress Test) qua nhiều tầng Load Balancer, CDN, API Gateway.
   - Cần kiểm tra độ ổn định lâu dài (Soak test kéo dài 12 - 24 giờ) hoặc mô phỏng luồng hành vi phức tạp của người dùng trên website (duyệt trang, giỏ hàng, thanh toán).
-

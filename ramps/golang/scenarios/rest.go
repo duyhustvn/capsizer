@@ -3,6 +3,7 @@ package scenarios
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -110,7 +111,11 @@ func (s *RestScenario) Execute(ctx context.Context, client *http.Client) Record 
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		rec.Err = strPtr(err.Error())
+		if errors.Is(err, context.Canceled) {
+			rec.Err = strPtr("abandoned")
+		} else {
+			rec.Err = strPtr(err.Error())
+		}
 		elapsed := float64(time.Since(t0).Microseconds()) / 1000.0
 		rec.TotalMs = &elapsed
 		rec.TtftMs = &elapsed

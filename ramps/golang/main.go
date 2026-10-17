@@ -332,13 +332,14 @@ launchLoop:
 	abandoned := launched - int64(len(records))
 
 	// Các request đã phát ra nhưng không kịp phản hồi trong thời gian settle được ghi nhận là "abandoned".
-	// Điều này đồng bộ hành vi với bản Python: report.py dùng chuỗi err == "abandoned" làm tín hiệu nhận diện
-	// điểm gãy quá tải (knee). Bổ sung các bản ghi còn thiếu giúp số lượng record khớp đúng với tổng request đã gửi.
+	// report.go dùng chuỗi err == "abandoned" làm tín hiệu nhận diện điểm gãy quá tải (knee).
+	// Bổ sung các bản ghi còn thiếu giúp số lượng record khớp đúng với tổng request đã gửi.
 	for i := int64(0); i < abandoned; i++ {
 		records = append(records, scenarios.Record{
-			Type: "req",
-			Ok:   false,
-			Err:  strPtrMain("abandoned"),
+			Type:   "req",
+			TStart: tStepStart,
+			Ok:     false,
+			Err:    strPtrMain("abandoned"),
 		})
 	}
 	recMu.Unlock()
@@ -750,5 +751,5 @@ func main() {
 	_ = outWriter.Flush()
 
 	fmt.Println("\nXong. Ghép với probe rồi dựng bảng:")
-	fmt.Printf("  python3 report.py --ramp %s --probe <probe.jsonl>\n", *outFile)
+	fmt.Printf("  go run report.go --ramp %s --probe <probe.jsonl>\n", *outFile)
 }

@@ -1,8 +1,3 @@
-# Python bytecode
-__pycache__/
-*.py[cod]
-*$py.class
-
 # Test data & logs (chứa log chạy thực tế, token, kết quả đo)
 *.jsonl
 *.csv
@@ -16,16 +11,9 @@ __pycache__/
 *.pem
 *.key
 
-# Virtual environments
-.venv/
-env/
-venv/
-ENV/
-
-# Distribution / packaging
+# Distribution / build
 dist/
 build/
-*.egg-info/
 
 # IDEs & OS
 .vscode/
@@ -36,4 +24,7 @@ build/
 # Go binaries
 probe
 probe-*
+report
+report-*
+capsizer-ramp
 *.exe

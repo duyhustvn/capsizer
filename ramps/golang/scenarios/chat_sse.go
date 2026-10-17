@@ -530,7 +530,7 @@ func (s *ChatSSEScenario) Execute(ctx context.Context, client *http.Client) Reco
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				// Request bị hủy bởi step runner khi hết thời gian settle cuối bậc kiểm thử.
-				// Đánh dấu err = "abandoned" để đồng bộ với bản Python; report.py nhận diện chính xác
+				// Đánh dấu err = "abandoned" để report.go nhận diện chính xác
 				// chuỗi lỗi này làm một trong các chỉ số phát hiện điểm gãy quá tải (knee condition).
 				if rec.Err == nil {
 					rec.Err = strPtr("abandoned")
