@@ -21,6 +21,8 @@ Bộ công cụ giúp trả lời các câu hỏi cốt lõi về mặt kỹ thu
 - [5. Hướng dẫn chi tiết từng công cụ](#5-hướng-dẫn-chi-tiết-từng-công-cụ)
   - [probe.go - Thu thập chỉ số hệ thống (Static Binary)](#probego---thu-thập-chỉ-số-hệ-thống-static-binary)
   - [ramps/golang - Bộ phát tải Open-Loop Go (Đa kịch bản)](#rampsgolang---bộ-phát-tải-open-loop-go-đa-kịch-bản-chat-sse-rest-api)
+    - [Tổ chức kịch bản theo Service](#cách-tổ-chức-thư-mục--thêm-kịch-bản-scenario-mới-cho-từng-service)
+    - [Docker Base Image & Kế thừa kịch bản mới](#hướng-dẫn-docker-build-base-image--kế-thừa-khi-thêm-kịch-bản-mới)
   - [report.go - Phân tích dữ liệu & Lập báo cáo](#reportgo---phân-tích-dữ-liệu--lập-báo-cáo)
 - [6. Kịch bản thực tế mẫu (End-to-End Walkthrough)](#6-kịch-bản-thực-tế-mẫu-end-to-end-walkthrough)
 - [7. Các lưu ý kỹ thuật quan trọng (Best Practices)](#7-các-lưu-ý-kỹ-thuật-quan-trọng-best-practices)
@@ -136,7 +138,7 @@ Toàn bộ hệ thống được viết bằng **Golang** (chỉ sử dụng Go 
 | [`report.go`](file:///home/vbox/projects/capsizer/report.go) | Phân tích và tương quan log `ramp.jsonl` và `probe.jsonl`, tính toán chỉ số $C$ và lập bảng capacity planning | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Máy phân tích |
 | [`ramps/golang/`](file:///home/vbox/projects/capsizer/ramps/golang) | **Bộ phát tải Open-Loop Engine chạy bằng Go ⚡⚡⚡**: | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Máy phát tải bên ngoài |
 | ├── [`main.go`](file:///home/vbox/projects/capsizer/ramps/golang/main.go) | Core Open-Loop Engine chạy bằng Goroutines, Connection Pooling lớn, scheduler độ chính xác cao | Go 1.20+ | Máy phát tải |
-| └── [`scenarios/`](file:///home/vbox/projects/capsizer/ramps/golang/scenarios) | Kịch bản Go: `base.go`, `chat_sse.go`, `rest.go`, `registry.go` | Go 1.20+ | Module kịch bản Go |
+| └── [`scenarios/`](file:///home/vbox/projects/capsizer/ramps/golang/scenarios) | Kịch bản Go: `chatbot/chat_sse.go`, `sample/get_posts.go`, `sample/create_post.go`, `base.go`, `registry.go`, `utils.go` | Go 1.20+ | Module kịch bản Go |
 
 ---
 
@@ -273,7 +275,8 @@ go run probe.go [OPTIONS]
 
 Bộ phát tải được viết bằng **Go (Golang)**, tận dụng tối đa cơ chế Goroutines nhẹ và HTTP connection pooling lớn để đạt độ chính xác lịch trình phát tải cực cao:
 1. `chat-sse` (mặc định): Đo endpoint Chatbot streaming SSE (`POST /chat`), đo TTFT theo thời gian thực.
-2. `rest`: Đo mọi API REST tiêu chuẩn (GET, POST, PUT, DELETE,...), đo latency.
+2. `sample-get`: Kịch bản mẫu gọi REST API GET công khai (mặc định đo Public API JSONPlaceholder `GET /posts/1`).
+3. `sample-post`: Kịch bản mẫu gửi JSON payload lên REST API công khai (mặc định đo Public API JSONPlaceholder `POST /posts`).
 
 #### Cú pháp dòng lệnh
 ```bash
@@ -283,17 +286,34 @@ cd ramps/golang && go run . [OPTIONS]
 # Cách 2: Biên dịch thành binary độc lập (Khuyên dùng khi triển khai Pod/VM tải):
 cd ramps/golang && go build -o capsizer-ramp .
 ./capsizer-ramp [OPTIONS]
+
+# Cách 3: Chạy qua Docker (Image runner siêu nhẹ ~25MB):
+docker build -t capsizer-ramp .
+docker run --rm -it -v $(pwd):/data capsizer-ramp [OPTIONS]
+
+# Cách 4: Chạy tiện lợi qua Docker Compose:
+# Phát tải với runner:
+docker compose run --rm ramp [OPTIONS]
+
+# Phát tải chế độ Dev (tự động nạp kịch bản mới trong scenarios/):
+docker compose run --rm ramp-dev -scenario <tên_kịch_bản> [OPTIONS]
+
+# Xuất bảng phân tích sizing:
+docker compose run --rm report -ramp loadtest-ramp.jsonl [-probe probe.jsonl]
+
+# Build base image để mở rộng kịch bản mới:
+docker build --target base -t capsizer-ramp:base .
 ```
 
 #### Bảng tham số
 | Tham số | Giá trị mặc định | Giải thích |
 | :--- | :--- | :--- |
-| `-scenario` | `chat-sse` | Kịch bản kiểm thử: `chat-sse` (mặc định) hoặc `rest` |
+| `-scenario` | `chat-sse` | Kịch bản kiểm thử: `chat-sse` (mặc định), `sample-get`, `sample-post` hoặc service tùy chỉnh |
 | `-method` | `GET` | HTTP method cho kịch bản REST (`GET`, `POST`, `PUT`, `DELETE`,...) |
 | `-H`, `-header` | `None` | Thêm HTTP header tùy chọn (ví dụ: `-H 'Authorization: Bearer xxx' -H 'X-Api-Key: 123'`) |
 | `-body` | `""` | Chuỗi body gửi kèm cho request REST (chuỗi JSON hoặc chuỗi text thô) |
 | `-body-file` | `""` | Đường dẫn file chứa dữ liệu body cho request REST |
-| `-url` | `http://127.0.0.1:8000/chat` | URL endpoint nhận request |
+| `-url` | `http://127.0.0.1:8000/chat` | URL endpoint nhận request (khi dùng `sample-get`/`sample-post` có thể để trống để dùng Public API mặc định hoặc truyền URL của bạn) |
 | `-steps` | `1,2,4,8,16,32` | Danh sách các mức RPS cần đo, phân tách bằng dấu phẩy |
 | `-step-seconds` | `60.0` | Thời gian phát tải ở mỗi mức RPS (giây) |
 | `-cooldown` | `20.0` | Thời gian nghỉ giải tỏa tải giữa 2 bậc RPS (giây) |
@@ -335,99 +355,167 @@ cd ramps/golang && go build -o capsizer-ramp .
     -out loadtest-ramp.jsonl
   ```
 
-- **Ví dụ 2: Test API REST GET thông thường (ví dụ: lấy danh sách items):**
+- **Ví dụ 2: Test Public API REST GET (Kịch bản mẫu sample-get):**
   ```bash
   cd ramps/golang
+  # Đo trực tiếp Public API JSONPlaceholder:
   go run . \
-    -scenario rest \
-    -method GET \
-    -url "http://127.0.0.1:8000/api/v1/items" \
-    -H "Authorization: Bearer my-token" \
-    -steps "10,20,50,100" \
+    -scenario sample-get \
+    -steps "2,4,8,16" \
+    -step-seconds 10 \
+    -baseline-wait 0 \
+    -out loadtest-sample-get.jsonl
+
+  # Hoặc truyền URL của riêng bạn:
+  go run . \
+    -scenario sample-get \
+    -url "https://api.example.com/posts/1" \
+    -steps "10,20,50" \
     -step-seconds 30 \
-    -out loadtest-items.jsonl
+    -out loadtest-posts.jsonl
   ```
 
-- **Ví dụ 3: Test API REST POST với JSON Body (ví dụ: tìm kiếm search/embedding):**
+- **Ví dụ 3: Test Public API REST POST gửi kèm JSON (Kịch bản mẫu sample-post):**
   ```bash
   cd ramps/golang
+  # Đo trực tiếp Public API POST:
   go run . \
-    -scenario rest \
-    -method POST \
-    -url "http://127.0.0.1:8000/api/v1/search" \
-    -H "Content-Type: application/json" \
-    -H "X-Api-Key: secret123" \
-    -body '{"query": "an ninh mạng", "limit": 10}' \
-    -steps "5,10,20,40" \
+    -scenario sample-post \
+    -steps "2,4,8" \
+    -step-seconds 10 \
+    -baseline-wait 0 \
+    -out loadtest-sample-post.jsonl
+
+  # Hoặc truyền URL và body JSON tùy chỉnh:
+  go run . \
+    -scenario sample-post \
+    -url "https://api.example.com/posts" \
+    -body '{"title": "test", "body": "load testing", "userId": 1}' \
+    -steps "5,10,20" \
     -step-seconds 30 \
-    -out loadtest-search.jsonl
+    -out loadtest-post.jsonl
   ```
 
-#### Cách thêm một kịch bản kiểm thử (Scenario) mới trong Go
+#### Cách tổ chức thư mục & thêm kịch bản (Scenario) mới cho từng Service
 
-Trong `ramps/golang`, mọi kịch bản đều cài đặt interface `Scenario` (định nghĩa tại [`scenarios/base.go`](file:///home/vbox/projects/capsizer/ramps/golang/scenarios/base.go)):
+Để quản lý kịch bản cho nhiều service khác nhau, `ramps/golang` hỗ trợ cấu trúc **mỗi service một thư mục con trong `scenarios/`**, và trong thư mục đó có thể chứa **nhiều file `.go`**:
 
+```text
+ramps/golang/scenarios/
+├── base.go              # Interface Scenario & Record
+├── registry.go          # Scenario Registry tự động
+├── utils.go             # Tiện ích chung (UserPool, JWT, LoadDotEnv, ...)
+│
+├── chatbot/             # Service Chatbot (folder riêng)
+│   └── chat_sse.go      # package chatbot (đăng ký "chat-sse")
+│
+├── sample/              # Service Sample (Public API JSONPlaceholder)
+│   ├── get_posts.go     # package sample (đăng ký "sample-get")
+│   └── create_post.go   # package sample (đăng ký "sample-post")
+│
+├── auth/                # Service Auth (folder riêng, nhiều file .go)
+│   ├── login.go         # package auth (đăng ký "auth-login")
+│   └── logout.go        # package auth (đăng ký "auth-logout")
+│
+└── order/               # Service Order
+    └── checkout.go      # package order (đăng ký "order-checkout")
+```
+
+##### 1. Cách viết file kịch bản trong thư mục Service
+Mọi file trong cùng thư mục service sử dụng chung `package <tên_service>`, import `ramps/golang/scenarios` và tự động đăng ký kịch bản thông qua hàm `init()`:
+
+*Ví dụ `ramps/golang/scenarios/auth/login.go`:*
 ```go
-type Scenario interface {
-    Name() string
-    MetricLabel() string
-    Setup(ctx context.Context, client *http.Client) error
-    Execute(ctx context.Context, client *http.Client) Record
+package auth
+
+import (
+    "context"
+    "fmt"
+    "net/http"
+    "ramps/golang/scenarios"
+)
+
+// Tự động đăng ký kịch bản "auth-login" vào hệ thống
+func init() {
+    scenarios.Register("auth-login", func(p scenarios.ScenarioParams) (scenarios.Scenario, error) {
+        return &LoginScenario{url: p.TargetURL}, nil
+    })
+}
+
+type LoginScenario struct {
+    url string
+}
+
+func (s *LoginScenario) Name() string        { return "auth-login" }
+func (s *LoginScenario) MetricLabel() string { return "lat" }
+
+func (s *LoginScenario) Setup(ctx context.Context, client *http.Client) error {
+    fmt.Printf("[AUTH] Kiểm tra kết nối tới: %s\n", s.url)
+    return nil
+}
+
+func (s *LoginScenario) Execute(ctx context.Context, client *http.Client) scenarios.Record {
+    // Thực hiện request login...
+    return scenarios.Record{Type: "req", Ok: true}
 }
 ```
 
-1. Tạo file mới trong `ramps/golang/scenarios/` (ví dụ `my_service.go`):
-   ```go
-   package scenarios
+> [!TIP]
+> Nhờ cơ chế **Scenario Registry**, bạn **không cần sửa bất kỳ dòng nào trong `main.go`**. Hệ thống sẽ tự động quét các thư mục service con và nạp kịch bản vào runtime.
 
-   import (
-       "context"
-       "net/http"
-       "time"
-   )
+---
 
-   type MyServiceScenario struct {
-       url string
-   }
+#### Hướng dẫn Docker: Build Base Image & Kế thừa khi thêm Kịch bản mới
 
-   func NewMyServiceScenario(url string) *MyServiceScenario {
-       return &MyServiceScenario{url: url}
-   }
+Để tối ưu hóa thời gian build và không phải tải lại Go toolchain/dependencies mỗi khi thêm kịch bản mới:
 
-   func (s *MyServiceScenario) Name() string        { return "my-service" }
-   func (s *MyServiceScenario) MetricLabel() string { return "lat" }
-   func (s *MyServiceScenario) Setup(ctx context.Context, client *http.Client) error {
-       return nil
-   }
+##### Bước 1: Build Base Image cho Ramps (Chỉ làm 1 lần)
+```bash
+docker build --target base -t capsizer-ramp:base .
+```
+*Image `capsizer-ramp:base` chứa sẵn môi trường Golang, core engine, các dependencies và công cụ biên dịch tự động `build_ramp`.*
 
-   func (s *MyServiceScenario) Execute(ctx context.Context, client *http.Client) Record {
-       tStart := float64(time.Now().UnixNano()) / 1e9
-       t0 := time.Now()
-       rec := Record{Type: "req", TStart: tStart, Ok: false}
+##### Bước 2: Tạo Dockerfile kế thừa khi thêm các Service / Scenario mới
+Khi bạn đã thêm các thư mục kịch bản mới (`auth/`, `order/`, `payment/`,...), chỉ cần tạo 1 file `Dockerfile.loadtest` ngắn gọn:
 
-       req, err := http.NewRequestWithContext(ctx, "GET", s.url, nil)
-       if err != nil {
-           rec.Err = strPtr(err.Error())
-           return rec
-       }
-       resp, err := client.Do(req)
-       elapsed := float64(time.Since(t0).Microseconds()) / 1000.0
-       rec.TotalMs = &elapsed
-       rec.TtftMs = &elapsed
+```dockerfile
+FROM capsizer-ramp:base
 
-       if err != nil {
-           rec.Err = strPtr(err.Error())
-           return rec
-       }
-       defer resp.Body.Close()
+# Copy tất cả các thư mục kịch bản vào image
+COPY ramps/golang/scenarios/ /app/scenarios/
 
-       rec.Status = &resp.StatusCode
-       rec.Ok = resp.StatusCode >= 200 && resp.StatusCode < 400
-       return rec
-   }
-   ```
+# Tự động quét subpackages và biên dịch binary (mất ~1-2 giây)
+RUN build_ramp
+```
 
-2. Đăng ký kịch bản vào hàm `main()` trong [`ramps/golang/main.go`](file:///home/vbox/projects/capsizer/ramps/golang/main.go) tương ứng với cờ `-scenario my-service`.
+##### Bước 3: Build và chạy kịch bản
+```bash
+# Build image kịch bản mới (chỉ mất ~2 giây)
+docker build -t capsizer-ramp:my-services -f Dockerfile.loadtest .
+
+# Chạy kịch bản chatbot SSE
+docker run --rm -it -v $(pwd):/data capsizer-ramp:my-services \
+  -scenario chat-sse \
+  -url "http://127.0.0.1:8000/chat" \
+  -queries queries.txt
+
+# Chạy kịch bản auth-login
+docker run --rm -it -v $(pwd):/data capsizer-ramp:my-services \
+  -scenario auth-login \
+  -url "http://127.0.0.1:8000/api/v1/auth/login"
+```
+
+> [!NOTE]
+> **Chế độ Hot-run khi phát triển (Không cần build lại image):**
+> Bạn có thể mount trực tiếp thư mục `scenarios` từ host vào container Base:
+> ```bash
+> docker run --rm -it \
+>   -v $(pwd)/ramps/golang/scenarios:/app/scenarios \
+>   -v $(pwd):/data \
+>   capsizer-ramp:base \
+>   -scenario auth-login -url "http://127.0.0.1:8000/api/v1/auth/login"
+> ```
+> Container sẽ tự động phát hiện mã nguồn mới được mount, tự quét subpackages, biên dịch lại trong 1 giây và chạy ngay lập tức.
 
 ---
 

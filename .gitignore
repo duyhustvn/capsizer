@@ -27,4 +27,5 @@ probe-*
 report
 report-*
 capsizer-ramp
+ramps/golang/golang
 *.exe

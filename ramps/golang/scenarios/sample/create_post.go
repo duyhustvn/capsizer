@@ -1,56 +1,70 @@
-package scenarios
+package sample
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
+
+	"ramps/golang/scenarios"
 )
 
-// RestScenario kịch bản kiểm thử API REST thông thường (GET, POST, PUT, DELETE,...).
-type RestScenario struct {
+func init() {
+	scenarios.Register("sample-post", func(p scenarios.ScenarioParams) (scenarios.Scenario, error) {
+		target := p.TargetURL
+		// Nếu URL là endpoint chatbot mặc định hoặc để trống, dùng Public API JSONPlaceholder
+		if target == "" || target == "http://127.0.0.1:8000/chat" {
+			target = "https://jsonplaceholder.typicode.com/posts"
+		}
+		bodyData := p.BodyData
+		if len(bodyData) == 0 {
+			// Payload JSON mặc định gửi đến JSONPlaceholder
+			defaultPayload := map[string]any{
+				"title":  "Capsizer Load Test",
+				"body":   "Benchmarking REST API with open-loop concurrency",
+				"userId": 1,
+			}
+			bodyData, _ = json.Marshal(defaultPayload)
+		}
+		return NewCreatePostScenario(target, p.Headers, p.Timeout, bodyData), nil
+	})
+}
+
+// CreatePostScenario kịch bản mẫu gọi API REST POST công khai gửi JSON payload.
+type CreatePostScenario struct {
 	url      string
-	method   string
 	headers  map[string]string
 	timeout  time.Duration
 	bodyData []byte
 }
 
-func NewRestScenario(
-	url string,
-	method string,
-	headers map[string]string,
-	timeout time.Duration,
-	bodyData []byte,
-) *RestScenario {
+func NewCreatePostScenario(url string, headers map[string]string, timeout time.Duration, bodyData []byte) *CreatePostScenario {
 	hdrs := make(map[string]string)
 	for k, v := range headers {
 		hdrs[k] = v
 	}
-	m := strings.ToUpper(method)
-	if m == "" {
-		m = "GET"
+	if _, ok := hdrs["Content-Type"]; !ok {
+		hdrs["Content-Type"] = "application/json; charset=UTF-8"
 	}
-	return &RestScenario{
+	if _, ok := hdrs["Accept"]; !ok {
+		hdrs["Accept"] = "application/json"
+	}
+	return &CreatePostScenario{
 		url:      url,
-		method:   m,
 		headers:  hdrs,
 		timeout:  timeout,
 		bodyData: bodyData,
 	}
 }
 
-func (s *RestScenario) Name() string        { return "rest" }
-func (s *RestScenario) MetricLabel() string { return "lat" }
-func (s *RestScenario) Setup(ctx context.Context, client *http.Client) error {
-	// Thực hiện 1 request smoke-test / dry-run:
-	// 1. Kiểm tra kết nối, URL, Authentication (fail-fast)
-	// 2. Làm ấm connection pool (TCP/TLS handshake) của http.Client
-	// 3. Đánh thức backend/worker lần đầu
+func (s *CreatePostScenario) Name() string        { return "sample-post" }
+func (s *CreatePostScenario) MetricLabel() string { return "lat" }
+
+func (s *CreatePostScenario) Setup(ctx context.Context, client *http.Client) error {
 	t0 := time.Now()
 	setupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -74,15 +88,15 @@ func (s *RestScenario) Setup(ctx context.Context, client *http.Client) error {
 	if rec.Status != nil {
 		statusCode = *rec.Status
 	}
-	fmt.Printf("warmup   : kiểm tra kết nối & làm ấm connection pool... OK (status: %d, latency: %v)\n", statusCode, elapsed.Round(time.Millisecond))
+	fmt.Printf("warmup   : kiểm tra kết nối Public API (%s)... OK (status: %d, latency: %v)\n", s.url, statusCode, elapsed.Round(time.Millisecond))
 	return nil
 }
 
-func (s *RestScenario) Execute(ctx context.Context, client *http.Client) Record {
+func (s *CreatePostScenario) Execute(ctx context.Context, client *http.Client) scenarios.Record {
 	tStart := float64(time.Now().UnixNano()) / 1e9
 	t0 := time.Now()
 
-	rec := Record{
+	rec := scenarios.Record{
 		Type:   "req",
 		TStart: tStart,
 		Ok:     false,
@@ -96,7 +110,7 @@ func (s *RestScenario) Execute(ctx context.Context, client *http.Client) Record 
 		bodyReader = bytes.NewReader(s.bodyData)
 	}
 
-	httpReq, err := http.NewRequestWithContext(reqCtx, s.method, s.url, bodyReader)
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, s.url, bodyReader)
 	if err != nil {
 		rec.Err = strPtr(err.Error())
 		elapsed := float64(time.Since(t0).Microseconds()) / 1000.0
@@ -130,6 +144,7 @@ func (s *RestScenario) Execute(ctx context.Context, client *http.Client) Record 
 	rec.TotalMs = &elapsed
 	rec.TtftMs = &elapsed
 
+	// JSONPlaceholder trả về 201 Created khi tạo post thành công
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 		rec.Ok = true
 	} else {

@@ -1,25 +1,23 @@
 package scenarios
 
 import (
-	"bufio"
-	"bytes"
-	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"math/rand"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
 )
+
+// strPtr trả về con trỏ tới chuỗi.
+func strPtr(s string) *string {
+	return &s
+}
 
 // LoadDotEnv tìm và nạp các biến môi trường từ file .env vào process (os.Setenv) nếu chưa tồn tại.
 func LoadDotEnv(path string) map[string]string {
@@ -173,7 +171,6 @@ func ParseQueries(raw string) []string {
 // 1. Cờ dòng lệnh --queries (file txt/csv)
 // 2. Biến CHAT_QUERIES_FILE hoặc QUERIES_FILE từ .env
 // 3. Biến CHAT_QUERIES hoặc QUERIES từ .env
-// 4. Danh sách mặc định DefaultQueries
 func ResolveQueries(queriesFile string, envFile string) []string {
 	LoadDotEnv(envFile)
 
@@ -326,10 +323,7 @@ func LoadUsers(csvPath string) ([]User, error) {
 		}
 	}
 
-	// Lượt 2: Tìm kiếm gần đúng (fuzzy match) nếu chưa tìm thấy khớp chính xác.
-	// Nhận diện bất kỳ cột nào chứa chuỗi "token" (không phân biệt hoa/thường, ví dụ: "tokenUserChatbot", "auth_token",...).
-	// Cơ chế này giúp tự động tương thích với các định dạng CSV từ nhiều nguồn, tránh việc LoadUsers báo lỗi
-	// khiến hệ thống tự động rơi về chế độ dùng 1 token dùng chung làm nghẽn rate-limit của tài khoản.
+	// Lượt 2: Tìm kiếm gần đúng (fuzzy match)
 	if tokenCol == -1 {
 		for i, h := range header {
 			if strings.Contains(strings.ToLower(strings.TrimSpace(h)), "token") {
@@ -365,191 +359,4 @@ func LoadUsers(csvPath string) ([]User, error) {
 		return nil, fmt.Errorf("%s: không có dòng nào hợp lệ", csvPath)
 	}
 	return users, nil
-}
-
-// ChatSSEScenario kịch bản kiểm thử API Chatbot streaming SSE.
-type ChatSSEScenario struct {
-	url       string
-	headers   map[string]string
-	timeout   time.Duration
-	pool      *UserPool
-	queries   []string
-	cacheBust bool
-}
-
-func NewChatSSEScenario(
-	url string,
-	headers map[string]string,
-	timeout time.Duration,
-	pool *UserPool,
-	queries []string,
-	cacheBust bool,
-) *ChatSSEScenario {
-	hdrs := make(map[string]string)
-	for k, v := range headers {
-		hdrs[k] = v
-	}
-	if _, ok := hdrs["Content-Type"]; !ok {
-		hdrs["Content-Type"] = "application/json"
-	}
-	return &ChatSSEScenario{
-		url:       url,
-		headers:   hdrs,
-		timeout:   timeout,
-		pool:      pool,
-		queries:   queries,
-		cacheBust: cacheBust,
-	}
-}
-
-func (s *ChatSSEScenario) Name() string        { return "chat-sse" }
-func (s *ChatSSEScenario) MetricLabel() string { return "ttft" }
-func (s *ChatSSEScenario) Setup(ctx context.Context, client *http.Client) error {
-	// Thực hiện 1 request smoke-test / dry-run:
-	// 1. Kiểm tra kết nối, URL, Authentication (fail-fast)
-	// 2. Làm ấm connection pool (TCP/TLS handshake) của http.Client
-	// 3. Đánh thức backend/worker lần đầu
-	t0 := time.Now()
-	setupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
-	rec := s.Execute(setupCtx, client)
-	elapsed := time.Since(t0)
-
-	if !rec.Ok {
-		errDetail := "unknown error"
-		if rec.Err != nil {
-			errDetail = *rec.Err
-		}
-		statusStr := "không có HTTP response"
-		if rec.Status != nil {
-			statusStr = fmt.Sprintf("HTTP %d", *rec.Status)
-		}
-		return fmt.Errorf("warmup thất bại (%s): %s", statusStr, errDetail)
-	}
-
-	ttftStr := "-"
-	if rec.TtftMs != nil {
-		ttftStr = fmt.Sprintf("%.0fms", *rec.TtftMs)
-	}
-	fmt.Printf("warmup   : kiểm tra kết nối & làm ấm connection pool... OK (TTFT: %s, total: %v)\n", ttftStr, elapsed.Round(time.Millisecond))
-	return nil
-}
-
-func (s *ChatSSEScenario) Execute(ctx context.Context, client *http.Client) Record {
-	q := "Xin chào"
-	if len(s.queries) > 0 {
-		q = s.queries[rand.Intn(len(s.queries))]
-	}
-	if s.cacheBust {
-		q = fmt.Sprintf("%s (ma tham chieu %d)", q, rand.Intn(900000)+100000)
-	}
-	uid, token := s.pool.Next()
-
-	payload := map[string]any{
-		"user_token": token,
-		"summary":    "",
-		"history": []map[string]string{
-			{"role": "user", "text": "Xin chào"},
-			{"role": "assistant", "text": "Chào bạn, mình là chatbot. Bạn cần hỗ trợ gì?"},
-			{"role": "user", "text": q},
-		},
-	}
-	bodyBytes, _ := json.Marshal(payload)
-
-	tStart := float64(time.Now().UnixNano()) / 1e9
-	t0 := time.Now()
-
-	endSeen := false
-	rec := Record{
-		Type:    "req",
-		TStart:  tStart,
-		UserID:  uid,
-		EndSeen: &endSeen,
-		Ok:      false,
-	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, s.timeout)
-	defer cancel()
-
-	httpReq, err := http.NewRequestWithContext(reqCtx, "POST", s.url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		rec.Err = strPtr(err.Error())
-		elapsed := float64(time.Since(t0).Microseconds()) / 1000.0
-		rec.TotalMs = &elapsed
-		return rec
-	}
-
-	for k, v := range s.headers {
-		httpReq.Header.Set(k, v)
-	}
-
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			rec.Err = strPtr("abandoned")
-		} else {
-			rec.Err = strPtr(err.Error())
-		}
-		elapsed := float64(time.Since(t0).Microseconds()) / 1000.0
-		rec.TotalMs = &elapsed
-		return rec
-	}
-	defer resp.Body.Close()
-
-	rec.Status = &resp.StatusCode
-	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		rec.Err = strPtr(fmt.Sprintf("http_%d", resp.StatusCode))
-		elapsed := float64(time.Since(t0).Microseconds()) / 1000.0
-		rec.TotalMs = &elapsed
-		return rec
-	}
-
-	reader := bufio.NewReader(resp.Body)
-	var event string
-	for {
-		line, err := reader.ReadString('\n')
-		if line != "" {
-			trimmed := strings.TrimRight(line, "\r\n")
-			if strings.HasPrefix(trimmed, "event:") {
-				event = strings.TrimSpace(trimmed[6:])
-			} else if strings.HasPrefix(trimmed, "data:") {
-				now := float64(time.Since(t0).Microseconds()) / 1000.0
-				if event == "message" && rec.TtftMs == nil {
-					rec.TtftMs = &now
-				} else if event == "notice" && rec.NoticeMs == nil {
-					rec.NoticeMs = &now
-				} else if event == "message_end" {
-					*rec.EndSeen = true
-				} else if event == "error" {
-					rec.Err = strPtr("sse_error")
-				}
-			}
-		}
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				// Request bị hủy bởi step runner khi hết thời gian settle cuối bậc kiểm thử.
-				// Đánh dấu err = "abandoned" để report.go nhận diện chính xác
-				// chuỗi lỗi này làm một trong các chỉ số phát hiện điểm gãy quá tải (knee condition).
-				if rec.Err == nil {
-					rec.Err = strPtr("abandoned")
-				}
-			} else if err != io.EOF {
-				if rec.Err == nil {
-					rec.Err = strPtr(err.Error())
-				}
-			}
-			break
-		}
-	}
-
-	elapsed := float64(time.Since(t0).Microseconds()) / 1000.0
-	rec.TotalMs = &elapsed
-	rec.Ok = *rec.EndSeen && rec.Err == nil
-	return rec
-}
-
-func strPtr(s string) *string {
-	return &s
 }

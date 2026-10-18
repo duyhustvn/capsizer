@@ -389,7 +389,7 @@ launchLoop:
 
 func main() {
 	var (
-		scenarioName = flag.String("scenario", "chat-sse", "loại kịch bản: 'chat-sse' (mặc định) hoặc 'rest'")
+		scenarioName = flag.String("scenario", "chat-sse", "loại kịch bản: 'chat-sse' (mặc định), 'sample-get', 'sample-post', hoặc kịch bản dịch vụ tùy chỉnh")
 		method       = flag.String("method", "GET", "HTTP method cho kịch bản REST (GET, POST, PUT, DELETE,...)")
 		body         = flag.String("body", "", "chuỗi body gửi kèm cho request REST (chuỗi JSON hoặc chuỗi text thô)")
 		bodyFile     = flag.String("body-file", "", "đường dẫn file chứa dữ liệu body cho request REST")
@@ -471,71 +471,58 @@ func main() {
 		}
 	}
 
-	// Khởi tạo Scenario tương ứng từ package scenarios
-	var scenario scenarios.Scenario
-	if *scenarioName == "rest" {
-		var bodyData []byte
-		if *body != "" {
-			bodyData = []byte(*body)
-		} else if *bodyFile != "" {
-			content, err := os.ReadFile(*bodyFile)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "ERROR: đọc file body thất bại: %v\n", err)
-				os.Exit(2)
-			}
-			bodyData = content
-		}
-
-		if len(bodyData) > 0 {
-			var js json.RawMessage
-			if json.Unmarshal(bodyData, &js) == nil {
-				if _, exists := headers["Content-Type"]; !exists {
-					headers["Content-Type"] = "application/json"
-				}
-			}
-		}
-
-		scenario = scenarios.NewRestScenario(
-			*targetURL,
-			*method,
-			headers,
-			time.Duration(*timeout*float64(time.Second)),
-			bodyData,
-		)
-	} else {
-		// Default: chat-sse
-		queries := scenarios.ResolveQueries(*queriesFile, *envFile)
-		if len(queries) == 0 {
-			fmt.Fprintln(os.Stderr, "ERROR: không tìm thấy danh sách câu hỏi kiểm thử. Vui lòng cung cấp file câu hỏi qua cờ --queries hoặc khai báo CHAT_QUERIES / CHAT_QUERIES_FILE trong .env")
+	// Chuẩn bị dữ liệu body cho kịch bản REST hoặc kịch bản tùy chỉnh
+	var bodyData []byte
+	if *body != "" {
+		bodyData = []byte(*body)
+	} else if *bodyFile != "" {
+		content, err := os.ReadFile(*bodyFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: đọc file body thất bại: %v\n", err)
 			os.Exit(2)
 		}
+		bodyData = content
+	}
 
-		csvFile := *usersCSV
-		if csvFile == "" {
-			if _, err := os.Stat("users.csv"); err == nil {
-				csvFile = "users.csv"
+	if len(bodyData) > 0 {
+		var js json.RawMessage
+		if json.Unmarshal(bodyData, &js) == nil {
+			if _, exists := headers["Content-Type"]; !exists {
+				headers["Content-Type"] = "application/json"
 			}
 		}
+	}
 
-		var pool *scenarios.UserPool
-		if csvFile != "" {
-			users, err := scenarios.LoadUsers(csvFile)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "CẢNH BÁO: không đọc được file %s (%v), chuyển sang dùng --user-token\n", csvFile, err)
-				pool = scenarios.NewUserPool([]scenarios.User{{ID: "", Token: *userToken}})
-				fmt.Println("pool     : 1 token dùng chung (--user-token)")
-			} else {
-				pool = scenarios.NewUserPool(users)
-				fmt.Printf("pool     : %d user từ %s\n", len(users), filepath.Base(csvFile))
-			}
-		} else {
+	// Chuẩn bị danh sách câu hỏi & user pool (nếu có cấu hình)
+	queries := scenarios.ResolveQueries(*queriesFile, *envFile)
+
+	csvFile := *usersCSV
+	if csvFile == "" {
+		if _, err := os.Stat("users.csv"); err == nil {
+			csvFile = "users.csv"
+		}
+	}
+
+	var pool *scenarios.UserPool
+	if csvFile != "" {
+		users, err := scenarios.LoadUsers(csvFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "CẢNH BÁO: không đọc được file %s (%v), chuyển sang dùng --user-token\n", csvFile, err)
 			pool = scenarios.NewUserPool([]scenarios.User{{ID: "", Token: *userToken}})
 			fmt.Println("pool     : 1 token dùng chung (--user-token)")
+		} else {
+			pool = scenarios.NewUserPool(users)
+			fmt.Printf("pool     : %d user từ %s\n", len(users), filepath.Base(csvFile))
 		}
+	} else {
+		pool = scenarios.NewUserPool([]scenarios.User{{ID: "", Token: *userToken}})
+		if *scenarioName == "chat-sse" {
+			fmt.Println("pool     : 1 token dùng chung (--user-token)")
+		}
+	}
 
-		// Kiểm tra kích thước pool user (Rate-limit guard):
-		// Nếu chu kỳ lặp lại token (cycleS = pool.Len() / maxStep) nhỏ hơn ngưỡng an toàn (120s),
-		// cảnh báo nguy cơ chạm rate-limit của từng tài khoản thay vì đo tải thực tế của hệ thống.
+	// Kiểm tra kích thước pool user (Rate-limit guard cho chat-sse)
+	if *scenarioName == "chat-sse" {
 		maxStep := 0.0
 		for _, s := range steps {
 			if s > maxStep {
@@ -552,15 +539,24 @@ func main() {
 				}
 			}
 		}
+	}
 
-		scenario = scenarios.NewChatSSEScenario(
-			*targetURL,
-			headers,
-			time.Duration(*timeout*float64(time.Second)),
-			pool,
-			queries,
-			*cacheBust,
-		)
+	// Khởi tạo Scenario từ Scenario Registry
+	params := scenarios.ScenarioParams{
+		TargetURL: *targetURL,
+		Method:    *method,
+		Headers:   headers,
+		Timeout:   time.Duration(*timeout * float64(time.Second)),
+		BodyData:  bodyData,
+		UserPool:  pool,
+		Queries:   queries,
+		CacheBust: *cacheBust,
+	}
+
+	scenario, err := scenarios.Get(*scenarioName, params)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(2)
 	}
 
 	// Đảm bảo thư mục lưu output tồn tại

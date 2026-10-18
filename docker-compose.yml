@@ -1,0 +1,70 @@
+services:
+  # ============================================================================
+  # 1. RAMP (Production Runner Image siêu nhẹ ~25MB)
+  # Phù hợp chạy các kịch bản sẵn có (chat-sse, sample-get, sample-post)
+  # ============================================================================
+  ramp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    image: capsizer-ramp:latest
+    container_name: capsizer-ramp
+    volumes:
+      - .:/data
+    env_file:
+      - path: .env
+        required: false
+    command:
+      - "-scenario"
+      - "sample-get"
+      - "-steps"
+      - "2,4,8"
+      - "-step-seconds"
+      - "10"
+      - "-baseline-wait"
+      - "0"
+
+  # ============================================================================
+  # 2. RAMP-DEV (Base Image với Go SDK & Hot-run)
+  # Mount trực tiếp scenarios/ từ host: tự động phát hiện, scan và biên dịch
+  # khi bạn thêm file hoặc folder service mới mà không cần rebuild image.
+  # ============================================================================
+  ramp-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: base
+    image: capsizer-ramp:base
+    container_name: capsizer-ramp-dev
+    volumes:
+      - ./ramps/golang/scenarios:/app/scenarios
+      - .:/data
+    env_file:
+      - path: .env
+        required: false
+    command:
+      - "-scenario"
+      - "sample-get"
+      - "-steps"
+      - "2,4,8"
+      - "-step-seconds"
+      - "10"
+      - "-baseline-wait"
+      - "0"
+
+  # ============================================================================
+  # 3. REPORT (Công cụ phân tích và lập bảng định chuẩn sizing)
+  # Chạy trực tiếp report.go mà không cần cài Go trên máy host
+  # ============================================================================
+  report:
+    image: capsizer-ramp:base
+    container_name: capsizer-report
+    entrypoint: ["go", "run", "/tools/report.go"]
+    volumes:
+      - .:/data
+      - ./report.go:/tools/report.go:ro
+    working_dir: /data
+    command:
+      - "-ramp"
+      - "loadtest-ramp.jsonl"
