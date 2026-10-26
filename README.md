@@ -134,54 +134,53 @@ Toàn bộ hệ thống được viết bằng **Golang** (chỉ sử dụng Go 
 
 | Tệp tin / Thư mục | Chức năng chính | Ngôn ngữ / Phụ thuộc | Vị trí thực thi |
 | :--- | :--- | :--- | :--- |
-| [`probe.go`](file:///home/vbox/projects/capsizer/probe.go) | Daemon thu thập chỉ số hệ thống (cgroup quota, CFS throttling, TCP queue, socket states, worker threads/fds, health latency). Biên dịch thành static binary chạy trên mọi container (Python, Golang, Distroless, Alpine, Scratch) | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Bên trong Pod mục tiêu |
-| [`report.go`](file:///home/vbox/projects/capsizer/report.go) | Phân tích và tương quan log `ramp.jsonl` và `probe.jsonl`, tính toán chỉ số $C$ và lập bảng capacity planning | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Máy phân tích |
-| [`ramps/golang/`](file:///home/vbox/projects/capsizer/ramps/golang) | **Bộ phát tải Open-Loop Engine chạy bằng Go ⚡⚡⚡**: | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Máy phát tải bên ngoài |
-| ├── [`main.go`](file:///home/vbox/projects/capsizer/ramps/golang/main.go) | Core Open-Loop Engine chạy bằng Goroutines, Connection Pooling lớn, scheduler độ chính xác cao | Go 1.20+ | Máy phát tải |
-| └── [`scenarios/`](file:///home/vbox/projects/capsizer/ramps/golang/scenarios) | Kịch bản Go: `chatbot/chat_sse.go`, `sample/get_posts.go`, `sample/create_post.go`, `base.go`, `registry.go`, `utils.go` | Go 1.20+ | Module kịch bản Go |
+| [`cmd/probe/`](file:///home/vbox/projects/capsizer/cmd/probe) & [`pkg/probe/`](file:///home/vbox/projects/capsizer/pkg/probe) | Daemon thu thập chỉ số hệ thống (cgroup quota, CFS throttling, memory/RAM, TCP queue, socket states, worker threads/fds, health latency). Biên dịch thành static binary chạy trên mọi container | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Bên trong Pod mục tiêu |
+| [`profiling-sidecar/`](file:///home/vbox/projects/capsizer/profiling-sidecar) | Container chuyên dụng tích hợp `probe`, `py-spy`, `perf`, và Brendan Gregg `FlameGraph` để phân tích sâu & xuất biểu đồ SVG | Docker / Linux | K8s Sidecar / Debug Container |
+| [`cmd/report/`](file:///home/vbox/projects/capsizer/cmd/report) & [`pkg/analyzer/`](file:///home/vbox/projects/capsizer/pkg/analyzer) | Phân tích và tương quan log `ramp.jsonl` và `probe.jsonl`, tính toán chỉ số $C$, định chuẩn RAM/CPU và lập bảng capacity planning | Go 1.20+ (Chỉ dùng thư viện chuẩn) | Máy phân tích |
+| [`cmd/ramp/`](file:///home/vbox/projects/capsizer/cmd/ramp) & [`pkg/engine/`](file:///home/vbox/projects/capsizer/pkg/engine) | **Bộ phát tải Open-Loop Engine chạy bằng Go ⚡⚡⚡**: Goroutines dispatcher, Connection Pooling lớn, scheduler độ chính xác cao | Go 1.20+ | Máy phát tải bên ngoài |
+| [`pkg/scenarios/`](file:///home/vbox/projects/capsizer/pkg/scenarios) | Kho kịch bản Go: `chatbot/chat_sse.go`, `sample/get_posts.go`, `sample/create_post.go`, `registry.go`, `utils.go` | Go 1.20+ | Module kịch bản Go |
 
 ---
 
 ## 3. Yêu cầu môi trường & Cài đặt
 
 ### Yêu cầu
-- **Go 1.20 trở lên** trên máy phát tải / máy phân tích để chạy hoặc biên dịch `ramps/golang`, `probe.go` và `report.go`.
+- **Go 1.20 trở lên** trên máy phát tải / máy phân tích.
 - Hệ điều hành Linux trên Pod mục tiêu (hỗ trợ cgroup v1 hoặc v2, đọc `/proc`).
 
 ### Cài đặt & Sử dụng
 
-1. **Trên máy phát tải (Bộ phát tải Go `ramps/golang`):**
+1. **Trên máy phát tải (Bộ phát tải Go `cmd/ramp`):**
    *Không cần cài thêm thư viện bên ngoài (chỉ dùng Go standard library):*
    ```bash
    # Cách 1: Chạy trực tiếp qua go run:
-   cd ramps/golang
-   go run . --help
+   go run ./cmd/ramp --help
 
-   # Cách 2: Biên dịch thành binary độc lập (khuyên dùng khi dựng Docker/Pod loadtest):
-   cd ramps/golang
-   go build -o capsizer-ramp .
+   # Cách 2: Biên dịch thành binary độc lập:
+   go build -o capsizer-ramp ./cmd/ramp
    ./capsizer-ramp --help
    ```
 
-2. **Trên Pod / Container mục tiêu (chạy daemon `probe` lấy mẫu cgroup/TCP):**
-   Biên dịch tĩnh [`probe.go`](file:///home/vbox/projects/capsizer/probe.go) thành binary độc lập trên máy dev/CI rồi copy vào Pod:
+2. **Trên Pod / Container mục tiêu (chạy daemon `probe` hoặc dùng `profiling-sidecar`):**
+   Biên dịch tĩnh `cmd/probe` thành binary độc lập trên máy dev/CI rồi copy vào Pod:
    ```bash
    # Biên dịch file thực thi tĩnh (Linux x86_64)
-   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o probe probe.go
+   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o probe ./cmd/probe
 
-   # Copy vào pod và chạy trực tiếp (không cần bất kỳ runtime hay thư viện nào)
+   # Copy vào pod và chạy trực tiếp
    kubectl cp probe ${NAMESPACE}/${POD_NAME}:/tmp/probe
    kubectl exec -it ${NAMESPACE}/${POD_NAME} -- /tmp/probe --port 8000 --out /tmp/probe.jsonl
    ```
+   *Hoặc triển khai sẵn `profiling-sidecar` (xem chi tiết trong thư mục [`profiling-sidecar/`](file:///home/vbox/projects/capsizer/profiling-sidecar)).*
 
-3. **Trên máy phân tích (chạy `report.go`):**
+3. **Trên máy phân tích (chạy `cmd/report`):**
    ```bash
    # Cách 1: Chạy trực tiếp qua go run:
-   go run report.go --ramp <ramp.jsonl> --probe <probe.jsonl>
+   go run ./cmd/report -ramp <ramp.jsonl> -probe <probe.jsonl>
 
    # Cách 2: Biên dịch thành binary:
-   go build -o report report.go
-   ./report --ramp <ramp.jsonl> --probe <probe.jsonl>
+   go build -o report ./cmd/report
+   ./report -ramp <ramp.jsonl> -probe <probe.jsonl>
    ```
 
 ---
