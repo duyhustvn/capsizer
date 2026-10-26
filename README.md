@@ -19,11 +19,12 @@ Bộ công cụ giúp trả lời các câu hỏi cốt lõi về mặt kỹ thu
 - [3. Yêu cầu môi trường & Cài đặt](#3-yêu-cầu-môi-trường--cài-đặt)
 - [4. Hướng dẫn chạy từng bước (Workflow chuẩn)](#4-hướng-dẫn-chạy-từng-bước-workflow-chuẩn)
 - [5. Hướng dẫn chi tiết từng công cụ](#5-hướng-dẫn-chi-tiết-từng-công-cụ)
-  - [probe.go - Thu thập chỉ số hệ thống (Static Binary)](#probego---thu-thập-chỉ-số-hệ-thống-static-binary)
-  - [ramps/golang - Bộ phát tải Open-Loop Go (Đa kịch bản)](#rampsgolang---bộ-phát-tải-open-loop-go-đa-kịch-bản-chat-sse-rest-api)
-    - [Tổ chức kịch bản theo Service](#cách-tổ-chức-thư-mục--thêm-kịch-bản-scenario-mới-cho-từng-service)
+  - [cmd/probe - Thu thập chỉ số hệ thống RAM/CPU (Static Binary)](#cmdprobe---thu-thập-chỉ-số-hệ-thống-ramcpu-static-binary)
+  - [profiling-sidecar - Container phân tích sâu & FlameGraph](#profiling-sidecar---container-phân-tích-sâu--flamegraph)
+  - [cmd/ramp - Bộ phát tải Open-Loop Go (Đa kịch bản)](#cmdramp---bộ-phát-tải-open-loop-go-đa-kịch-bản-chat-sse-rest-api)
+    - [Tổ chức kịch bản theo Service trong pkg/scenarios](#cách-tổ-chức-thư-mục--thêm-kịch-bản-scenario-mới-cho-từng-service)
     - [Docker Base Image & Kế thừa kịch bản mới](#hướng-dẫn-docker-build-base-image--kế-thừa-khi-thêm-kịch-bản-mới)
-  - [report.go - Phân tích dữ liệu & Lập báo cáo](#reportgo---phân-tích-dữ-liệu--lập-báo-cáo)
+  - [cmd/report - Phân tích dữ liệu & Định chuẩn RAM/CPU](#cmdreport---phân-tích-dữ-liệu--định-chuẩn-ramcpu)
 - [6. Kịch bản thực tế mẫu (End-to-End Walkthrough)](#6-kịch-bản-thực-tế-mẫu-end-to-end-walkthrough)
 - [7. Các lưu ý kỹ thuật quan trọng (Best Practices)](#7-các-lưu-ý-kỹ-thuật-quan-trọng-best-practices)
 - [8. Capsizer khác gì các bài kiểm thử hiệu năng truyền thống?](#8-capsizer-khác-gì-các-bài-kiểm-thử-hiệu-năng-truyền-thống)
@@ -39,7 +40,7 @@ Bộ công cụ giúp trả lời các câu hỏi cốt lõi về mặt kỹ thu
 ```mermaid
 flowchart TD
     subgraph GeneratorHost["MÁY PHÁT TẢI - External Test Runner (Golang)"]
-        Ramp["ramps/golang (Open-Loop Load Generator)"]
+        Ramp["cmd/ramp (Open-Loop Load Generator)"]
         UserCSV[("users.csv / UserPool")]
         RampOut[("loadtest-ramp.jsonl")]
         Ramp -->|Đọc User/Token| UserCSV
@@ -49,19 +50,21 @@ flowchart TD
     subgraph K8sNode["MÁY CHỦ MỤC TIÊU - Kubernetes Node"]
         subgraph TargetPod["TARGET POD / CONTAINER"]
             AppServer["App Server (FastAPI / Gin / Echo / ...)"]
-            Probe["probe (Go Static Binary từ probe.go)"]
+            Probe["probe (Go Static Binary từ cmd/probe)"]
+            Sidecar["profiling-sidecar (py-spy, perf, FlameGraph)"]
             ProbeOut[("probe.jsonl")]
             
             Probe -->|Ghi snapshot| ProbeOut
             Probe -.->|Theo dõi /health/live| AppServer
             Probe -.->|Đọc /proc/net/tcp và /proc/pid| AppServer
-            Probe -.->|Đọc cpu.stat và cpu.max| CGroup["Linux cgroup v1/v2"]
+            Probe -.->|Đọc cpu.stat, cpu.max, memory.current| CGroup["Linux cgroup v1/v2"]
+            Sidecar -.->|Sampling StackTrace| AppServer
         end
     end
 
     subgraph Analysis["MÁY PHÂN TÍCH - Analysis & Sizing (Golang)"]
-        Report["report.go"]
-        ReportTable["Bảng phân tích và Capacity Sizing"]
+        Report["cmd/report"]
+        ReportTable["Bảng phân tích và Định chuẩn RAM & CPU"]
         RampOut -->|Thu thập| Report
         ProbeOut -->|Thu thập| Report
         Report -->|Tổng hợp và Đánh giá| ReportTable
@@ -70,9 +73,9 @@ flowchart TD
     Ramp ==>|"HTTP Request (SSE / REST)"| AppServer
 ```
 
-- **Máy phát tải (Generator Host)**: Chạy bộ phát tải Go ([`ramps/golang`](file:///home/vbox/projects/capsizer/ramps/golang)) từ bên ngoài Pod (máy trạm kỹ sư, VM kiểm thử hoặc Pod loadtest độc lập). **Tuyệt đối không chạy bộ tạo tải bên trong cùng container của ứng dụng** để tránh việc tiến trình phát tải tranh chấp CPU/RAM với ứng dụng mục tiêu.
-- **Pod / Container mục tiêu (Target Pod)**: Chạy daemon [`probe.go`](file:///home/vbox/projects/capsizer/probe.go) (được biên dịch thành file binary tĩnh `probe` siêu nhẹ ~6MB) trực tiếp trong container của ứng dụng. Nhờ nằm chung Linux namespace và cgroup, `probe` đọc trực tiếp các file ảo `/proc/net/tcp`, `/proc/<pid>/*` và `/sys/fs/cgroup` mà không cần bất kỳ runtime (Python/Node) hay công cụ bổ trợ (`ss`, `netstat`, `iproute2`) nào. Chạy được trên mọi loại container kể cả `distroless`, `alpine`, `scratch`.
-- **Tổng hợp & Báo cáo (Analysis)**: Sau khi đợt kiểm thử kết thúc, cả 2 file `loadtest-ramp.jsonl` và `probe.jsonl` được đưa về để [`report.go`](file:///home/vbox/projects/capsizer/report.go) đối chiếu theo dòng thời gian.
+- **Máy phát tải (Generator Host)**: Chạy bộ phát tải Go ([`cmd/ramp`](file:///home/vbox/projects/capsizer/cmd/ramp)) từ bên ngoài Pod (máy trạm kỹ sư, VM kiểm thử hoặc Pod loadtest độc lập). **Tuyệt đối không chạy bộ tạo tải bên trong cùng container của ứng dụng** để tránh việc tiến trình phát tải tranh chấp CPU/RAM với ứng dụng mục tiêu.
+- **Pod / Container mục tiêu (Target Pod)**: Chạy daemon [`cmd/probe`](file:///home/vbox/projects/capsizer/cmd/probe) (được biên dịch thành file binary tĩnh `probe` siêu nhẹ ~6MB) hoặc gắn [`profiling-sidecar`](file:///home/vbox/projects/capsizer/profiling-sidecar) trực tiếp vào Pod của ứng dụng. Nhờ nằm chung Linux namespace và cgroup, `probe` đọc trực tiếp các file ảo `/proc/net/tcp`, `/proc/<pid>/*` và `/sys/fs/cgroup` mà không cần bất kỳ runtime (Python/Node) hay công cụ bổ trợ nào.
+- **Tổng hợp & Báo cáo (Analysis)**: Sau khi đợt kiểm thử kết thúc, cả 2 file `loadtest-ramp.jsonl` và `probe.jsonl` được đưa về để [`cmd/report`](file:///home/vbox/projects/capsizer/cmd/report) đối chiếu theo dòng thời gian, tính toán $C$ (ms CPU / req) và lập bảng định chuẩn cả CPU lẫn RAM.
 
 ---
 
@@ -194,16 +197,16 @@ sequenceDiagram
     autonumber
     actor Dev as Kỹ sư kiểm thử
     participant Pod as Pod Ứng Dụng (Target)
-    participant Generator as Máy Phát Tải (Ramp)
-    participant Analyzer as Máy Phân Tích (Report)
+    participant Generator as Máy Phát Tải (cmd/ramp)
+    participant Analyzer as Máy Phân Tích (cmd/report)
 
-    Note over Dev,Pod: Giai đoạn 1: Khởi động probe trên Pod
+    Note over Dev,Pod: Giai đoạn 1: Khởi động probe trên Pod (hoặc profiling-sidecar)
     Dev->>Pod: Khởi động ./probe ngầm (ghi probe.jsonl)
     
     Note over Dev,Generator: Giai đoạn 2: Khởi chạy bộ tạo tải Go (Tự động hóa hoàn toàn)
-    Dev->>Generator: Chạy ramps/golang (--steps 1,2,4,8,16,32)
+    Dev->>Generator: Chạy cmd/ramp (--steps 1,2,4,8,16,32)
     Generator->>Pod: a. Warmup 1 req (kiểm tra kết nối & làm ấm connection pool)
-    Generator->>Generator: b. Tự động đếm lùi 90s để probe đo CPU nền chuẩn xác
+    Generator->>Generator: b. Tự động đếm lùi đo CPU/RAM nền chuẩn xác
     Generator->>Pod: c. Bắt đầu phát tải bậc thang Open-Loop
     Generator->>Generator: Ghi log loadtest-ramp.jsonl
     
@@ -211,33 +214,33 @@ sequenceDiagram
     Dev->>Pod: Dừng tiến trình probe (Ctrl+C hoặc kill)
     Dev->>Pod: Tải probe.jsonl về máy kiểm thử (kubectl cp)
     
-    Note over Dev,Analyzer: Giai đoạn 4: Dựng báo cáo
-    Dev->>Analyzer: go run report.go --ramp loadtest-ramp.jsonl --probe probe.jsonl
-    Analyzer-->>Dev: Xuất bảng phân tích & Khuyến nghị Capacity Sizing
+    Note over Dev,Analyzer: Giai đoạn 4: Dựng báo cáo & Sizing
+    Dev->>Analyzer: go run ./cmd/report -ramp loadtest-ramp.jsonl -probe probe.jsonl
+    Analyzer-->>Dev: Xuất bảng phân tích & Khuyến nghị Capacity Sizing (CPU & RAM)
 ```
 
 ---
 
 ## 5. Hướng dẫn chi tiết từng công cụ
 
-### probe.go - Thu thập chỉ số hệ thống (Static Binary)
+### cmd/probe - Thu thập chỉ số hệ thống RAM/CPU (Static Binary)
 
-[`probe.go`](file:///home/vbox/projects/capsizer/probe.go) chỉ dùng thư viện chuẩn của Go, biên dịch thành một file binary tĩnh độc lập (static binary ~6MB), chạy được trên mọi container Linux (kể cả container Python FastAPI/Uvicorn, container Golang hay các image tối giản **Distroless**, **Alpine**, **Scratch** không có shell hay runtime).
+[`cmd/probe`](file:///home/vbox/projects/capsizer/cmd/probe) chỉ dùng thư viện chuẩn của Go, biên dịch thành một file binary tĩnh độc lập (static binary ~6MB), chạy được trên mọi container Linux (kể cả container Python FastAPI/Uvicorn, container Golang hay các image tối giản **Distroless**, **Alpine**, **Scratch** không có shell hay runtime).
 
-#### Biên dịch tĩnh `probe.go`
+#### Biên dịch tĩnh `cmd/probe`
 Biên dịch ngay trên máy phát tải hoặc trong quy trình CI/CD:
 ```bash
 # Biên dịch cho Linux x86_64 (amd64)
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o probe probe.go
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o probe ./cmd/probe
 
 # Biên dịch cho Linux ARM64 (Apple Silicon k8s / AWS Graviton)
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o probe probe.go
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o probe ./cmd/probe
 ```
 
 #### Cú pháp dòng lệnh
 ```bash
 # Chạy trực tiếp qua go run
-go run probe.go [OPTIONS]
+go run ./cmd/probe [OPTIONS]
 
 # Hoặc chạy binary tĩnh đã biên dịch
 ./probe [OPTIONS]
@@ -246,31 +249,29 @@ go run probe.go [OPTIONS]
 #### Bảng tham số
 | Tham số | Giá trị mặc định | Giải thích |
 | :--- | :--- | :--- |
-| `--out` / `-out` | `/tmp/probe.jsonl` | Đường dẫn file JSONL lưu kết quả lấy mẫu |
-| `--interval` / `-interval` | `1.0` | Chu kỳ lấy mẫu dữ liệu (tính bằng giây) |
-| `--port` / `-port` | `8000` | Cổng dịch vụ của ứng dụng (để lọc TCP socket & đo Accept Queue) |
-| `--target` / `-target` | `http://127.0.0.1:8000` | URL gốc của dịch vụ để kiểm tra health check |
-| `--health-timeout` / `-health-timeout` | `5.0` | Thời gian timeout khi kiểm tra endpoint `/health/live` (giây) |
-| `--no-cgroup` / `-no-cgroup` | `false` | Bỏ qua thu thập cgroup/proc (dùng khi chạy từ ngoài Pod, chỉ đo health check) |
-| `--once` / `-once` | `false` | In 1 snapshot metadata và dữ liệu ra màn hình rồi thoát ngay |
-| `--proc-pattern` / `-proc-pattern` | `""` | Từ khóa lọc tiến trình ứng dụng (ví dụ `"uvicorn"`). Để trống sẽ tự động nhận diện PID 1 của container và cây tiến trình con |
-
-#### Ví dụ chạy
-- **Chạy thường trực trong container:**
-  ```bash
-  # Copy binary tĩnh vào container và khởi chạy
-  kubectl cp probe ${NAMESPACE}/${POD_NAME}:/tmp/probe
-  kubectl exec -it ${NAMESPACE}/${POD_NAME} -- /tmp/probe --port 8000 --out /tmp/probe.jsonl
-  ```
-
-- **Kiểm tra nhanh thông số cgroup quota và nproc của container:**
-  ```bash
-  ./probe --once
-  ```
+| `-out` | `probe.jsonl` | Đường dẫn file JSONL lưu kết quả lấy mẫu |
+| `-interval` | `1.0` | Chu kỳ lấy mẫu dữ liệu (tính bằng giây) |
+| `-port` | `0` | Cổng dịch vụ của ứng dụng (để lọc TCP socket & đo Accept Queue) |
+| `-health-url` | `""` | URL kiểm tra `/health/live` của dịch vụ |
+| `-health-timeout` | `2.0` | Thời gian timeout khi kiểm tra health check (giây) |
+| `-pid` | `0` | PID của tiến trình worker đơn lẻ |
+| `-parent-pid` | `0` | PID của master process (để quét toàn bộ worker con) |
+| `-once` | `false` | In 1 snapshot metadata và dữ liệu ra màn hình rồi thoát ngay |
 
 ---
 
-### ramps/golang - Bộ phát tải Open-Loop Go (Đa kịch bản: Chat SSE, REST API)
+### profiling-sidecar - Container phân tích sâu & FlameGraph
+
+Ngoài daemon `probe` siêu nhẹ, dự án tích hợp sẵn container [`profiling-sidecar/`](file:///home/vbox/projects/capsizer/profiling-sidecar) được đóng gói sẵn các công cụ profiling chuyên sâu:
+- **`py-spy`**: Profiler Python tốc độ cao, không dừng GIL, trích xuất FlameGraph CPU trực tiếp.
+- **`perf`**: Linux kernel profiling (`perf record` + `flamegraph.pl` tần số 99Hz).
+- **`analyze-connections`**: Điều tra trạng thái TCP, phát hiện rò rỉ socket `CLOSE-WAIT`, nghẽn `Recv-Q/Send-Q`.
+
+Xem hướng dẫn chi tiết về triển khai Kubernetes (`kubectl debug`, Pod sidecar) tại [`profiling-sidecar/README.md`](file:///home/vbox/projects/capsizer/profiling-sidecar/README.md).
+
+---
+
+### cmd/ramp - Bộ phát tải Open-Loop Go (Đa kịch bản: Chat SSE, REST API)
 
 Bộ phát tải được viết bằng **Go (Golang)**, tận dụng tối đa cơ chế Goroutines nhẹ và HTTP connection pooling lớn để đạt độ chính xác lịch trình phát tải cực cao:
 1. `chat-sse` (mặc định): Đo endpoint Chatbot streaming SSE (`POST /chat`), đo TTFT theo thời gian thực.
@@ -280,13 +281,13 @@ Bộ phát tải được viết bằng **Go (Golang)**, tận dụng tối đa 
 #### Cú pháp dòng lệnh
 ```bash
 # Cách 1: Chạy trực tiếp qua go run:
-cd ramps/golang && go run . [OPTIONS]
+go run ./cmd/ramp [OPTIONS]
 
 # Cách 2: Biên dịch thành binary độc lập (Khuyên dùng khi triển khai Pod/VM tải):
-cd ramps/golang && go build -o capsizer-ramp .
+go build -o capsizer-ramp ./cmd/ramp
 ./capsizer-ramp [OPTIONS]
 
-# Cách 3: Chạy qua Docker (Image runner siêu nhẹ ~25MB):
+# Cách 3: Chạy qua Docker (Image runner siêu nhẹ ~20MB):
 docker build -t capsizer-ramp .
 docker run --rm -it -v $(pwd):/data capsizer-ramp [OPTIONS]
 
@@ -294,7 +295,7 @@ docker run --rm -it -v $(pwd):/data capsizer-ramp [OPTIONS]
 # Phát tải với runner:
 docker compose run --rm ramp [OPTIONS]
 
-# Phát tải chế độ Dev (tự động nạp kịch bản mới trong scenarios/):
+# Phát tải chế độ Dev (tự động nạp kịch bản mới trong pkg/scenarios/):
 docker compose run --rm ramp-dev -scenario <tên_kịch_bản> [OPTIONS]
 
 # Xuất bảng phân tích sizing:
@@ -339,26 +340,23 @@ docker build --target base -t capsizer-ramp:base .
 - **Ví dụ 1: Test API Chatbot streaming SSE (Kịch bản mặc định):**
   ```bash
   export JWT_SECRET="your-jwt-secret-key"
-  cd ramps/golang
-  go run . \
+  go run ./cmd/ramp \
     -scenario chat-sse \
     -url "https://api.example.com/chat" \
     -queries queries.txt \
-    -users-csv users.csv \
+    -users users.csv \
     -steps "2,4,8,12,16" \
     -step-seconds 60 \
     -cooldown 20 \
     -baseline-wait 90 \
-    -stop-on-knee \
-    -insecure \
+    -skip-verify \
     -out loadtest-ramp.jsonl
   ```
 
 - **Ví dụ 2: Test Public API REST GET (Kịch bản mẫu sample-get):**
   ```bash
-  cd ramps/golang
   # Đo trực tiếp Public API JSONPlaceholder:
-  go run . \
+  go run ./cmd/ramp \
     -scenario sample-get \
     -steps "2,4,8,16" \
     -step-seconds 10 \
@@ -366,7 +364,7 @@ docker build --target base -t capsizer-ramp:base .
     -out loadtest-sample-get.jsonl
 
   # Hoặc truyền URL của riêng bạn:
-  go run . \
+  go run ./cmd/ramp \
     -scenario sample-get \
     -url "https://api.example.com/posts/1" \
     -steps "10,20,50" \
@@ -376,9 +374,8 @@ docker build --target base -t capsizer-ramp:base .
 
 - **Ví dụ 3: Test Public API REST POST gửi kèm JSON (Kịch bản mẫu sample-post):**
   ```bash
-  cd ramps/golang
   # Đo trực tiếp Public API POST:
-  go run . \
+  go run ./cmd/ramp \
     -scenario sample-post \
     -steps "2,4,8" \
     -step-seconds 10 \
@@ -386,7 +383,7 @@ docker build --target base -t capsizer-ramp:base .
     -out loadtest-sample-post.jsonl
 
   # Hoặc truyền URL và body JSON tùy chỉnh:
-  go run . \
+  go run ./cmd/ramp \
     -scenario sample-post \
     -url "https://api.example.com/posts" \
     -body '{"title": "test", "body": "load testing", "userId": 1}' \
@@ -397,10 +394,10 @@ docker build --target base -t capsizer-ramp:base .
 
 #### Cách tổ chức thư mục & thêm kịch bản (Scenario) mới cho từng Service
 
-Để quản lý kịch bản cho nhiều service khác nhau, `ramps/golang` hỗ trợ cấu trúc **mỗi service một thư mục con trong `scenarios/`**, và trong thư mục đó có thể chứa **nhiều file `.go`**:
+Để quản lý kịch bản cho nhiều service khác nhau, Capsizer hỗ trợ cấu trúc **mỗi service một thư mục con trong `pkg/scenarios/`**, và trong thư mục đó có thể chứa **nhiều file `.go`**:
 
 ```text
-ramps/golang/scenarios/
+pkg/scenarios/
 ├── base.go              # Interface Scenario & Record
 ├── registry.go          # Scenario Registry tự động
 ├── utils.go             # Tiện ích chung (UserPool, JWT, LoadDotEnv, ...)
@@ -421,9 +418,9 @@ ramps/golang/scenarios/
 ```
 
 ##### 1. Cách viết file kịch bản trong thư mục Service
-Mọi file trong cùng thư mục service sử dụng chung `package <tên_service>`, import `ramps/golang/scenarios` và tự động đăng ký kịch bản thông qua hàm `init()`:
+Mọi file trong cùng thư mục service sử dụng chung `package <tên_service>`, import `capsizer/pkg/scenarios` và tự động đăng ký kịch bản thông qua hàm `init()`:
 
-*Ví dụ `ramps/golang/scenarios/auth/login.go`:*
+*Ví dụ `pkg/scenarios/auth/login.go`:*
 ```go
 package auth
 
@@ -431,7 +428,7 @@ import (
     "context"
     "fmt"
     "net/http"
-    "ramps/golang/scenarios"
+    "capsizer/pkg/scenarios"
 )
 
 // Tự động đăng ký kịch bản "auth-login" vào hệ thống
@@ -481,15 +478,15 @@ Khi bạn đã thêm các thư mục kịch bản mới (`auth/`, `order/`, `pay
 FROM capsizer-ramp:base
 
 # Copy tất cả các thư mục kịch bản vào image
-COPY ramps/golang/scenarios/ /app/scenarios/
+COPY pkg/scenarios/ /app/pkg/scenarios/
 
-# Tự động quét subpackages và biên dịch binary (mất ~1-2 giây)
+# Tự động quét subpackages và biên dịch binary
 RUN build_ramp
 ```
 
 ##### Bước 3: Build và chạy kịch bản
 ```bash
-# Build image kịch bản mới (chỉ mất ~2 giây)
+# Build image kịch bản mới
 docker build -t capsizer-ramp:my-services -f Dockerfile.loadtest .
 
 # Chạy kịch bản chatbot SSE
@@ -506,10 +503,10 @@ docker run --rm -it -v $(pwd):/data capsizer-ramp:my-services \
 
 > [!NOTE]
 > **Chế độ Hot-run khi phát triển (Không cần build lại image):**
-> Bạn có thể mount trực tiếp thư mục `scenarios` từ host vào container Base:
+> Bạn có thể mount trực tiếp thư mục `pkg/scenarios` từ host vào container Base:
 > ```bash
 > docker run --rm -it \
->   -v $(pwd)/ramps/golang/scenarios:/app/scenarios \
+>   -v $(pwd)/pkg/scenarios:/app/pkg/scenarios \
 >   -v $(pwd):/data \
 >   capsizer-ramp:base \
 >   -scenario auth-login -url "http://127.0.0.1:8000/api/v1/auth/login"
@@ -518,31 +515,31 @@ docker run --rm -it -v $(pwd):/data capsizer-ramp:my-services \
 
 ---
 
-### report.go - Phân tích dữ liệu & Lập báo cáo
+### cmd/report - Phân tích dữ liệu & Định chuẩn RAM/CPU
 
 #### Cú pháp dòng lệnh
 ```bash
 # Chạy trực tiếp qua go run
-go run report.go --ramp <file-ramp.jsonl> [--probe <file-probe.jsonl>]
+go run ./cmd/report -ramp <file-ramp.jsonl> [-probe <file-probe.jsonl>]
 
 # Hoặc biên dịch thành binary
-go build -o report report.go
-./report --ramp <file-ramp.jsonl> [--probe <file-probe.jsonl>]
+go build -o report ./cmd/report
+./report -ramp <file-ramp.jsonl> [-probe <file-probe.jsonl>]
 ```
 
 #### Bảng tham số
 | Tham số | Bắt buộc | Giải thích |
 | :--- | :--- | :--- |
-| `--ramp` / `-ramp` | **Có** | File JSONL chứa kết quả phát tải từ `ramps/golang` |
-| `--probe` / `-probe` | Không | File JSONL chứa chỉ số hệ thống từ `probe.go` |
+| `-ramp` | **Có** | File JSONL chứa kết quả phát tải từ `cmd/ramp` |
+| `-probe` | Không | File JSONL chứa chỉ số hệ thống từ `cmd/probe` (khuyên dùng để có sizing đầy đủ) |
 
-#### Giải thích các cột trong bảng kết quả của `report.go`
+#### Giải thích các cột trong bảng kết quả của `cmd/report`
 ```text
- offer  achiev    ok  err  ttftP50  ttftP95  cores    C_ms   thr%  acptQ  hlthP99  estab  fdMax  thrd  verdict
-------------------------------------------------------------------------------------------------------------
-   2.0    2.00   120    0      230      450   0.45   180.2    0.0      0       12     18     42    16  OK
-   4.0    3.98   239    1      310      620   0.88   185.1    1.2      0       15     34     45    16  OK
-   8.0    6.50   390   90    2,100    5,400   1.98   190.5   18.5      4    1,250     75     52    18  KNEE: achieved<offered, acptQ 10 mẫu, throttled
+ offer  achiev    ok  err  ttftP50  ttftP95  cores    C_ms   ramMB   pkRAM    dRAM   thr%  acptQ  hlthP99  thrd  verdict
+--------------------------------------------------------------------------------------------------------------------------
+   2.0    2.00   120    0      230      450   0.45   180.2     185     210      25    0.0      0       12    16  OK
+   4.0    3.98   239    1      310      620   0.88   185.1     215     260      75    1.2      0       15    16  OK
+   8.0    6.50   390   90    2,100    5,400   1.98   190.5     310     420     235   18.5      4    1,250    18  KNEE (achieved<90%, acptQ>=1, thr>5%)
 ```
 
 - `offer`: Mức RPS mục tiêu phát ra từ bộ tạo tải.
@@ -551,11 +548,12 @@ go build -o report report.go
 - `ttftP50` / `ttftP95`: Độ trễ nhận token/nội dung đầu tiên ở phân vị p50 và p95 (ms).
 - `cores`: Số lượng CPU core thực tế container đã tiêu thụ.
 - `C_ms`: Thời gian CPU tiêu thụ trung bình cho mỗi request (đã trừ CPU nền).
+- `ramMB`: Mức RAM trung bình tiêu thụ trong suốt bậc đo (MB).
+- `pkRAM`: Mức RAM đỉnh đạt được trong bậc kiểm thử (MB).
+- `dRAM`: Mức tăng RAM ($\Delta$RAM = `pkRAM - baseRAM`) so với baseline (MB).
 - `thr%`: Tỷ lệ phần trăm chu kỳ CFS bị bóp nghẽn CPU (`nr_throttled / nr_periods`).
 - `acptQ`: Số kết nối lớn nhất bị dồn ứ trong TCP Accept Queue.
 - `hlthP99`: Độ trễ endpoint `/health/live` ở phân vị p99 (đo mức độ nghẽn event loop).
-- `estab`: Số lượng kết nối TCP ở trạng thái `ESTABLISHED`.
-- `fdMax`: Số file descriptor lớn nhất của một tiến trình worker.
 - `thrd`: Số OS thread lớn nhất trong một tiến trình worker.
 - `verdict`: Trạng thái đánh giá (`OK` hoặc `KNEE` kèm nguyên nhân cụ thể).
 
@@ -565,7 +563,7 @@ go build -o report report.go
 
 Dưới đây là kịch bản đo kiểm thực tế một Pod dịch vụ trên cụm Kubernetes:
 
-### Bước 1: Biên dịch và khởi động `probe` trên Pod để lấy CPU nền
+### Bước 1: Biên dịch và khởi động `probe` trên Pod để lấy CPU và RAM nền
 Mở terminal 1, biên dịch binary `probe` và đẩy vào Pod mục tiêu:
 
 ```bash
@@ -573,47 +571,35 @@ POD_NAME="app-deployment-78b958c97-xyz12"
 NAMESPACE="default"
 
 # 1. Biên dịch static binary một lần duy nhất trên máy phát tải / CI
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o probe probe.go
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o probe ./cmd/probe
 
 # 2. Copy binary vào pod
 kubectl cp probe ${NAMESPACE}/${POD_NAME}:/tmp/probe
 
-# 3. Khởi chạy probe trong pod (tự động nhận diện ứng dụng tại PID 1 và các worker con)
+# 3. Khởi chạy probe trong pod (tự động nhận diện cgroup v1/v2, CPU, RAM và worker con)
 kubectl exec -n ${NAMESPACE} ${POD_NAME} -- \
-  /tmp/probe --port 8000 --out /tmp/probe.jsonl
+  /tmp/probe -port 8000 -out /tmp/probe.jsonl
 ```
 
 > [!TIP]
-> **Tự động hóa hoàn toàn việc lấy CPU nền:** Bạn không cần phải bấm giờ chờ đợi thủ công! Ngay sau khi bật `probe` ở terminal 1, bạn có thể chuyển sang terminal 2 để khởi chạy `ramps/golang` ngay lập tức. Bộ tạo tải Go sẽ tự động thực hiện warmup và đếm lùi chính xác 90 giây (`-baseline-wait 90`) để `probe` thu thập CPU nền trước khi bắt đầu phát tải Bậc 1.
+> **Tự động hóa hoàn toàn việc lấy CPU & RAM nền:** Bạn không cần phải bấm giờ chờ đợi thủ công! Ngay sau khi bật `probe` ở terminal 1, bạn có thể chuyển sang terminal 2 để khởi chạy `cmd/ramp` ngay lập tức. Bộ tạo tải Go sẽ tự động thực hiện warmup và đếm lùi chính xác 90 giây (`-baseline-wait 90`) để `probe` thu thập CPU và RAM nền trước khi bắt đầu phát tải Bậc 1.
 
-### Bước 2: Khởi chạy bộ tạo tải Go (`ramps/golang`)
+### Bước 2: Khởi chạy bộ tạo tải Go (`cmd/ramp`)
 Mở terminal 2 (trên máy phát tải bên ngoài), thực thi lệnh:
 ```bash
 export JWT_SECRET="your-secret-key"
 
-cd ramps/golang
-go run . \
+go run ./cmd/ramp \
   -url "https://api.example.com/chat" \
   -queries queries.txt \
-  -users-csv users.csv \
+  -users users.csv \
   -steps "1,2,4,8,12,16" \
   -step-seconds 60 \
   -cooldown 20 \
   -settle 60 \
   -baseline-wait 90 \
-  -insecure \
-  -stop-on-knee \
+  -skip-verify \
   -out /tmp/loadtest-ramp.jsonl
-```
-
-Quan sát terminal để theo dõi bảng tiến độ theo từng bậc RPS:
-```text
- offered  achieved     ok   err  drop  ttft_p50  ttft_p95  inflight
------------------------------------------------------------------
-     1.0      1.00     60     0     0       185       320         2
-     2.0      2.00    120     0     0       210       390         4
-     4.0      4.00    240     0     0       295       580         9
-...
 ```
 
 ### Bước 3: Thu thập file `probe.jsonl` từ Pod về máy phân tích
@@ -625,30 +611,31 @@ Sau khi quá trình phát tải hoàn thành:
    ```
 
 ### Bước 4: Dựng báo cáo và đọc kết quả
-Chạy lệnh phân tích bằng `report.go`:
+Chạy lệnh phân tích bằng `cmd/report`:
 ```bash
-go run report.go --ramp /tmp/loadtest-ramp.jsonl --probe /tmp/probe.jsonl
+go run ./cmd/report -ramp /tmp/loadtest-ramp.jsonl -probe /tmp/probe.jsonl
 ```
 
-**Mẫu kết luận xuất ra từ `report.go`:**
+**Mẫu kết luận xuất ra từ `cmd/report`:**
 ```text
-====================================================================================================
-CALIBRATE - KẾT QUẢ
-====================================================================================================
-cpu_quota_cores : 2.0
-nproc nhìn thấy : 64 (core của NODE, không phải quota)
-executor threads: 32 / worker
-CPU nền (không tải)    : 0.082 core (115 mẫu / 115s)
+========================================================================================================================
+                                           KẾT LUẬN & ĐỊNH CHUẨN
+========================================================================================================================
+▶ 1. ĐỊNH CHUẨN CPU & THROUGHPUT:
+  • C (trung vị các bậc còn khoẻ)    : 175.4 ms CPU / request
+  • Trần lý thuyết 1 worker (1 core)  : 5.7 req/s
+  • Trần lý thuyết Pod (2 core quota) : 11.4 req/s
+  • Số worker hợp lý khuyến nghị      : 2 worker (= quota)
+  • Bậc cao nhất còn đạt chuẩn SLO   : 4 req/s
+  • Điểm gãy quan sát được (KNEE)     : 8 req/s (Nguyên nhân: achieved<90%, acptQ>=1, thr>5%)
 
-[... Bảng chi tiết từng bậc ...]
-
-KẾT LUẬN
-  C (trung vị các bậc còn khoẻ)   : 175.4 ms CPU / request
-  Trần lý thuyết 1 worker (1 core) : 5.7 req/s
-  Trần lý thuyết pod (2 core)      : 11.4 req/s
-  Số worker hợp lý                 : 2 (= quota)
-  Bậc cuối còn khoẻ                : 4 req/s -> SLO
-  Điểm gãy quan sát được           : 8 req/s offered
+▶ 2. ĐỊNH CHUẨN BỘ NHỚ (RAM / MEMORY):
+  • RAM nền (Baseline khi không tải) : 185.0 MB
+  • RAM đỉnh quan sát được khi tải   : 420.0 MB
+  • Mức tăng RAM tối đa do tải (ΔRAM): 235.0 MB
+  • Khuyến nghị cấu hình Kubernetes Pod:
+      - resources.requests.memory    : 448Mi
+      - resources.limits.memory      : 576Mi (bao gồm 30% buffer chống OOM-Killed)
 ```
 
 ---
@@ -659,13 +646,13 @@ KẾT LUẬN
 Trong Kubernetes, số core hiển thị từ hệ điều hành (`runtime.NumCPU()` hoặc `os.cpu_count()`) thường trả về số core của máy chủ vật lý (Node, ví dụ 64 core), chứ không phải mức giới hạn CPU Quota của Pod (ví dụ 2 core).
 - Nhiều runtime và thư viện mặc định khởi tạo thread pool / `GOMAXPROCS` dựa trên số core của Node.
 - Việc sinh ra quá nhiều thread trên một Pod có quota thấp sẽ dẫn đến tranh chấp CPU gay gắt, gây ra hiện tượng **CFS Throttling nặng** dù ứng dụng chưa đầy tải.
-- `probe.go` và `report.go` sẽ cảnh báo trực tiếp nếu phát hiện `nproc_visible > quota * 2`.
+- `cmd/probe` và `cmd/report` sẽ cảnh báo trực tiếp nếu phát hiện `nproc_visible > quota * 2`.
 
 ### 2. Thời gian lấy mẫu Baseline tối thiểu 90s
 Các ứng dụng thường có các cron job nội bộ chạy ngầm (ví dụ: đồng bộ cấu hình, cache nền theo chu kỳ 30 - 45s). Nếu đo baseline quá ngắn (< 90s), giá trị CPU nền sẽ bị dao động mạnh, dẫn đến việc tính toán chỉ số $C$ bị thiếu chính xác.
 
-### 3. Giám sát Container với `probe.go`: Multi-worker vs Single-process & Distroless Images
-- **Mô hình tiến trình**: `probe.go` tự động nhận diện cả ứng dụng đa tiến trình (master-worker như Uvicorn/Gunicorn) lẫn ứng dụng đơn tiến trình (như Go `runtime.GOMAXPROCS`). Trường `threads_max` và `n_workers` sẽ phản ánh chính xác số lượng OS thread và worker thực tế đang gánh tải.
+### 3. Giám sát Container với `cmd/probe`: Multi-worker vs Single-process & Distroless Images
+- **Mô hình tiến trình**: `cmd/probe` tự động nhận diện cả ứng dụng đa tiến trình (master-worker như Uvicorn/Gunicorn) lẫn ứng dụng đơn tiến trình (như Go `runtime.GOMAXPROCS`). Trường `threads_max` và `n_workers` sẽ phản ánh chính xác số lượng OS thread và worker thực tế đang gánh tải.
 - **Container Distroless / Scratch**: Hầu hết container tối giản trong môi trường production không có sẵn shell (`/bin/sh`) hay Python. File binary `probe` được biên dịch tĩnh hoàn toàn (`CGO_ENABLED=0`), có thể chạy trực tiếp thông qua `kubectl exec pod -- /tmp/probe ...` mà không cần bất kỳ công cụ phụ trợ nào.
 
 ---
@@ -678,6 +665,7 @@ Các ứng dụng thường có các cron job nội bộ chạy ngầm (ví dụ
   - Một request tiêu tốn chính xác bao nhiêu mili-giây CPU thực tế ($C$) trong cgroup?
   - Với giới hạn CPU quota được cấp phát cho Pod, thông lượng tối đa theo lý thuyết là bao nhiêu?
   - Cần chạy bao nhiêu tiến trình worker là tối ưu để không bị lãng phí bộ nhớ hoặc tranh chấp CPU Throttling?
+  - Cần cấp phát bao nhiêu RAM (`requests` / `limits`) để đảm bảo không bị OOM-Killed?
 
 ---
 
@@ -698,8 +686,9 @@ Các ứng dụng thường có các cron job nội bộ chạy ngầm (ví dụ
 
 ### 4. Kết hợp viễn trắc cgroup & kernel (Không chỉ quan sát từ phía client)
 - Các công cụ thông thường chỉ đứng ở phía máy phát tải để đo lường mã trạng thái HTTP (200, 500) và thời gian phản hồi.
-- Capsizer sử dụng daemon `probe.go` chạy trực tiếp trong container để theo dõi sát sao "sức khỏe" tầng hệ điều hành:
+- Capsizer sử dụng daemon `cmd/probe` chạy trực tiếp trong container để theo dõi sát sao "sức khỏe" tầng hệ điều hành:
   - Tỷ lệ chu kỳ CPU bị bóp nghẽn bởi Linux CFS Quota (`nr_throttled / nr_periods`).
+  - Mức tiêu thụ bộ nhớ RAM (`memory.current` hoặc `memory.usage_in_bytes`).
   - Số lượng kết nối chờ xử lý trong TCP Accept Queue (`/proc/net/tcp`).
   - Phân bố trạng thái kết nối TCP (ESTAB, TIME_WAIT, SYN_RECV,...).
   - Độ bận của Event Loop thông qua độ trễ endpoint `/health/live`.
@@ -710,13 +699,26 @@ Các ứng dụng thường có các cron job nội bộ chạy ngầm (ví dụ
 
 | Tiêu chí | Kiểm thử tải truyền thống (Load / Stress Test) | Capsizer (Capacity Sizing & Calibration) |
 | :--- | :--- | :--- |
-| **Mục tiêu cốt lõi** | Kiểm tra độ bền, tìm điểm sập của toàn hệ thống | Đo chi phí CPU ($C$), tìm điểm gãy tối ưu hóa Pod/Worker |
+| **Mục tiêu cốt lõi** | Kiểm tra độ bền, tìm điểm sập của toàn hệ thống | Đo chi phí CPU ($C$), định chuẩn RAM/CPU, tối ưu Pod/Worker |
 | **Mô hình phát tải** | Thường là Closed-Loop (dựa theo số VU / Concurrency) | Thuần Open-Loop (phát theo arrival-rate độc lập $1/\text{RPS}$) |
 | **Hỗ trợ AI Streaming** | Thường xử lý response nguyên khối (khó đo TTFT) | Bóc tách từng chunk SSE stream (đo TTFT, notice, end-of-stream) |
-| **Nguồn dữ liệu** | Chỉ số đo từ phía Client (Response Time, Error Rate) | Đa chiều: Client metrics + Linux cgroup quota + CFS Throttling + TCP Queue |
+| **Nguồn dữ liệu** | Chỉ số đo từ phía Client (Response Time, Error Rate) | Đa chiều: Client metrics + Linux cgroup quota + Memory RAM + CFS Throttling + TCP Queue |
 | **Khoảng nghỉ giữa các bậc** | Thường tăng tải liên tục | Có khoảng nghỉ Cooldown riêng biệt để server giải phóng CPU/GC |
-| **Ngắt bài test thông minh** | Dừng khi hết thời gian định sẵn hoặc tỷ lệ lỗi cao | Tự động ngắt khi qua điểm gãy (`achieved < 90% offered`) |
-| **Kết quả đầu ra** | Biểu đồ RPS và độ trễ qua Gateway | Khuyến nghị cấu hình Pod: trần RPS, số CPU quota, số worker tối ưu |
+| **Định chuẩn bộ nhớ** | Thường chỉ theo dõi sơ sài từ ngoài Node | Đo Baseline RAM, Peak RAM, $\Delta$RAM và khuyến nghị K8s RAM Requests/Limits |
+| **Kết quả đầu ra** | Biểu đồ RPS và độ trễ qua Gateway | Khuyến nghị cấu hình Pod: trần RPS, số CPU quota, số worker và mức RAM tối ưu |
+
+---
+
+### 6. Khi nào nên dùng công cụ nào?
+
+- **Nên sử dụng Capsizer khi:**
+  - Bạn đang xây dựng hoặc triển khai ứng dụng Backend / AI Chatbot trên Kubernetes/Docker và cần tìm cấu hình tài nguyên chuẩn xác: cấp bao nhiêu CPU core, bao nhiêu RAM (Requests/Limits), cấu hình bao nhiêu worker là vừa vặn nhất.
+  - Cần đo đạc chính xác độ trễ phản hồi token đầu tiên (TTFT) của mô hình AI.
+  - Cần tìm ra giới hạn bão hòa (knee point) của một Pod dịch vụ độc lập trước khi cấu hình Autoscaling (HPA).
+
+- **Nên sử dụng các bài kiểm thử tải truyền thống diện rộng khi:**
+  - Bạn cần kiểm thử độ chịu tải của toàn bộ hệ thống từ đầu đến cuối (End-to-End Stress Test) qua nhiều tầng Load Balancer, CDN, API Gateway.
+  - Cần kiểm tra độ ổn định lâu dài (Soak test kéo dài 12 - 24 giờ) hoặc mô phỏng luồng hành vi phức tạp của người dùng trên website (duyệt trang, giỏ hàng, thanh toán).
 
 ---
 
