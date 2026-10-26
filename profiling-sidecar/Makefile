@@ -30,6 +30,7 @@ help:
 build: docker-build
 docker-build:
 	docker build \
+		--network host \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
 		--build-arg http_proxy=$(PROXY) \
 		--build-arg https_proxy=$(PROXY) \
@@ -39,6 +40,7 @@ docker-build:
 		--build-arg NO_PROXY=$(NO_PROXY) \
 		-t $(IMG_NAME):$(IMG_TAG) \
 		-t $(FULL_IMAGE) \
+		-t $(CONTAINER_REGISTRY)/$(DOCKER_USER)/$(IMG_NAME):latest \
 		-f Dockerfile ..
 
 push: docker-push

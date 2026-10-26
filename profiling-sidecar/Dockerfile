@@ -57,7 +57,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Fix lỗi "perf not found for kernel x.x.x":
 # Thay thế wrapper mặc định của Ubuntu bằng script tự động fallback sang binary perf có sẵn trong container
-COPY perf-wrapper.sh /usr/local/bin/perf
+COPY profiling-sidecar/perf-wrapper.sh /usr/local/bin/perf
 RUN chmod +x /usr/local/bin/perf \
     && ln -sf /usr/local/bin/perf /usr/bin/perf
 
@@ -67,7 +67,7 @@ COPY --from=builder /opt/FlameGraph /opt/FlameGraph
 COPY --from=go-builder /build/probe /usr/local/bin/probe
 
 # Copy các helper scripts hữu ích (py-spy, perf flamegraph, analyze-connections)
-COPY scripts/ /usr/local/bin/
+COPY profiling-sidecar/scripts/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/*.sh \
     && ln -sf /usr/local/bin/profile-pyspy.sh /usr/local/bin/profile-pyspy \
     && ln -sf /usr/local/bin/profile-perf.sh /usr/local/bin/profile-perf \
