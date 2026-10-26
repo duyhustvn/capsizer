@@ -27,6 +27,7 @@ Bộ công cụ giúp trả lời các câu hỏi cốt lõi về mặt kỹ thu
   - [cmd/report - Phân tích dữ liệu & Định chuẩn RAM/CPU](#cmdreport---phân-tích-dữ-liệu--định-chuẩn-ramcpu)
 - [6. Kịch bản thực tế mẫu (End-to-End Walkthrough)](#6-kịch-bản-thực-tế-mẫu-end-to-end-walkthrough)
 - [7. Các lưu ý kỹ thuật quan trọng (Best Practices)](#7-các-lưu-ý-kỹ-thuật-quan-trọng-best-practices)
+  - [Quy trình chuẩn 2 Pha: Đo Capacity Sizing sạch vs Chẩn đoán sâu (FlameGraph)](#4-quy-trình-chuẩn-2-pha-đo-capacity-sizing-sạch-vs-chẩn-đoán-sâu-flamegraph--profiling)
 - [8. Capsizer khác gì các bài kiểm thử hiệu năng truyền thống?](#8-capsizer-khác-gì-các-bài-kiểm-thử-hiệu-năng-truyền-thống)
 
 ---
@@ -654,6 +655,39 @@ Các ứng dụng thường có các cron job nội bộ chạy ngầm (ví dụ
 ### 3. Giám sát Container với `cmd/probe`: Multi-worker vs Single-process & Distroless Images
 - **Mô hình tiến trình**: `cmd/probe` tự động nhận diện cả ứng dụng đa tiến trình (master-worker như Uvicorn/Gunicorn) lẫn ứng dụng đơn tiến trình (như Go `runtime.GOMAXPROCS`). Trường `threads_max` và `n_workers` sẽ phản ánh chính xác số lượng OS thread và worker thực tế đang gánh tải.
 - **Container Distroless / Scratch**: Hầu hết container tối giản trong môi trường production không có sẵn shell (`/bin/sh`) hay Python. File binary `probe` được biên dịch tĩnh hoàn toàn (`CGO_ENABLED=0`), có thể chạy trực tiếp thông qua `kubectl exec pod -- /tmp/probe ...` mà không cần bất kỳ công cụ phụ trợ nào.
+
+### 4. Quy trình chuẩn 2 Pha: Đo Capacity Sizing sạch vs Chẩn đoán sâu (FlameGraph / Profiling)
+
+Khi triển khai trên Kubernetes kết hợp giữa **`cmd/probe`**, **`perf`** và **`py-spy`** (trong `profiling-sidecar`), câu hỏi thường gặp là: *Có nên chạy cả 3 công cụ cùng một lúc hay không?*
+
+> [!WARNING]
+> **CẢNH BÁO: Bật `perf` hoặc `py-spy` trong khi đo Capacity Sizing sẽ làm sai lệch kết quả!**
+> - `perf record` tiêu tốn khoảng **2% – 5% CPU**.
+> - `py-spy` lấy mẫu liên tục tiêu tốn khoảng **1% – 3% CPU**.
+> - Nếu chạy chung trong cgroup/Pod của ứng dụng mục tiêu, mức CPU tiêu thụ của profiler sẽ bị tính gộp vào `usage_usec`. Điều này dẫn đến:
+>   1. **Thổi phồng chỉ số $C$:** Thời gian CPU cho mỗi request ($C$) bị đo cao hơn thực tế 5% – 10%, dẫn đến ước tính trần RPS của app bị thấp đi.
+>   2. **Gây ra điểm gãy ảo (False Knee Point):** Đẩy Pod chạm trần CPU CFS Quota sớm hơn bình thường do profiler "ăn" mất CPU của worker, làm sai lệch nhận định về năng lực của dịch vụ.
+
+#### Quy trình chuẩn khuyến nghị (2-Phase Workflow):
+
+```mermaid
+flowchart TD
+    Step1["PHA 1: Đo chuẩn dung lượng (Capacity Sizing)"]
+    Step1_Detail["▶ Chỉ chạy: RAMP (bắn tải) + PROBE (đo CPU/RAM thụ động)<br/>▶ KHÔNG bật perf hay py-spy<br/>▶ Kết quả: $C$ chuẩn xác 100%, tìm đúng Điểm Gãy (Knee Point)"]
+    
+    Step2["PHA 2: Chẩn đoán nguyên nhân sâu (Root-Cause Profiling)"]
+    Step2_Detail["▶ Khi Pha 1 đã xác định được điểm gãy (ví dụ: gãy ở bậc 32 rps)<br/>▶ Bắn tải giữ đều ở bậc 32 rps<br/>▶ Kích hoạt profiling-sidecar (py-spy hoặc perf) trong 30-60 giây<br/>▶ Kết quả: Xuất biểu đồ FlameGraph SVG thấy rõ hàm Python/Kernel gây nghẽn"]
+
+    Step1 --> Step1_Detail --> Step2 --> Step2_Detail
+```
+
+#### Lưu ý nếu bắt buộc phải chạy đồng thời trong 1 lần kiểm thử:
+Nếu thời gian cửa sổ kiểm thử bị giới hạn và bạn bắt buộc phải bật tất cả cùng lúc:
+1. **Tách biệt cgroup của Profiling-Sidecar:** Đặt `resources.limits` và `requests` riêng cho container sidecar trong Pod (hoặc dùng `kubectl debug` độc lập). Chỉ chia sẻ namespace tiến trình (`shareProcessNamespace: true`) và cấp capability `SYS_PTRACE`. Nhờ đó, CPU của profiler sẽ được tính vào cgroup riêng của sidecar, không làm bóp nghẽn cgroup của ứng dụng.
+2. **Hạ thấp tần số lấy mẫu (Sampling Rate):**
+   - Với `perf`: Luôn dùng `-F 49` hoặc `-F 99` (tuyệt đối không dùng mặc định 1000Hz – 4000Hz).
+   - Với `py-spy`: Dùng `--rate 50` hoặc `--rate 100`.
+3. **Chỉ kích hoạt profiling ở bậc tải cao:** Không chạy `perf`/`py-spy` trong suốt 20-30 phút kiểm thử. Chỉ kích hoạt trong 30 giây cuối cùng của các bậc tải cao để lấy mẫu.
 
 ---
 
