@@ -67,6 +67,8 @@ LOADGEN_PORT="${REMOTE_PORT:-${LOADGEN_PORT:-22}}"
 LOADGEN_KEY="${REMOTE_KEY:-${LOADGEN_KEY:-}}"
 LOADGEN_DIR="${REMOTE_DIR:-${LOADGEN_DIR:-~/capsizer-loadtest}}"
 
+EXTRA_OPTS=()
+
 # Parse cờ dòng lệnh (ghi đè cấu hình)
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -86,6 +88,7 @@ while [[ $# -gt 0 ]]; do
     --skip-verify) SKIP_VERIFY="true"; shift 1 ;;
     --queries) QUERIES_FILE="$2"; shift 2 ;;
     --users) USERS_FILE="$2"; shift 2 ;;
+    --opt) EXTRA_OPTS+=("-opt" "$2"); shift 2 ;;
 
     --profile-type) PROFILE_TYPE="$2"; shift 2 ;;
     --pod) POD_NAME="$2"; shift 2 ;;
@@ -281,6 +284,7 @@ run_loadgen() {
     if [[ -n "$BODY_FILE" && -f "$BODY_FILE" ]]; then r_cmd+=" -body-file '${LOADGEN_DIR}/body_payload'"; fi
     if [[ -n "$QUERIES_FILE" && -f "$QUERIES_FILE" ]]; then r_cmd+=" -queries '${LOADGEN_DIR}/queries.txt'"; fi
     if [[ -n "$USERS_FILE" && -f "$USERS_FILE" ]]; then r_cmd+=" -users '${LOADGEN_DIR}/users.csv'"; fi
+    for opt in "${EXTRA_OPTS[@]}"; do r_cmd+=" $opt"; done
 
     if [[ "$l_bg" == "true" ]]; then
       run_ssh "cd '${LOADGEN_DIR}' && ${r_cmd}" > "$OUT_DIR/remote-loadgen.log" 2>&1 &
@@ -310,6 +314,7 @@ run_loadgen() {
     if [[ -n "$BODY_FILE" && -f "$BODY_FILE" ]]; then local_args+=(-body-file "$BODY_FILE"); fi
     if [[ -n "$QUERIES_FILE" && -f "$QUERIES_FILE" ]]; then local_args+=(-queries "$QUERIES_FILE"); fi
     if [[ -n "$USERS_FILE" && -f "$USERS_FILE" ]]; then local_args+=(-users "$USERS_FILE"); fi
+    if [[ ${#EXTRA_OPTS[@]} -gt 0 ]]; then local_args+=("${EXTRA_OPTS[@]}"); fi
 
     if [[ "$l_bg" == "true" ]]; then
       go run ./cmd/ramp "${local_args[@]}" > "$OUT_DIR/local-loadgen.log" 2>&1 &

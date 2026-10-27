@@ -18,6 +18,33 @@ type ScenarioParams struct {
 	UserPool  *UserPool
 	Queries   []string
 	CacheBust bool
+	Options   map[string]string // Các tham số động truyền qua -opt key=value hoặc config
+}
+
+// GetOpt lấy giá trị option theo key, nếu không có thì trả về defaultVal.
+func (p ScenarioParams) GetOpt(key, defaultVal string) string {
+	if p.Options == nil {
+		return defaultVal
+	}
+	if val, ok := p.Options[key]; ok && val != "" {
+		return val
+	}
+	return defaultVal
+}
+
+// GetOptBool lấy giá trị boolean option (hỗ trợ true/1/yes).
+func (p ScenarioParams) GetOptBool(key string, defaultVal bool) bool {
+	val := p.GetOpt(key, "")
+	if val == "" {
+		return defaultVal
+	}
+	switch val {
+	case "true", "1", "yes", "on", "TRUE", "True":
+		return true
+	case "false", "0", "no", "off", "FALSE", "False":
+		return false
+	}
+	return defaultVal
 }
 
 // ScenarioFactory là hàm khởi tạo một Scenario từ ScenarioParams.

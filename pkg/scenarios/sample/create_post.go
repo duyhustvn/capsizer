@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 
 	"capsizer/pkg/scenarios"
@@ -21,6 +22,15 @@ func init() {
 			target = "https://jsonplaceholder.typicode.com/posts"
 		}
 		bodyData := p.BodyData
+		if len(bodyData) == 0 {
+			if bodyStr := p.GetOpt("body", ""); bodyStr != "" {
+				bodyData = []byte(bodyStr)
+			} else if bodyFile := p.GetOpt("body-file", ""); bodyFile != "" {
+				if data, err := os.ReadFile(bodyFile); err == nil {
+					bodyData = data
+				}
+			}
+		}
 		if len(bodyData) == 0 {
 			// Payload JSON mặc định gửi đến JSONPlaceholder
 			defaultPayload := map[string]any{

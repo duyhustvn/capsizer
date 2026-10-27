@@ -18,14 +18,33 @@ import (
 
 func init() {
 	scenarios.Register("chat-sse", func(p scenarios.ScenarioParams) (scenarios.Scenario, error) {
-		if len(p.Queries) == 0 {
-			return nil, errors.New("không tìm thấy danh sách câu hỏi kiểm thử. Vui lòng cung cấp file câu hỏi qua cờ --queries hoặc khai báo CHAT_QUERIES / CHAT_QUERIES_FILE trong .env")
+		queries := p.Queries
+		if len(queries) == 0 {
+			qFile := p.GetOpt("queries", p.GetOpt("queries-file", ""))
+			envFile := p.GetOpt("env-file", ".env")
+			queries = scenarios.ResolveQueries(qFile, envFile)
 		}
+		if len(queries) == 0 {
+			return nil, errors.New("không tìm thấy danh sách câu hỏi kiểm thử. Vui lòng cung cấp file câu hỏi qua cờ -opt queries=<file> (hoặc --queries) hoặc khai báo CHAT_QUERIES / CHAT_QUERIES_FILE trong .env")
+		}
+
 		pool := p.UserPool
 		if pool == nil {
-			pool = scenarios.NewUserPool([]scenarios.User{{Token: "loadtest-token"}})
+			uFile := p.GetOpt("users", p.GetOpt("users-file", p.GetOpt("users-csv", "")))
+			if uFile != "" {
+				users, err := scenarios.LoadUsers(uFile)
+				if err == nil && len(users) > 0 {
+					pool = scenarios.NewUserPool(users)
+				}
+			}
 		}
-		return NewChatSSEScenario(p.TargetURL, p.Headers, p.Timeout, pool, p.Queries, p.CacheBust), nil
+		if pool == nil {
+			token := p.GetOpt("token", p.GetOpt("user-token", "loadtest-token"))
+			pool = scenarios.NewUserPool([]scenarios.User{{Token: token}})
+		}
+
+		cacheBust := p.CacheBust || p.GetOptBool("cache-bust", false)
+		return NewChatSSEScenario(p.TargetURL, p.Headers, p.Timeout, pool, queries, cacheBust), nil
 	})
 }
 

@@ -72,32 +72,97 @@ func (h *headerList) Set(val string) error {
 	return nil
 }
 
+// kvMap hỗ trợ truyền danh sách key=value tùy biến cho Scenario.
+type kvMap map[string]string
+
+func (m *kvMap) String() string {
+	var pairs []string
+	for k, v := range *m {
+		pairs = append(pairs, fmt.Sprintf("%s=%s", k, v))
+	}
+	return strings.Join(pairs, ", ")
+}
+
+func (m *kvMap) Set(val string) error {
+	parts := strings.SplitN(val, "=", 2)
+	if len(parts) == 2 {
+		(*m)[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+	} else if len(parts) == 1 {
+		(*m)[strings.TrimSpace(parts[0])] = "true"
+	}
+	return nil
+}
+
 func main() {
 	var (
+		// ---------------------------------------------------------------------
+		// CÁC THAM SỐ CỐT LÕI (CORE RAMP ENGINE)
+		// ---------------------------------------------------------------------
 		scenarioName = flag.String("scenario", "chat-sse", "loại kịch bản: 'chat-sse', 'sample-get', 'sample-post', hoặc kịch bản dịch vụ tùy chỉnh")
-		method       = flag.String("method", "GET", "HTTP method cho kịch bản REST (GET, POST, PUT, DELETE,...)")
-		body         = flag.String("body", "", "chuỗi body gửi kèm cho request REST")
-		bodyFile     = flag.String("body-file", "", "đường dẫn file chứa dữ liệu body cho request REST")
 		targetURL    = flag.String("url", "http://127.0.0.1:8000/chat", "URL endpoint nhận request")
 		stepsStr     = flag.String("steps", "1,2,4,8,16,32", "danh sách RPS, cách nhau dấu phẩy")
 		stepSeconds  = flag.Float64("step-seconds", 60.0, "độ dài mỗi bậc (giây)")
-		cooldown     = flag.Float64("cooldown", 20.0, "nghỉ giữa hai bậc (giây)")
-		settle       = flag.Float64("settle", 60.0, "chờ tối đa cho in-flight cuối bậc (giây)")
-		baselineWait = flag.Float64("baseline-wait", 15.0, "chờ đo baseline CPU trước khi phát tải (giây)")
+		cooldown     = flag.Float64("cooldown", 20.0, "nghỉ giải tỏa tải giữa hai bậc (giây)")
+		settle       = flag.Float64("settle", 60.0, "chờ tối đa cho in-flight dở dang cuối bậc (giây)")
+		baselineWait = flag.Float64("baseline-wait", 15.0, "chờ đo baseline CPU/RAM nền tĩnh trước khi phát tải (giây)")
 		timeoutSec   = flag.Float64("timeout", 180.0, "timeout cho mỗi request (giây)")
-		usersFile    = flag.String("users", "users.csv", "đường dẫn file users.csv")
-		queriesFile  = flag.String("queries", "", "đường dẫn file queries/prompts")
-		cacheBust    = flag.Bool("cache-bust", false, "thêm tham số timestamp ngẫu nhiên để chống cache")
 		maxInflight  = flag.Int("max-inflight", 5000, "trần concurrency tối đa của client")
 		workers      = flag.Int("workers", 2000, "kích thước connection pool (MaxIdleConns)")
-		outFile      = flag.String("out", "loadtest-ramp.jsonl", "đường dẫn file output kết quả")
+		outFile      = flag.String("out", "loadtest-ramp.jsonl", "đường dẫn file JSONL xuất kết quả")
 		skipVerify   = flag.Bool("skip-verify", false, "bỏ qua xác thực chứng chỉ TLS/SSL")
 		statusFile   = flag.String("status-file", "", "file ghi trạng thái tiến trình thời gian thực")
+		envFile      = flag.String("env-file", ".env", "đường dẫn file .env nạp cấu hình môi trường")
+
+		// ---------------------------------------------------------------------
+		// THAM SỐ TƯƠNG THÍCH NGƯỢC (LEGACY / CONVENIENCE ALIASES)
+		// ---------------------------------------------------------------------
+		methodLegacy      = flag.String("method", "", "[Legacy alias] HTTP method cho kịch bản REST")
+		bodyLegacy        = flag.String("body", "", "[Legacy alias] chuỗi body gửi kèm cho request")
+		bodyFileLegacy    = flag.String("body-file", "", "[Legacy alias] file chứa body payload")
+		queriesFileLegacy = flag.String("queries", "", "[Legacy alias] đường dẫn file queries/prompts cho chatbot")
+		usersFileLegacy   = flag.String("users", "", "[Legacy alias] đường dẫn file users.csv")
+		cacheBustLegacy   = flag.Bool("cache-bust", false, "[Legacy alias] thêm tham số timestamp ngẫu nhiên chống cache")
 	)
 
 	var headers headerList
-	flag.Var(&headers, "H", "HTTP header tùy chỉnh (định dạng 'Key: Value'). Có thể dùng nhiều lần.")
+	flag.Var(&headers, "H", "HTTP header tùy chỉnh ('Key: Value'). Có thể dùng nhiều lần.")
 	flag.Var(&headers, "header", "HTTP header tùy chỉnh (bí danh của -H)")
+
+	// Tham số động truyền tự do cho bất kỳ kịch bản nào
+	scenarioOptions := make(kvMap)
+	flag.Var(&scenarioOptions, "opt", "Tùy chọn riêng cho kịch bản dạng 'key=value' (ví dụ: -opt queries=q.txt -opt users=u.csv -opt method=POST)")
+	flag.Var(&scenarioOptions, "set", "Bí danh của -opt")
+	flag.Var(&scenarioOptions, "param", "Bí danh của -opt")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Sử dụng: capsizer-ramp [OPTIONS]\n\n")
+		fmt.Fprintf(os.Stderr, "CÁC THAM SỐ CỐT LÕI (RAMP ENGINE):\n")
+		fmt.Fprintf(os.Stderr, "  -url string             URL endpoint nhận request (default \"http://127.0.0.1:8000/chat\")\n")
+		fmt.Fprintf(os.Stderr, "  -scenario string        Tên kịch bản: chat-sse, sample-get, sample-post, ... (default \"chat-sse\")\n")
+		fmt.Fprintf(os.Stderr, "  -steps string           Dải bậc RPS, phân tách bằng dấu phẩy (default \"1,2,4,8,16,32\")\n")
+		fmt.Fprintf(os.Stderr, "  -step-seconds float     Thời gian phát tải mỗi bậc (giây, default 60)\n")
+		fmt.Fprintf(os.Stderr, "  -baseline-wait float    Thời gian chờ đo baseline CPU/RAM tĩnh trước bậc 1 (giây, default 15)\n")
+		fmt.Fprintf(os.Stderr, "  -cooldown float         Thời gian nghỉ giải tỏa tải giữa hai bậc (giây, default 20)\n")
+		fmt.Fprintf(os.Stderr, "  -settle float           Thời gian chờ tối đa cho in-flight cuối bậc (giây, default 60)\n")
+		fmt.Fprintf(os.Stderr, "  -timeout float          Timeout cho mỗi request (giây, default 180)\n")
+		fmt.Fprintf(os.Stderr, "  -max-inflight int       Trần kết nối đồng thời tối đa của client (default 5000)\n")
+		fmt.Fprintf(os.Stderr, "  -workers int            Kích thước connection pool MaxIdleConns (default 2000)\n")
+		fmt.Fprintf(os.Stderr, "  -out string             File JSONL xuất kết quả đo (default \"loadtest-ramp.jsonl\")\n")
+		fmt.Fprintf(os.Stderr, "  -skip-verify            Bỏ qua xác thực chứng chỉ TLS/SSL\n")
+		fmt.Fprintf(os.Stderr, "  -status-file string     File ghi trạng thái thời gian thực\n")
+		fmt.Fprintf(os.Stderr, "  -H, -header value       HTTP header tùy chỉnh ('Key: Value', dùng nhiều lần)\n")
+		fmt.Fprintf(os.Stderr, "  -env-file string        Đường dẫn file .env nạp cấu hình (default \".env\")\n\n")
+
+		fmt.Fprintf(os.Stderr, "TÙY CHỌN RIÊNG CHO TỪNG KỊCH BẢN (-opt key=value):\n")
+		fmt.Fprintf(os.Stderr, "  -opt, -set, -param      Truyền tham số tùy biến cho kịch bản (dùng nhiều lần).\n")
+		fmt.Fprintf(os.Stderr, "                          Ví dụ cho 'chat-sse':\n")
+		fmt.Fprintf(os.Stderr, "                            -opt queries=queries.txt -opt users=users.csv -opt cache-bust=true\n")
+		fmt.Fprintf(os.Stderr, "                          Ví dụ cho REST API (sample-post, sample-get):\n")
+		fmt.Fprintf(os.Stderr, "                            -opt method=POST -opt body='{\"msg\":\"hi\"}' -opt body-file=req.json\n\n")
+
+		fmt.Fprintf(os.Stderr, "KỊCH BẢN HIỆN CÓ: %v\n", scenarios.AvailableScenarios())
+	}
+
 	flag.Parse()
 
 	// Parse header map
@@ -128,41 +193,44 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Nạp queries
-	queries := scenarios.ResolveQueries(*queriesFile, ".env")
-
-	// Nạp users pool
-	var userPool *scenarios.UserPool
-	users, err := scenarios.LoadUsers(*usersFile)
-	if err != nil {
-		userPool = scenarios.NewUserPool([]scenarios.User{{Token: "loadtest-token"}})
-	} else {
-		userPool = scenarios.NewUserPool(users)
+	// Nạp file .env nếu có
+	if *envFile != "" {
+		scenarios.LoadDotEnv(*envFile)
+		scenarioOptions["env-file"] = *envFile
 	}
 
-	// Nạp body nếu có
-	var bodyBytes []byte
-	if *bodyFile != "" {
-		data, err := os.ReadFile(*bodyFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Lỗi đọc file body: %v\n", err)
-			os.Exit(1)
-		}
-		bodyBytes = data
-	} else if *body != "" {
-		bodyBytes = []byte(*body)
+	// Tự động map các cờ legacy vào scenarioOptions nếu người dùng truyền
+	if *methodLegacy != "" {
+		scenarioOptions["method"] = *methodLegacy
+	}
+	if *bodyLegacy != "" {
+		scenarioOptions["body"] = *bodyLegacy
+	}
+	if *bodyFileLegacy != "" {
+		scenarioOptions["body-file"] = *bodyFileLegacy
+	}
+	if *queriesFileLegacy != "" {
+		scenarioOptions["queries"] = *queriesFileLegacy
+	}
+	if *usersFileLegacy != "" {
+		scenarioOptions["users"] = *usersFileLegacy
+	}
+	if *cacheBustLegacy {
+		scenarioOptions["cache-bust"] = "true"
 	}
 
-	// Khởi tạo Scenario từ Registry
+	methodVal := scenarioOptions["method"]
+	if methodVal == "" {
+		methodVal = "GET"
+	}
+
+	// Khởi tạo Scenario từ Registry với Dynamic Options
 	scenarioParams := scenarios.ScenarioParams{
 		TargetURL: *targetURL,
-		Method:    *method,
+		Method:    methodVal,
 		Headers:   headerMap,
 		Timeout:   time.Duration(*timeoutSec * float64(time.Second)),
-		BodyData:  bodyBytes,
-		UserPool:  userPool,
-		Queries:   queries,
-		CacheBust: *cacheBust,
+		Options:   scenarioOptions,
 	}
 
 	sc, err := scenarios.Get(*scenarioName, scenarioParams)
