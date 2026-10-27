@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"ramps/golang/scenarios"
+	"capsizer/pkg/scenarios"
 )
 
 func init() {

@@ -1,6 +1,6 @@
 services:
   # ============================================================================
-  # 1. RAMP (Production Runner Image siêu nhẹ ~25MB)
+  # 1. RAMP (Production Runner Image siêu nhẹ ~20MB)
   # Phù hợp chạy các kịch bản sẵn có (chat-sse, sample-get, sample-post)
   # ============================================================================
   ramp:
@@ -27,7 +27,7 @@ services:
 
   # ============================================================================
   # 2. RAMP-DEV (Base Image với Go SDK & Hot-run)
-  # Mount trực tiếp scenarios/ từ host: tự động phát hiện, scan và biên dịch
+  # Mount trực tiếp pkg/scenarios/ từ host: tự động phát hiện, scan và biên dịch
   # khi bạn thêm file hoặc folder service mới mà không cần rebuild image.
   # ============================================================================
   ramp-dev:
@@ -38,7 +38,7 @@ services:
     image: capsizer-ramp:base
     container_name: capsizer-ramp-dev
     volumes:
-      - ./ramps/golang/scenarios:/app/scenarios
+      - ./pkg/scenarios:/app/pkg/scenarios
       - .:/data
     env_file:
       - path: .env
@@ -54,17 +54,36 @@ services:
       - "0"
 
   # ============================================================================
-  # 3. REPORT (Công cụ phân tích và lập bảng định chuẩn sizing)
-  # Chạy trực tiếp report.go mà không cần cài Go trên máy host
+  # 3. PROFILING-SIDECAR (Debug & Thu thập chỉ số hệ thống, RAM, CPU, FlameGraph)
+  # ============================================================================
+  sidecar:
+    build:
+      context: .
+      dockerfile: profiling-sidecar/Dockerfile
+    image: capsizer-profiling-sidecar:latest
+    container_name: capsizer-sidecar
+    volumes:
+      - .:/data
+    working_dir: /data
+    command:
+      - "probe"
+      - "-out"
+      - "probe.jsonl"
+      - "-interval"
+      - "1"
+
+  # ============================================================================
+  # 4. REPORT (Công cụ phân tích và lập bảng định chuẩn sizing RAM/CPU)
   # ============================================================================
   report:
     image: capsizer-ramp:base
     container_name: capsizer-report
-    entrypoint: ["go", "run", "/tools/report.go"]
+    entrypoint: ["/usr/local/bin/capsizer-report"]
     volumes:
       - .:/data
-      - ./report.go:/tools/report.go:ro
     working_dir: /data
     command:
       - "-ramp"
       - "loadtest-ramp.jsonl"
+      - "-probe"
+      - "probe.jsonl"
