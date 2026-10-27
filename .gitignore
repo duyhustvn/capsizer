@@ -26,10 +26,11 @@ results/
 *.swp
 
 # Go binaries
-probe
-probe-*
-report
-report-*
-capsizer-ramp
+/probe
+/probe-*
+/report
+/report-*
+/ramp
+/capsizer-ramp
 ramps/golang/golang
 *.exe
