@@ -1,0 +1,13 @@
+{
+  "name": "sample-post",
+  "type": "http",
+  "url": "https://jsonplaceholder.typicode.com/posts",
+  "method": "POST",
+  "headers": {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "X-Request-ID": "{{.UUID}}"
+  },
+  "body_file": "payload.json",
+  "expected_status": [200, 201]
+}

@@ -138,7 +138,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Sử dụng: capsizer-ramp [OPTIONS]\n\n")
 		fmt.Fprintf(os.Stderr, "CÁC THAM SỐ CỐT LÕI (RAMP ENGINE):\n")
 		fmt.Fprintf(os.Stderr, "  -url string             URL endpoint nhận request (default \"http://127.0.0.1:8000/chat\")\n")
-		fmt.Fprintf(os.Stderr, "  -scenario string        Tên kịch bản: chat-sse, sample-get, sample-post, ... (default \"chat-sse\")\n")
+		fmt.Fprintf(os.Stderr, "  -scenario string        Tên kịch bản (chat-sse, sample-get, sample-post) HOẶC đường dẫn file/thư mục scenario.json (default \"chat-sse\")\n")
 		fmt.Fprintf(os.Stderr, "  -steps string           Dải bậc RPS, phân tách bằng dấu phẩy (default \"1,2,4,8,16,32\")\n")
 		fmt.Fprintf(os.Stderr, "  -step-seconds float     Thời gian phát tải mỗi bậc (giây, default 60)\n")
 		fmt.Fprintf(os.Stderr, "  -baseline-wait float    Thời gian chờ đo baseline CPU/RAM tĩnh trước bậc 1 (giây, default 15)\n")
@@ -160,7 +160,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "                          Ví dụ cho REST API (sample-post, sample-get):\n")
 		fmt.Fprintf(os.Stderr, "                            -opt method=POST -opt body='{\"msg\":\"hi\"}' -opt body-file=req.json\n\n")
 
-		fmt.Fprintf(os.Stderr, "KỊCH BẢN HIỆN CÓ: %v\n", scenarios.AvailableScenarios())
+		fmt.Fprintf(os.Stderr, "KỊCH BẢN TÍCH HỢP: %v (hoặc truyền trực tiếp file/thư mục chứa scenario.json tương tự k6)\n", scenarios.AvailableScenarios())
 	}
 
 	flag.Parse()
@@ -290,8 +290,15 @@ func main() {
 
 	term := isTerminal()
 
+	displayTarget := *targetURL
+	if tp, ok := sc.(interface{ Target() string }); ok {
+		if (*targetURL == "http://127.0.0.1:8000/chat" || *targetURL == "") && tp.Target() != "" {
+			displayTarget = tp.Target()
+		}
+	}
+
 	fmt.Printf("%s[Capsizer Open-Loop Load Generator]%s Kịch bản: %s%s%s -> %s\n",
-		colorBlue, colorReset, colorGreen, sc.Name(), colorReset, *targetURL)
+		colorBlue, colorReset, colorGreen, sc.Name(), colorReset, displayTarget)
 	fmt.Printf("Dải bậc RPS: %v | Mỗi bậc: %.0fs | Cooldown: %.0fs | Settle: %.0fs | File output: %s\n",
 		steps, *stepSeconds, *cooldown, *settle, *outFile)
 

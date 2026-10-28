@@ -1,14 +1,14 @@
 services:
   # ============================================================================
-  # 1. RAMP (Production Runner Image siêu nhẹ ~20MB)
-  # Phù hợp chạy các kịch bản sẵn có (chat-sse, sample-get, sample-post)
+  # 1. RAMP (Runner Image siêu nhẹ ~15MB)
+  # Chạy trực tiếp bất kỳ kịch bản nào trong thư mục scenarios/ (tương tự k6)
   # ============================================================================
   ramp:
     build:
       context: .
       dockerfile: Dockerfile
       target: runner
-    image: capsizer-ramp:latest
+    image: capsizer:latest
     container_name: capsizer-ramp
     volumes:
       - .:/data
@@ -17,7 +17,7 @@ services:
         required: false
     command:
       - "-scenario"
-      - "sample-get"
+      - "scenarios/sample-get"
       - "-steps"
       - "2,4,8"
       - "-step-seconds"
@@ -26,35 +26,7 @@ services:
       - "0"
 
   # ============================================================================
-  # 2. RAMP-DEV (Base Image với Go SDK & Hot-run)
-  # Mount trực tiếp pkg/scenarios/ từ host: tự động phát hiện, scan và biên dịch
-  # khi bạn thêm file hoặc folder service mới mà không cần rebuild image.
-  # ============================================================================
-  ramp-dev:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: base
-    image: capsizer-ramp:base
-    container_name: capsizer-ramp-dev
-    volumes:
-      - ./pkg/scenarios:/app/pkg/scenarios
-      - .:/data
-    env_file:
-      - path: .env
-        required: false
-    command:
-      - "-scenario"
-      - "sample-get"
-      - "-steps"
-      - "2,4,8"
-      - "-step-seconds"
-      - "10"
-      - "-baseline-wait"
-      - "0"
-
-  # ============================================================================
-  # 3. PROFILING-SIDECAR (Debug & Thu thập chỉ số hệ thống, RAM, CPU, FlameGraph)
+  # 2. PROFILING-SIDECAR (Debug & Thu thập chỉ số hệ thống, RAM, CPU, FlameGraph)
   # ============================================================================
   sidecar:
     build:
@@ -73,10 +45,10 @@ services:
       - "1"
 
   # ============================================================================
-  # 4. REPORT (Công cụ phân tích và lập bảng định chuẩn sizing RAM/CPU)
+  # 3. REPORT (Công cụ phân tích và lập bảng định chuẩn sizing RAM/CPU)
   # ============================================================================
   report:
-    image: capsizer-ramp:base
+    image: capsizer:latest
     container_name: capsizer-report
     entrypoint: ["/usr/local/bin/capsizer-report"]
     volumes:

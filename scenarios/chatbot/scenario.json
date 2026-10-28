@@ -1,0 +1,17 @@
+{
+  "name": "chat-sse",
+  "type": "sse",
+  "url": "http://10.0.0.10:8000/chat",
+  "method": "POST",
+  "headers": {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer {{.Token}}"
+  },
+  "body": "{\"prompt\": \"{{.Query}}\", \"stream\": true}",
+  "queries_file": "queries.txt",
+  "users_file": "users.csv",
+  "expected_status": [200],
+  "sse": {
+    "end_marker": "[DONE]"
+  }
+}

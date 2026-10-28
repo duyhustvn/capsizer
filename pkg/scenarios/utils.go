@@ -1,9 +1,6 @@
 package scenarios
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -11,11 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
-	"time"
 )
 
-// strPtr trả về con trỏ tới chuỗi.
-func strPtr(s string) *string {
+// StrPtr trả về con trỏ tới chuỗi.
+func StrPtr(s string) *string {
 	return &s
 }
 
@@ -239,28 +235,6 @@ func ResolveQueries(queriesFile string, envFile string) []string {
 	return nil
 }
 
-// MintJWT sinh JWT HS256 nội bộ với role super_admin.
-func MintJWT(secret string, ttlSeconds int64) (string, error) {
-	headerJSON := `{"alg":"HS256","typ":"JWT"}`
-	headerEnc := base64.RawURLEncoding.EncodeToString([]byte(headerJSON))
-
-	payload := map[string]any{
-		"roles": []string{"super_admin"},
-		"exp":   time.Now().Unix() + ttlSeconds,
-	}
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-	payloadEnc := base64.RawURLEncoding.EncodeToString(payloadBytes)
-
-	signingInput := headerEnc + "." + payloadEnc
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(signingInput))
-	sigEnc := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-
-	return signingInput + "." + sigEnc, nil
-}
 
 type User struct {
 	ID    string

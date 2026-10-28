@@ -2,28 +2,28 @@
 name: capsizer-two-phase-profiling
 description: >-
   Tự động hóa quy trình kiểm thử tải và profiling 2 Pha (README Mục 7.4) theo kiến trúc 3 máy.
-  Tách biệt cấu hình Hạ tầng (.env.remote) và Kịch bản (scenarios/<name>/scenario.env).
+  Tách biệt cấu hình Hạ tầng (.env.remote) và Kịch bản khai báo (scenarios/<name>/scenario.json & scenario.env).
   Hỗ trợ chạy đơn lẻ hoặc chạy tự động hàng loạt nhiều scenario (Multi-Scenario Batch).
 ---
 
-# Capsizer 2-Phase Capacity Sizing & Profiling Workflow (Kiến trúc 3 Máy & Đa Kịch Bản)
+# Capsizer 2-Phase Capacity Sizing & Profiling Workflow (Kiến trúc 3 Máy & Declarative Scenarios)
 
-Kỹ năng này tự động hóa toàn bộ quy trình kiểm thử tải và định chuẩn năng lực hệ thống theo chuẩn **2 Pha**, hỗ trợ triển khai phân tán **3 Máy độc lập** và kiến trúc **Đa kịch bản (Multi-Scenario)**:
+Kỹ năng này tự động hóa toàn bộ quy trình kiểm thử tải và định chuẩn năng lực hệ thống theo chuẩn **2 Pha**, hỗ trợ triển khai phân tán **3 Máy độc lập** và kiến trúc **Kịch bản khai báo Declarative (tương tự k6)**:
 
 ```mermaid
 flowchart TD
     subgraph Machine1["[MACHINE 1] MÁY CHẠY SKILL (Local Agent / Điều phối)"]
         Skill["Antigravity Skill\n(run_two_phase.sh / run_batch.sh)"]
-        Report["cmd/report\n(Tổng hợp Sizing & Đọc FlameGraph)"]
+        Report["capsizer-report\n(Tổng hợp Sizing & Đọc FlameGraph)"]
     end
 
     subgraph Configs["CẤU HÌNH TÁCH BIỆT"]
-        InfraEnv[".env.remote\n(Hạ tầng kết nối 3 máy)"]
-        ScenariosDir["scenarios/<name>/scenario.env\n(Từng bài test: URL, Steps, Profiler, Payload)"]
+        InfraEnv[".env.remote\n(Hạ tầng kết nối 3 máy SSH)"]
+        ScenariosDir["scenarios/<name>/\n├── scenario.json (Request, Headers, Template Body)\n└── scenario.env (Steps, K8s Selector, Profiler)"]
     end
 
     subgraph Machine2["[MACHINE 2] MÁY PHÁT TẢI (Dedicated Host qua SSH)"]
-        Ramp["capsizer-ramp (Go Open-Loop)"]
+        Ramp["capsizer-ramp\n(Chạy Declarative Scenario độc lập)"]
         RampLog["phase1-ramp.jsonl"]
     end
 
@@ -40,10 +40,10 @@ flowchart TD
     InfraEnv -.-> Skill
     ScenariosDir -.-> Skill
 
-    Skill ==>|"1. SSH trigger tải"| Ramp
+    Skill ==>|"1. SSH scp binary & scenario.json"| Ramp
     Skill ==>|"2. SSH sudo kubectl chui vào Pod"| K8sServer
     K8sServer -.->|"gắn sidecar & đo"| Sidecar
-    Ramp ==>|"3. Bắn tải HTTP / SSE"| App
+    Ramp ==>|"3. Bắn tải Open-Loop HTTP / SSE"| App
     Sidecar -.->|"Lấy mẫu CPU, RAM, TCP"| App
 
     RampLog -->|"4. scp về"| Skill
@@ -71,33 +71,39 @@ K8S_USE_SUDO="true"
 K8S_NAMESPACE="default"
 ```
 
-### B. Cấu hình Kịch bản độc lập (`scenarios/<tên_dịch_vụ>/scenario.env`)
-Mỗi service hoặc API có một thư mục riêng biệt chứa:
-- `scenario.env`: Khai báo endpoint, dải RPS, selector pod, loại profiler (`pyspy` hoặc `perf`).
-- Tệp dữ liệu đi kèm (`queries.txt`, `users.csv`, `payload.json`) đặt ngay trong cùng thư mục với đường dẫn tương đối.
+### B. Cấu hình Kịch bản độc lập (`scenarios/<tên_dịch_vụ>/`)
+Mỗi kịch bản được tổ chức gọn gàng trong thư mục riêng:
+- `scenario.json`: **[Khai báo Request tương tự k6]** Định nghĩa URL, HTTP method, headers, dynamic template body (`{{.Query}}`, `{{.Token}}`, `{{.UUID}}`), logic SSE.
+- `scenario.env`: **[Thông số thực thi & K8s]** Dải bậc tải (`STEPS`), selector Pod mục tiêu (`K8S_SELECTOR`), loại profiler (`PROFILE_TYPE=pyspy|perf`).
+- Tệp dữ liệu đi kèm (`queries.txt`, `users.csv`, `payload.json`) đặt ngay trong thư mục với đường dẫn tương đối.
 
-*Ví dụ `scenarios/chatbot/scenario.env`:*
-```bash
-SCENARIO="chat-sse"
-TARGET_URL="http://10.0.0.10:8000/chat"
-TARGET_PORT="8000"
-K8S_SELECTOR="app=chatbot"
-PROFILE_TYPE="pyspy"               # Python app dùng py-spy
-STEPS="2,4,8,16,32"
-QUERIES_FILE="queries.txt"
-USERS_FILE="users.csv"
-```
-
-*Ví dụ `scenarios/sample-post/scenario.env`:*
-```bash
-SCENARIO="sample-post"
-TARGET_URL="https://jsonplaceholder.typicode.com/posts"
-TARGET_PORT="443"
-PROFILE_TYPE="perf"                # Golang/Node/Java app dùng perf
-STEPS="5,10,20,50"
-METHOD="POST"
-BODY_FILE="payload.json"
-```
+*Ví dụ `scenarios/chatbot/`:*
+- `scenario.json`:
+  ```json
+  {
+    "name": "chat-sse",
+    "type": "sse",
+    "url": "http://10.0.0.10:8000/chat",
+    "method": "POST",
+    "headers": {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer {{.Token}}"
+    },
+    "body": "{\"prompt\": \"{{.Query}}\", \"stream\": true}",
+    "queries_file": "queries.txt",
+    "users_file": "users.csv",
+    "sse": { "end_marker": "[DONE]" }
+  }
+  ```
+- `scenario.env`:
+  ```bash
+  K8S_SELECTOR="app=chatbot"
+  PROFILE_TYPE="pyspy"               # Python FastAPI dùng py-spy
+  STEPS="2,4,8,16,32"
+  STEP_SECONDS="30"
+  BASELINE_WAIT="60"
+  COOLDOWN="15"
+  ```
 
 ---
 
@@ -108,7 +114,7 @@ Agent kích hoạt kịch bản theo tên thư mục:
 ```bash
 ./.agents/skills/capsizer-two-phase-profiling/scripts/run_two_phase.sh --scenario chatbot
 ```
-*(Script sẽ tự động tìm và nạp `scenarios/chatbot/scenario.env`, tự động đồng bộ `queries.txt` và `users.csv` lên máy phát tải từ xa).*
+*(Script sẽ tự động tìm nạp `scenarios/chatbot/scenario.env` + `scenario.json`, tự động đồng bộ file kịch bản và dữ liệu lên máy phát tải từ xa qua SSH).*
 
 ### Trường hợp 2: Kiểm tra kết nối trước khi chạy (Preflight Check)
 ```bash
@@ -116,11 +122,11 @@ Agent kích hoạt kịch bản theo tên thư mục:
 ```
 
 ### Trường hợp 3: Chạy TỰ ĐỘNG HÀNG LOẠT nhiều kịch bản (Batch Runner)
-Khi người dùng yêu cầu: *"Hãy chạy kiểm thử tải lần lượt cả chatbot và sample-post"*:
+Khi người dùng yêu cầu: *"Hãy chạy kiểm thử tải lần lượt cả chatbot, sample-post và sample-get"*:
 ```bash
-./.agents/skills/capsizer-two-phase-profiling/scripts/run_batch.sh chatbot sample-post
+./.agents/skills/capsizer-two-phase-profiling/scripts/run_batch.sh chatbot sample-post sample-get
 ```
-Hoặc chạy toàn bộ kịch bản có trong thư mục `scenarios/`:
+Hoặc quét và chạy toàn bộ kịch bản có trong thư mục `scenarios/`:
 ```bash
 ./.agents/skills/capsizer-two-phase-profiling/scripts/run_batch.sh
 ```

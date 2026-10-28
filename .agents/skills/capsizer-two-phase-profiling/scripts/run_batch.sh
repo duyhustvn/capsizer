@@ -22,7 +22,7 @@ TARGET_SCENARIOS=("$@")
 if [[ ${#TARGET_SCENARIOS[@]} -eq 0 ]]; then
   echo "==> Không chỉ định kịch bản cụ thể. Đang quét thư mục: $SCENARIOS_DIR"
   for s_dir in "$SCENARIOS_DIR"/*; do
-    if [[ -d "$s_dir" && (-f "$s_dir/scenario.env" || -f "$s_dir/.env") ]]; then
+    if [[ -d "$s_dir" && (-f "$s_dir/scenario.env" || -f "$s_dir/.env" || -f "$s_dir/scenario.json") ]]; then
       TARGET_SCENARIOS+=("$(basename "$s_dir")")
     fi
   done

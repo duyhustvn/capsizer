@@ -85,12 +85,18 @@ ONLY_CHECK=false
 # HÀM NẠP CẤU HÌNH KỊCH BẢN ĐỘC LẬP (SCENARIO CONFIG)
 # ==============================================================================
 SCENARIO_ENV=""
+SCENARIO_DIR=""
+SCENARIO_JSON=""
 
 load_scenario_env() {
   local target_env="$1"
   if [[ -f "$target_env" ]]; then
     local env_dir
     env_dir="$(cd "$(dirname "$target_env")" && pwd)"
+    SCENARIO_DIR="$env_dir"
+    if [[ -f "$env_dir/scenario.json" ]]; then
+      SCENARIO_JSON="$env_dir/scenario.json"
+    fi
     echo "==> [Cấu hình Kịch bản] Đang nạp từ: $target_env"
     # shellcheck disable=SC1090
     source "$target_env"
@@ -138,6 +144,9 @@ for ((i=1; i<=$#; i++)); do
       SCENARIO_ENV="${PROJECT_ROOT}/scenarios/${next_arg}/scenario.env"
     elif [[ -f "${PROJECT_ROOT}/scenarios/${next_arg}/.env" ]]; then
       SCENARIO_ENV="${PROJECT_ROOT}/scenarios/${next_arg}/.env"
+    elif [[ -d "${PROJECT_ROOT}/scenarios/${next_arg}" && -f "${PROJECT_ROOT}/scenarios/${next_arg}/scenario.json" ]]; then
+      SCENARIO_DIR="${PROJECT_ROOT}/scenarios/${next_arg}"
+      SCENARIO_JSON="${SCENARIO_DIR}/scenario.json"
     fi
   fi
 done
@@ -152,7 +161,19 @@ while [[ $# -gt 0 ]]; do
     --scenario-env) SCENARIO_ENV="$2"; shift 2 ;;
     --url) URL="$2"; shift 2 ;;
     --scenario)
-      if [[ -f "${PROJECT_ROOT}/scenarios/$2/scenario.env" || -f "${PROJECT_ROOT}/scenarios/$2/.env" ]]; then
+      if [[ -f "$2" && "$2" == *.json ]]; then
+        SCENARIO_JSON="$2"
+        SCENARIO_DIR="$(dirname "$2")"
+        SCENARIO="$(basename "$2" .json)"
+      elif [[ -d "$2" && -f "$2/scenario.json" ]]; then
+        SCENARIO_DIR="$(cd "$2" && pwd)"
+        SCENARIO_JSON="$SCENARIO_DIR/scenario.json"
+        SCENARIO="$(basename "$SCENARIO_DIR")"
+      elif [[ -d "${PROJECT_ROOT}/scenarios/$2" && -f "${PROJECT_ROOT}/scenarios/$2/scenario.json" ]]; then
+        SCENARIO_DIR="${PROJECT_ROOT}/scenarios/$2"
+        SCENARIO_JSON="$SCENARIO_DIR/scenario.json"
+        SCENARIO="$2"
+      elif [[ -f "${PROJECT_ROOT}/scenarios/$2/scenario.env" || -f "${PROJECT_ROOT}/scenarios/$2/.env" ]]; then
         :
       else
         SCENARIO="$2"
@@ -546,6 +567,21 @@ setup_remote_loadgen() {
   run_loadgen_scp_to "$local_ramp_bin" "${LOADGEN_DIR}/capsizer-ramp"
   run_loadgen_ssh "chmod +x '${LOADGEN_DIR}/capsizer-ramp'"
 
+  # Đồng bộ file kịch bản khai báo declarative (scenario.json) nếu có
+  if [[ -n "${SCENARIO_JSON:-}" && -f "$SCENARIO_JSON" ]]; then
+    echo "    -> Đồng bộ scenario.json lên máy phát tải..."
+    run_loadgen_scp_to "$SCENARIO_JSON" "${LOADGEN_DIR}/scenario.json"
+  fi
+
+  # Đồng bộ toàn bộ các file dữ liệu trong thư mục kịch bản
+  if [[ -n "${SCENARIO_DIR:-}" && -d "$SCENARIO_DIR" ]]; then
+    for extra in "$SCENARIO_DIR"/*.json "$SCENARIO_DIR"/*.txt "$SCENARIO_DIR"/*.csv; do
+      if [[ -f "$extra" && "$(basename "$extra")" != "scenario.json" ]]; then
+        run_loadgen_scp_to "$extra" "${LOADGEN_DIR}/$(basename "$extra")"
+      fi
+    done
+  fi
+
   if [[ -n "$QUERIES_FILE" && -f "$QUERIES_FILE" ]]; then
     run_loadgen_scp_to "$QUERIES_FILE" "${LOADGEN_DIR}/queries.txt"
   fi
@@ -569,7 +605,11 @@ run_loadgen() {
 
   if [[ "$LOADGEN_MODE" == "remote" ]]; then
     local r_cmd="${LOADGEN_DIR}/capsizer-ramp"
-    r_cmd+=" -scenario '${SCENARIO}'"
+    if [[ -n "${SCENARIO_JSON:-}" && -f "$SCENARIO_JSON" ]]; then
+      r_cmd+=" -scenario '${LOADGEN_DIR}/scenario.json'"
+    else
+      r_cmd+=" -scenario '${SCENARIO}'"
+    fi
     r_cmd+=" -url '${URL}'"
     r_cmd+=" -method '${METHOD}'"
     r_cmd+=" -steps '${l_steps}'"
@@ -598,8 +638,12 @@ run_loadgen() {
     fi
   else
     # Local mode
+    local target_sc="$SCENARIO"
+    if [[ -n "${SCENARIO_JSON:-}" && -f "$SCENARIO_JSON" ]]; then
+      target_sc="$SCENARIO_JSON"
+    fi
     local local_args=(
-      -scenario "$SCENARIO"
+      -scenario "$target_sc"
       -url "$URL"
       -method "$METHOD"
       -steps "$l_steps"
