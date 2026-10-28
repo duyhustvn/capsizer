@@ -1,104 +1,106 @@
 ---
 name: capsizer-two-phase-profiling
 description: >-
-  Tự động hóa quy trình kiểm thử tải và profiling 2 Pha (README Mục 7.4):
-  Pha 1 đo Capacity Sizing sạch (CPU, RAM, điểm gãy Knee Point);
-  Pha 2 tự động phát tải tại điểm gãy và trích xuất FlameGraph SVG để điều tra sâu.
-  Hỗ trợ linh hoạt máy phát tải Cục bộ (Local) hoặc Từ xa qua SSH (Remote Dedicated Load Generator).
+  Tự động hóa quy trình kiểm thử tải và profiling 2 Pha (README Mục 7.4) theo kiến trúc 3 máy:
+  Máy chạy Skill điều khiển Máy phát tải (qua SSH) và chui vào Server Cụm K8s (qua SSH passwordless/sudo root)
+  để gắn sidecar/probe thu thập số liệu cgroup, TCP và xuất FlameGraph SVG khi phát hiện điểm gãy.
 ---
 
-# Capsizer 2-Phase Capacity Sizing & Profiling Workflow
+# Capsizer 2-Phase Capacity Sizing & Profiling Workflow (Kiến trúc 3 Máy)
 
-Kỹ năng này tự động hóa toàn bộ quy trình kiểm thử tải và định chuẩn năng lực hệ thống theo chuẩn **2 Pha**:
+Kỹ năng này tự động hóa toàn bộ quy trình kiểm thử tải và định chuẩn năng lực hệ thống theo chuẩn **2 Pha**, hỗ trợ mô hình triển khai phân tán **3 Máy độc lập**:
 
-## 1. Nguyên tắc cốt lõi (BẮT BUỘC TUÂN THỦ)
-1. **Pha 1 (Capacity Sizing sạch):** Tuyệt đối **KHÔNG** bật `perf` hay `py-spy` trong khi đo sizing để tránh làm sai lệch chỉ số $C$ (ms CPU/req) và tránh gây ra điểm gãy ảo (False Knee Point do profiler chiếm CPU cgroup).
-2. **Pha 2 (Root-Cause Profiling):** Chỉ kích hoạt FlameGraph khi Pha 1 đã xác định được điểm gãy (Knee Point), bằng cách giữ tải đều tại đúng bậc gãy trong 30–45s và lấy mẫu stack trace.
+```mermaid
+flowchart TD
+    subgraph Machine1["[MACHINE 1] MÁY CHẠY SKILL (Local Agent / Điều phối)"]
+        Skill["Antigravity Skill\n(run_two_phase.sh)"]
+        Report["cmd/report\n(Tổng hợp Sizing & Đọc FlameGraph)"]
+    end
 
----
+    subgraph Machine2["[MACHINE 2] MÁY PHÁT TẢI (Dedicated Host qua SSH)"]
+        Ramp["capsizer-ramp (Go Open-Loop)"]
+        RampLog["phase1-ramp.jsonl"]
+    end
 
-## 2. Mô hình máy phát tải (Load Generator)
-Hỗ trợ 2 chế độ điều phối qua cờ `--loadgen-mode`:
+    subgraph Machine3["[MACHINE 3] CỤM KUBERNETES TỪ XA"]
+        K8sServer["Server Cụm K8s (Master / Bastion)\nSSH passwordless + sudo root"]
+        subgraph TargetPod["TARGET POD"]
+            App["App Server (FastAPI / Gin / ...)"]
+            Sidecar["Debug Container / Sidecar\n(probe + py-spy / perf)"]
+        end
+        ProbeLog["probe.jsonl"]
+        SVG["flamegraph.svg"]
+    end
 
-1. **`--loadgen-mode local` (Mặc định):**
-   - Chạy trực tiếp bộ phát tải `cmd/ramp` trên máy hiện tại.
-2. **`--loadgen-mode remote`:**
-   - Dành cho máy phát tải độc lập (Dedicated Load Generator Host qua SSH).
-   - Tự động biên dịch tĩnh binary `cmd/ramp` (Linux amd64), đẩy lên máy từ xa qua SSH, kích hoạt phát tải và kéo file log kết quả về máy phân tích.
-   - Cấu hình qua cờ hoặc khai báo trong `.env.remote`:
-     `REMOTE_HOST`, `REMOTE_USER`, `REMOTE_PORT`, `REMOTE_KEY`, `REMOTE_DIR`.
+    Skill ==>|"1. SSH trigger tải"| Ramp
+    Skill ==>|"2. SSH sudo kubectl chui vào Pod"| K8sServer
+    K8sServer -.->|"gắn sidecar & đo"| Sidecar
+    Ramp ==>|"3. Bắn tải HTTP / SSE"| App
+    Sidecar -.->|"Lấy mẫu CPU, RAM, TCP"| App
 
----
-
-## 3. Cơ chế hoạt động trên Kubernetes (K8s Pod Mục Tiêu):
-Thông thường container của ứng dụng (Python slim, Golang distroless, Alpine) **không có sẵn công cụ profiling** (`py-spy`, `perf`, `flamegraph.pl`). Skill này hỗ trợ 3 cơ chế linh hoạt qua cờ `--k8s-mode`:
-
-1. **`--k8s-mode debug` (Mặc định & Khuyên dùng):**
-   - Tự động dùng `kubectl debug` gắn một **Ephemeral Container** sử dụng image `docker.io/duyle95/profiling-sidecar:latest` vào Pod mục tiêu.
-   - Container debug này được cấp quyền `SYS_PTRACE`, chia sẻ Process Namespace với container ứng dụng (`--target`).
-   - Có sẵn toàn bộ `probe`, `py-spy`, `perf`, và `FlameGraph` mà không cần cài đặt gì thêm vào ứng dụng.
-2. **`--k8s-mode sidecar`:**
-   - Dùng khi Pod Deployment đã khai báo sẵn một container sidecar (image `profiling-sidecar`).
-3. **`--k8s-mode cp`:**
-   - Biên dịch tĩnh binary `cmd/probe` và copy trực tiếp vào `/tmp/` của container ứng dụng qua `kubectl cp`.
-
----
-
-## 4. Các bước thực hiện của Agent:
-
-### Bước 1: Xác định tham số và chế độ chạy
-- **`--url`**: URL dịch vụ nhận tải.
-- **`--scenario`**: `chat-sse`, `sample-get`, `sample-post` hoặc kịch bản dịch vụ tùy chỉnh.
-- **`--steps`**: Dải bậc RPS (mặc định: `2,4,8,16,32`).
-- **`--profile-type`**: `pyspy` (nếu app là Python/FastAPI) hoặc `perf` (Go, C++, Java, Rust).
-- **`--loadgen-mode`**: `local` hoặc `remote`.
-- **`--pod` & `--namespace`**: Tên Pod và Namespace mục tiêu trên K8s (nếu target là K8s).
-
-### Bước 2: Thực thi Script điều phối 2 Pha
-
-#### Trường hợp A: Phát tải từ MÁY TỪ XA (Remote Load Generator qua SSH)
-```bash
-./.agents/skills/capsizer-two-phase-profiling/scripts/run_two_phase.sh \
-  --loadgen-mode "remote" \
-  --loadgen-host "192.168.1.50" \
-  --url "http://10.0.0.10:8000/chat" \
-  --scenario "chat-sse" \
-  --steps "2,4,8,16,32" \
-  --profile-type "pyspy" \
-  --pod "<POD_NAME>" \
-  --namespace "<NAMESPACE>" \
-  --container "<APP_CONTAINER_NAME>" \
-  --k8s-mode "debug"
-```
-*(Nếu đã cấu hình file `.env.remote`, chỉ cần thêm `--loadgen-mode remote` hoặc cấu hình `LOADGEN_MODE="remote"` trong file).*
-
-#### Trường hợp B: Phát tải CỤC BỘ (Local)
-```bash
-./.agents/skills/capsizer-two-phase-profiling/scripts/run_two_phase.sh \
-  --loadgen-mode "local" \
-  --url "http://127.0.0.1:8000/chat" \
-  --scenario "chat-sse" \
-  --steps "2,4,8,16,32" \
-  --profile-type "pyspy" \
-  --pod "<POD_NAME>" \
-  --namespace "<NAMESPACE>" \
-  --container "<APP_CONTAINER_NAME>" \
-  --k8s-mode "debug"
+    RampLog -->|"4. scp về"| Skill
+    ProbeLog -->|"5. kubectl cp + scp về"| Skill
+    SVG -->|"6. scp về (Pha 2)"| Skill
+    Skill --> Report
 ```
 
-### Bước 3: Phân tích kết quả và phản hồi cho User
-Sau khi script hoàn tất, đọc file báo cáo `phase1-report.txt` và trả về kết quả:
+---
 
-1. **Định chuẩn CPU & Năng lực:**
-   - Chỉ số **$C$ (ms CPU / request)**: Chi phí CPU thuần cho mỗi request.
-   - **Trần lý thuyết 1 worker (1 core)**: Tối đa bao nhiêu req/s.
-   - **Trần lý thuyết Pod**: Dựa trên CPU quota được cấp.
-   - **Số worker khuyến nghị**: Cần bao nhiêu worker để khai thác hết quota.
-2. **Định chuẩn Bộ nhớ (RAM):**
-   - **RAM nền (Baseline)**: Mức RAM khi rỗi.
-   - **RAM đỉnh (Peak RAM)**: Mức RAM cao nhất quan sát được khi có tải.
-   - **Khuyến nghị Kubernetes Pod**: Mức `requests.memory` và `limits.memory` (kèm 30% buffer an toàn).
-   - **Cảnh báo rò rỉ RAM**: Có hiện tượng RAM tăng liên tục qua các bậc không?
-3. **Chẩn đoán Điểm Gãy & FlameGraph (nếu có Pha 2):**
-   - Điểm gãy quan sát được tại mức bao nhiêu req/s và nguyên nhân (Achieved throughput, TCP Accept Queue nghẽn, CFS Throttling, hay Health latency).
-   - Dẫn link file FlameGraph `.svg` (ví dụ `flamegraph_knee_16rps.svg`) và nêu tên các hàm chiếm CPU nhiều nhất.
+## 1. Cấu hình phân bổ 3 máy (`.env.remote`)
+
+Khai báo thông số trong file `.env.remote` tại thư mục gốc:
+
+```bash
+# [Machine 2] Máy phát tải
+LOADGEN_MODE="remote"
+REMOTE_HOST="192.168.1.50"
+REMOTE_USER="vbox"
+
+# [Machine 3] Server cụm K8s (SSH passwordless + sudo root để chạy kubectl)
+K8S_SSH_HOST="192.168.1.100"
+K8S_SSH_USER="vbox"
+K8S_USE_SUDO="true"
+K8S_NAMESPACE="default"
+K8S_SELECTOR="app=chatbot"       # Tự động tìm Pod mục tiêu
+TARGET_PORT="8000"
+
+# Endpoint dịch vụ
+TARGET_URL="http://10.0.0.10:8000/chat"
+SCENARIO="chat-sse"
+STEPS="2,4,8,16,32"
+```
+
+---
+
+## 2. Các bước thực hiện của Agent
+
+### Bước 1: Kiểm tra kết nối 3 máy (Preflight Health Check)
+Trước khi chạy bài test dài, Agent chạy lệnh `--check`:
+```bash
+./.agents/skills/capsizer-two-phase-profiling/scripts/run_two_phase.sh --check
+```
+Script sẽ kiểm tra:
+1. Máy chạy Skill: Có sẵn Go và các công cụ cần thiết.
+2. Máy phát tải: SSH thành công và thông mạng tới `TARGET_URL`.
+3. Server cụm K8s: SSH passwordless thành công, quyền `sudo root` sẵn sàng, `kubectl` kết nối tốt tới cụm, và Pod mục tiêu đang `Running`.
+
+### Bước 2: Kích hoạt quy trình 2 Pha tự động
+```bash
+./.agents/skills/capsizer-two-phase-profiling/scripts/run_two_phase.sh
+```
+
+**Diễn biến tự động:**
+1. **Pha 1 (Capacity Sizing sạch):**
+   - Script SSH vào Server cụm K8s, dùng `sudo kubectl` gắn Ephemeral Debug Container (`profiling-sidecar`) và khởi động daemon `probe` trong Pod.
+   - Script SSH vào Máy phát tải, kích hoạt `capsizer-ramp` bắn các bậc `2, 4, 8, 16, 32 req/s`.
+   - Thu thập `probe.jsonl` từ Pod (qua `kubectl cp` + `scp`) và `ramp.jsonl` từ máy phát tải.
+   - Chạy `cmd/report` để tính: CPU cost $C$ (ms/req), RAM baseline/peak, và tự động trích xuất điểm gãy **Knee Point** (ví dụ: `16 req/s`).
+2. **Pha 2 (Root-Cause Profiling - chỉ chạy khi gặp điểm gãy):**
+   - Kích hoạt máy phát tải giữ đều mức tải tại đúng điểm gãy (`16 req/s`) trong 45s ở background.
+   - SSH vào Server K8s, kích hoạt `py-spy` hoặc `perf` lấy mẫu stack trace trong 30s.
+   - Xuất file biểu đồ `flamegraph_knee_16rps.svg` và kéo về máy chạy Skill.
+
+### Bước 3: Đọc kết quả và phản hồi cho User
+- **Định chuẩn năng lực Pod**: Khuyến nghị số worker tối ưu và mức RAM requests/limits (kèm 30% buffer an toàn).
+- **Chẩn đoán điểm gãy**: Nêu rõ nguyên nhân gãy (CFS Throttling, TCP Accept Queue tràn, hay Event Loop bị block).
+- **FlameGraph SVG**: Dẫn link file `.svg` để người dùng mở trực tiếp trên trình duyệt soi chi tiết hàm/dòng code gây nghẽn.
