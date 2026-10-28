@@ -71,8 +71,13 @@ for sc in "${TARGET_SCENARIOS[@]}"; do
   EXIT_CODE=$?
   set -e
 
-  # Trích xuất số liệu từ phase1-report.txt nếu có
+  # Trích xuất số liệu từ phase1-report.txt và scenario.env nếu có
   REPORT_FILE="$SC_OUT/phase1-report.txt"
+  PROF_STR="pyspy"
+  if [[ -f "$SCENARIOS_DIR/$sc/scenario.env" ]]; then
+    prof_val=$(grep -E '^PROFILE_TYPE=' "$SCENARIOS_DIR/$sc/scenario.env" | head -n 1 | cut -d'=' -f2 | tr -d '"'\'' ' || true)
+    [[ -n "$prof_val" ]] && PROF_STR="$prof_val"
+  fi
   KNEE_STR="None"
   P95_STR="-"
   STATUS_STR="FAILED"
@@ -88,10 +93,12 @@ for sc in "${TARGET_SCENARIOS[@]}"; do
     else
       KNEE_STR="Khỏe (No Knee)"
     fi
+    last_p95=$(grep -E "^[[:space:]]*[0-9]+\.[0-9]+" "$REPORT_FILE" 2>/dev/null | tail -n 1 | awk '{print $6 "ms"}' || true)
+    [[ -n "$last_p95" && "$last_p95" != "ms" ]] && P95_STR="$last_p95"
   fi
 
   printf "%-18s | %-12s | %-15s | %-12s | %-12s | %-10s\n" \
-    "$sc" "-" "$KNEE_STR" "$P95_STR" "$STATUS_STR" "$SC_OUT/phase1-report.txt" >> "$SUMMARY_FILE"
+    "$sc" "$PROF_STR" "$KNEE_STR" "$P95_STR" "$STATUS_STR" "$SC_OUT/phase1-report.txt" >> "$SUMMARY_FILE"
 
   INDEX=$((INDEX + 1))
 done

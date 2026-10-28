@@ -159,7 +159,7 @@ fi
 while [[ $# -gt 0 ]]; do
   case $1 in
     --scenario-env) SCENARIO_ENV="$2"; shift 2 ;;
-    --url) URL="$2"; shift 2 ;;
+    --url) URL="$2"; EXPLICIT_URL=true; shift 2 ;;
     --scenario)
       if [[ -f "$2" && "$2" == *.json ]]; then
         SCENARIO_JSON="$2"
@@ -179,7 +179,7 @@ while [[ $# -gt 0 ]]; do
         SCENARIO="$2"
       fi
       shift 2 ;;
-    --method) METHOD="$2"; shift 2 ;;
+    --method) METHOD="$2"; EXPLICIT_METHOD=true; shift 2 ;;
     --body) BODY="$2"; shift 2 ;;
     --body-file) BODY_FILE="$2"; shift 2 ;;
     --steps) STEPS="$2"; shift 2 ;;
@@ -205,7 +205,7 @@ while [[ $# -gt 0 ]]; do
     --k8s-mode) K8S_MODE="$2"; shift 2 ;;
     --sidecar-image) SIDECAR_IMAGE="$2"; shift 2 ;;
     --sidecar-container) SIDECAR_CONTAINER="$2"; shift 2 ;;
-    --port) PORT="$2"; shift 2 ;;
+    --port) PORT="$2"; EXPLICIT_PORT=true; shift 2 ;;
     --pid) TARGET_PID="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
 
@@ -256,7 +256,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --opt <key=val>             Tùy chọn riêng cho Scenario (dùng nhiều lần)"
       echo "  --cache-bust                Thêm tham số timestamp ngẫu nhiên chống cache"
       echo "  --skip-verify               Bỏ qua xác thực TLS/SSL"
-      echo "  --profile-type <type>       Công cụ profiling: pyspy hoặc perf (default: $PROFILE_TYPE)"
+      echo "  --profile-type <type>       Công cụ profiling: pyspy, perf, 'pyspy,perf' hoặc 'all' (default: $PROFILE_TYPE)"
       echo "  --out-dir <dir>             Thư mục lưu trữ artifact kết quả"
       echo ""
       echo "Tùy chọn Máy Phát Tải (Machine 2: Load Generator):"
@@ -294,6 +294,32 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Tự động trích xuất URL và tên kịch bản từ scenario.json nếu chưa ghi đè qua TARGET_URL / --url
+if [[ -n "${SCENARIO_JSON:-}" && -f "$SCENARIO_JSON" ]]; then
+  if [[ -z "${EXPLICIT_URL:-}" && -z "${TARGET_URL:-}" ]]; then
+    json_url=$(grep -oE '"url"[[:space:]]*:[[:space:]]*"[^"]+"' "$SCENARIO_JSON" | head -n 1 | sed -E 's/.*"url"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)
+    if [[ -n "$json_url" ]]; then
+      URL="$json_url"
+    fi
+  fi
+  json_name=$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$SCENARIO_JSON" | head -n 1 | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)
+  if [[ -n "$json_name" ]]; then
+    SCENARIO="$json_name"
+  fi
+fi
+
+# Tự động trích xuất cổng ứng dụng từ URL nếu người dùng không cấu hình TARGET_PORT
+if [[ -z "${TARGET_PORT:-}" && -z "${EXPLICIT_PORT:-}" ]]; then
+  parsed_port=$(echo "$URL" | sed -e 's|^[^/]*//||' -e 's|/.*$||' | grep -oE ':[0-9]+$' | tr -d ':' || true)
+  if [[ -n "$parsed_port" ]]; then
+    PORT="$parsed_port"
+  elif [[ "$URL" =~ ^https:// ]]; then
+    PORT="443"
+  elif [[ "$URL" =~ ^http:// ]]; then
+    PORT="80"
+  fi
+fi
 
 # ==============================================================================
 # HÀM KẾT NỐI VÀ ĐIỀU PHỐI SSH SERVER CỤM K8S (MACHINE 3)
@@ -868,46 +894,80 @@ echo "==========================================================================
 echo "⚠️ PHÁT HIỆN ĐIỂM GÃY TẠI MỨC TẢI: ${KNEE_RPS} req/s"
 echo "▶ [PHA 2] TỰ ĐỘNG CHUYỂN SANG CHẨN ĐOÁN NGUYÊN NHÂN SÂU (FLAMEGRAPH)..."
 echo "================================================================================"
-echo "Mức tải giữ ổn định : ${KNEE_RPS} req/s trong 45 giây"
-echo "Công cụ profiling    : ${PROFILE_TYPE}"
 
-SVG_OUT="$OUT_DIR/flamegraph_knee_${KNEE_RPS}rps.svg"
+# Phân tách danh sách profilers (hỗ trợ nhiều loại chạy lần lượt, ví dụ: 'pyspy,perf' hoặc 'all')
+PROFILER_RAW="$(echo "$PROFILE_TYPE" | tr ' ' ',' | tr -s ',')"
+IFS=',' read -ra RAW_LIST <<< "$PROFILER_RAW"
+PROFILER_LIST=()
+for p in "${RAW_LIST[@]}"; do
+  p="$(echo "$p" | tr -d ' ' | tr '[:upper:]' '[:lower:]')"
+  if [[ "$p" == "all" ]]; then
+    PROFILER_LIST+=("pyspy" "perf")
+  elif [[ -n "$p" ]]; then
+    PROFILER_LIST+=("$p")
+  fi
+done
+if [[ ${#PROFILER_LIST[@]} -eq 0 ]]; then
+  PROFILER_LIST=("pyspy")
+fi
+
+PROF_DURATION=30
+TOTAL_PHASE2_DURATION=$(( ${#PROFILER_LIST[@]} * (PROF_DURATION + 5) + 10 ))
+
+echo "Danh sách Profilers : ${PROFILER_LIST[*]} (chạy tuần tự để triệt tiêu nhiễu sampling)"
+echo "Thời gian mỗi tool  : ${PROF_DURATION} giây / tool"
+echo "Tổng thời gian giữ  : ${TOTAL_PHASE2_DURATION} giây tại Knee Point (${KNEE_RPS} req/s)"
+
 PHASE2_RAMP_LOG="$OUT_DIR/phase2-ramp.jsonl"
+GENERATED_SVGS=()
 
-# Phát tải cố định tại Knee RPS ở background
+# Phát tải duy trì liên tục ở mức Knee RPS ở background
 LOADGEN_BG_PID=""
 echo "==> Đang kích hoạt phát tải duy trì tại ${KNEE_RPS} req/s..."
-run_loadgen "${KNEE_RPS}" 45 0 0 "$PHASE2_RAMP_LOG" true
+run_loadgen "${KNEE_RPS}" "$TOTAL_PHASE2_DURATION" 0 0 "$PHASE2_RAMP_LOG" true
 
 sleep 5
 
-# Kích hoạt Profiler trên target
-if [[ -n "$POD_NAME" ]]; then
-  echo "==> Đang kích hoạt profiling trong Kubernetes Pod..."
-  if [[ "$PROFILE_TYPE" == "pyspy" ]]; then
-    echo "    Chạy py-spy record (30s, rate 100Hz)..."
-    exec_in_target "py-spy record -o /tmp/flamegraph.svg -d 30 --rate 100 --subprocesses || true"
-    copy_from_target "/tmp/flamegraph.svg" "$SVG_OUT"
-  else
-    echo "    Chạy profile-perf (30s, rate 99Hz)..."
-    exec_in_target "profile-perf 30 /tmp/flamegraph.svg || true"
-    copy_from_target "/tmp/flamegraph.svg" "$SVG_OUT"
-  fi
-else
-  echo "==> Đang kích hoạt profiling cục bộ..."
-  if [[ "$PROFILE_TYPE" == "pyspy" ]] && command -v py-spy &>/dev/null; then
-    TARGET_ARG=""
-    if [[ -n "$TARGET_PID" ]]; then TARGET_ARG="-p $TARGET_PID"; else TARGET_ARG="--subprocesses"; fi
-    py-spy record -o "$SVG_OUT" -d 30 --rate 100 $TARGET_ARG 2>/dev/null || true
-  elif [[ "$PROFILE_TYPE" == "perf" ]] && command -v perf &>/dev/null; then
-    perf record -F 99 -g -a -o "$OUT_DIR/perf.data" -- sleep 30 2>/dev/null || true
-    if command -v flamegraph.pl &>/dev/null; then
-      perf script -i "$OUT_DIR/perf.data" | stackcollapse-perf.pl | flamegraph.pl > "$SVG_OUT"
+# Thực thi tuần tự từng profiler để đảm bảo hiệu năng và độ chính xác
+for prof in "${PROFILER_LIST[@]}"; do
+  echo ""
+  echo "--> [PROFILING: $prof] Đang lấy mẫu ${PROF_DURATION}s..."
+  local_svg="$OUT_DIR/flamegraph_knee_${KNEE_RPS}rps_${prof}.svg"
+
+  if [[ -n "$POD_NAME" ]]; then
+    if [[ "$prof" == "pyspy" ]]; then
+      echo "    Chạy py-spy record (30s, rate 100Hz, đọc Python stack)..."
+      exec_in_target "py-spy record -o /tmp/flamegraph_${prof}.svg -d ${PROF_DURATION} --rate 100 --subprocesses || true"
+      copy_from_target "/tmp/flamegraph_${prof}.svg" "$local_svg"
+    elif [[ "$prof" == "perf" ]]; then
+      echo "    Chạy profile-perf (30s, rate 99Hz, đọc Kernel & C++ stack)..."
+      exec_in_target "profile-perf ${PROF_DURATION} /tmp/flamegraph_${prof}.svg || true"
+      copy_from_target "/tmp/flamegraph_${prof}.svg" "$local_svg"
+    else
+      echo "    [CẢNH BÁO] Không hỗ trợ profiler '${prof}'. Bỏ qua."
     fi
   else
-    echo "    (Lưu ý: Không tìm thấy py-spy hoặc perf trên máy host. Bỏ qua xuất SVG cục bộ.)"
+    echo "    Chạy profiling cục bộ ($prof)..."
+    if [[ "$prof" == "pyspy" ]] && command -v py-spy &>/dev/null; then
+      TARGET_ARG=""
+      if [[ -n "$TARGET_PID" ]]; then TARGET_ARG="-p $TARGET_PID"; else TARGET_ARG="--subprocesses"; fi
+      py-spy record -o "$local_svg" -d "$PROF_DURATION" --rate 100 $TARGET_ARG 2>/dev/null || true
+    elif [[ "$prof" == "perf" ]] && command -v perf &>/dev/null; then
+      perf record -F 99 -g -a -o "$OUT_DIR/perf_${prof}.data" -- sleep "$PROF_DURATION" 2>/dev/null || true
+      if command -v flamegraph.pl &>/dev/null; then
+        perf script -i "$OUT_DIR/perf_${prof}.data" | stackcollapse-perf.pl | flamegraph.pl > "$local_svg"
+      fi
+    else
+      echo "    (Lưu ý: Không tìm thấy $prof trên máy host. Bỏ qua xuất SVG cục bộ.)"
+    fi
   fi
-fi
+
+  if [[ -f "$local_svg" ]]; then
+    GENERATED_SVGS+=("$local_svg")
+    echo "    ✓ Đã xuất FlameGraph ($prof): $local_svg"
+  fi
+  sleep 3
+done
 
 # Chờ tiến trình phát tải Phase 2 kết thúc
 if [[ -n "$LOADGEN_BG_PID" ]]; then
@@ -924,8 +984,11 @@ echo "==========================================================================
 echo "✓ HOÀN TẤT TOÀN DIỆN QUY TRÌNH 2 PHA ĐỊNH CHUẨN VÀ PROFILING!"
 echo "================================================================================"
 echo "Báo cáo phân tích Sizing : $REPORT_LOG"
-if [[ -f "$SVG_OUT" ]]; then
-  echo "Biểu đồ FlameGraph SVG   : $SVG_OUT"
+if [[ ${#GENERATED_SVGS[@]} -gt 0 ]]; then
+  echo "Các biểu đồ FlameGraph SVG đã tạo:"
+  for s in "${GENERATED_SVGS[@]}"; do
+    echo "  • $s"
+  done
   echo "▶ Hãy mở file SVG trên trình duyệt để soi chi tiết hàm/dòng code gây nghẽn tại bậc ${KNEE_RPS} req/s!"
 fi
 echo "================================================================================"

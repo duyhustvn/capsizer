@@ -72,9 +72,13 @@ K8S_NAMESPACE="default"
 ```
 
 ### B. Cấu hình Kịch bản độc lập (`scenarios/<tên_dịch_vụ>/`)
-Mỗi kịch bản được tổ chức gọn gàng trong thư mục riêng:
-- `scenario.json`: **[Khai báo Request tương tự k6]** Định nghĩa URL, HTTP method, headers, dynamic template body (`{{.Query}}`, `{{.Token}}`, `{{.UUID}}`), logic SSE.
-- `scenario.env`: **[Thông số thực thi & K8s]** Dải bậc tải (`STEPS`), selector Pod mục tiêu (`K8S_SELECTOR`), loại profiler (`PROFILE_TYPE=pyspy|perf`).
+Mỗi kịch bản được tổ chức gọn gàng trong thư mục riêng, không trùng lặp cấu hình:
+- `scenario.json`: **[Khai báo Request tương tự k6]** Định nghĩa URL, HTTP method, headers, dynamic template body (`{{.Query}}`, `{{.Token}}`, `{{.UUID}}`), `queries_file`, `users_file`, logic SSE.
+- `scenario.env`: **[Thông số thực thi & K8s]**
+  - `STEPS`, `STEP_SECONDS`, `BASELINE_WAIT`, `COOLDOWN`: Dải bậc tải và thời gian.
+  - `K8S_SELECTOR`: Label selector tìm Pod mục tiêu (vd: `app=chatbot`).
+  - `PROFILE_TYPE`: Hỗ trợ đơn lẻ (`pyspy`, `perf`) hoặc **đa profiler chạy tuần tự** (`pyspy,perf` hoặc `all`) để triệt tiêu nhiễu mẫu (Probe Effect), xuất riêng từng file `flamegraph_knee_<RPS>rps_<prof>.svg`.
+  - `TARGET_PORT` *(Tùy chọn)*: Mặc định tự động bóc tách từ `url` trong `scenario.json`. Chỉ cần khai báo khi cổng nội bộ Pod khác với cổng của Ingress/Gateway bên ngoài.
 - Tệp dữ liệu đi kèm (`queries.txt`, `users.csv`, `payload.json`) đặt ngay trong thư mục với đường dẫn tương đối.
 
 *Ví dụ `scenarios/chatbot/`:*
@@ -98,7 +102,8 @@ Mỗi kịch bản được tổ chức gọn gàng trong thư mục riêng:
 - `scenario.env`:
   ```bash
   K8S_SELECTOR="app=chatbot"
-  PROFILE_TYPE="pyspy"               # Python FastAPI dùng py-spy
+  PROFILE_TYPE="pyspy,perf"          # Chạy tuần tự py-spy (Python stack) rồi perf (Kernel/C++ stack)
+  # TARGET_PORT="8000"               # Tùy chọn (chỉ bật khi đi qua Ingress cổng 443 -> Pod cổng 8000)
   STEPS="2,4,8,16,32"
   STEP_SECONDS="30"
   BASELINE_WAIT="60"
