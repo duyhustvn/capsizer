@@ -76,3 +76,5 @@ RUN chmod +x /usr/local/bin/*.sh \
 # Thêm FlameGraph vào PATH để tiện thực thi lệnh ở mọi nơi
 ENV PATH="/opt/FlameGraph:${PATH}"
 ENV HOME=/tmp
+
+CMD ["sleep", "infinity"]

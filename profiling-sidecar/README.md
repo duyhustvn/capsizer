@@ -44,24 +44,28 @@ kubectl debug -it <POD_NAME> -n <NAMESPACE> \
 > ⚠️ **Lưu ý khi Cluster bật Pod Security Standards (PSA/PSS) hoặc Kyverno / Gatekeeper:**
 > Nếu Namespace enforce mức `baseline` hoặc `restricted`, lệnh trên có thể bị chặn vì `--profile=sysadmin` yêu cầu quyền `privileged`/`hostPID`. Bạn có 2 cách giải quyết:
 >
-> **Cách A: Dùng file cấu hình quyền tùy chỉnh (`--custom` trên K8s 1.27+)**
-> Tạo file `debug-security.json` hoặc `.yaml` chỉ cấp đúng quyền `SYS_PTRACE` tối thiểu:
+> **Cách A: Dùng file cấu hình quyền root (`profiling-sidecar/debug-root.yaml` có sẵn)**
+> File `profiling-sidecar/debug-root.yaml` cấp quyền `runAsUser: 0`, `runAsNonRoot: false` (để vượt qua cấu hình `runAsNonRoot: true` ở cấp Pod) cùng `SYS_PTRACE` & `SYS_ADMIN`:
 > ```yaml
-> # debug-security.yaml
+> # profiling-sidecar/debug-root.yaml
 > securityContext:
+>   runAsUser: 0
+>   runAsGroup: 0
+>   runAsNonRoot: false
+>   allowPrivilegeEscalation: true
 >   capabilities:
 >     add:
 >       - SYS_PTRACE
->   runAsUser: 0
->   runAsNonRoot: false
->   allowPrivilegeEscalation: true
+>       - SYS_ADMIN
 > ```
 > Chạy lệnh:
 > ```bash
 > kubectl debug -it <POD_NAME> -n <NAMESPACE> \
+>   -c capsizer-debugger \
 >   --image=docker.io/duyle95/profiling-sidecar:latest \
 >   --target=<CONTAINER_NAME> \
->   --custom=debug-security.yaml \
+>   --custom=profiling-sidecar/debug-root.yaml \
+>   --profile=sysadmin \
 >   -- bash
 > ```
 >
@@ -112,9 +116,13 @@ spec:
           imagePullPolicy: IfNotPresent
           command: ["sh", "-c", "sleep infinity"]
           securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: true
             capabilities:
               add:
-                - SYS_PTRACE # Bắt buộc để inspect process
+                - SYS_PTRACE # Bắt buộc để inspect process (py-spy / perf)
                 - SYS_ADMIN  # Cần thiết nếu dùng Linux perf kernel events
 ```
 

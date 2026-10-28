@@ -1,0 +1,20 @@
+# ==============================================================================
+# Cấu hình quyền Root & Capabilities cho Ephemeral Debug Container / Sidecar
+# Sử dụng với lệnh:
+#   kubectl debug <POD_NAME> -n <NAMESPACE> \
+#     -c capsizer-debugger \
+#     --image=docker.io/duyle95/profiling-sidecar:latest \
+#     --target=<APP_CONTAINER_NAME> \
+#     --custom=profiling-sidecar/debug-root.yaml \
+#     --profile=sysadmin \
+#     -it -- bash
+# ==============================================================================
+securityContext:
+  runAsUser: 0
+  runAsGroup: 0
+  runAsNonRoot: false
+  allowPrivilegeEscalation: true
+  capabilities:
+    add:
+      - SYS_PTRACE
+      - SYS_ADMIN

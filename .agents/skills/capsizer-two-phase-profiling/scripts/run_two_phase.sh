@@ -325,8 +325,10 @@ fi
 # HÀM KẾT NỐI VÀ ĐIỀU PHỐI SSH SERVER CỤM K8S (MACHINE 3)
 # ==============================================================================
 K8S_SSH_OPTS=(-p "$K8S_SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+K8S_SCP_OPTS=(-P "$K8S_SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 if [[ -n "$K8S_SSH_KEY" ]]; then
   K8S_SSH_OPTS+=(-i "$K8S_SSH_KEY")
+  K8S_SCP_OPTS+=(-i "$K8S_SSH_KEY")
 fi
 
 run_k8s_ssh() {
@@ -336,38 +338,41 @@ run_k8s_ssh() {
 run_k8s_scp_to() {
   local src="$1"
   local dst="$2"
-  scp "${K8S_SSH_OPTS[@]}" "$src" "${K8S_SSH_USER}@${K8S_SSH_HOST}:$dst"
+  scp "${K8S_SCP_OPTS[@]}" "$src" "${K8S_SSH_USER}@${K8S_SSH_HOST}:$dst"
 }
 
 run_k8s_scp_from() {
   local src="$1"
   local dst="$2"
-  scp "${K8S_SSH_OPTS[@]}" "${K8S_SSH_USER}@${K8S_SSH_HOST}:$src" "$dst"
+  scp "${K8S_SCP_OPTS[@]}" "${K8S_SSH_USER}@${K8S_SSH_HOST}:$src" "$dst"
 }
 
 # ==============================================================================
 # HÀM THỰC THI KUBECTL (HỖ TRỢ CẢ SSH VÀO SERVER CỤM HOẶC CỤC BỘ)
 # ==============================================================================
 run_kubectl() {
-  local sudo_prefix=""
+  local cmd_arr=()
   if [[ "$K8S_USE_SUDO" == "true" ]]; then
-    sudo_prefix="sudo "
+    cmd_arr+=(sudo)
   fi
 
-  local base_cmd="${sudo_prefix}kubectl"
+  cmd_arr+=(kubectl)
   if [[ -n "$KUBECONFIG_PATH" ]]; then
-    base_cmd+=" --kubeconfig='$KUBECONFIG_PATH'"
+    cmd_arr+=(--kubeconfig="$KUBECONFIG_PATH")
   fi
   if [[ -n "$K8S_CONTEXT" ]]; then
-    base_cmd+=" --context='$K8S_CONTEXT'"
+    cmd_arr+=(--context="$K8S_CONTEXT")
   fi
+  cmd_arr+=("$@")
 
   if [[ -n "$K8S_SSH_HOST" ]]; then
-    # Thực thi qua SSH trên Server cụm K8s
-    run_k8s_ssh "${base_cmd} $*"
+    # Thực thi qua SSH trên Server cụm K8s (escape toàn bộ tham số bằng printf %q để giữ nguyên chuỗi quote)
+    local remote_cmd
+    remote_cmd=$(printf '%q ' "${cmd_arr[@]}")
+    run_k8s_ssh "$remote_cmd"
   else
-    # Thực thi cục bộ
-    eval "${base_cmd} $*"
+    # Thực thi cục bộ trực tiếp bằng mảng để bảo toàn tham số có khoảng trắng
+    "${cmd_arr[@]}"
   fi
 }
 
@@ -394,8 +399,10 @@ resolve_target_pod() {
 # HÀM KẾT NỐI VÀ ĐIỀU PHỐI MÁY PHÁT TẢI (MACHINE 2: LOAD GENERATOR)
 # ==============================================================================
 LOADGEN_SSH_OPTS=(-p "$LOADGEN_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+LOADGEN_SCP_OPTS=(-P "$LOADGEN_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 if [[ -n "$LOADGEN_KEY" ]]; then
   LOADGEN_SSH_OPTS+=(-i "$LOADGEN_KEY")
+  LOADGEN_SCP_OPTS+=(-i "$LOADGEN_KEY")
 fi
 
 run_loadgen_ssh() {
@@ -405,13 +412,13 @@ run_loadgen_ssh() {
 run_loadgen_scp_to() {
   local src="$1"
   local dst="$2"
-  scp "${LOADGEN_SSH_OPTS[@]}" "$src" "${LOADGEN_USER}@${LOADGEN_HOST}:$dst"
+  scp "${LOADGEN_SCP_OPTS[@]}" "$src" "${LOADGEN_USER}@${LOADGEN_HOST}:$dst"
 }
 
 run_loadgen_scp_from() {
   local src="$1"
   local dst="$2"
-  scp "${LOADGEN_SSH_OPTS[@]}" "${LOADGEN_USER}@${LOADGEN_HOST}:$src" "$dst"
+  scp "${LOADGEN_SCP_OPTS[@]}" "${LOADGEN_USER}@${LOADGEN_HOST}:$src" "$dst"
 }
 
 # ==============================================================================
@@ -578,6 +585,14 @@ setup_remote_loadgen() {
   remote_os=$(run_loadgen_ssh "uname -srm")
   echo "    ✓ Kết nối SSH thành công ($remote_os)."
 
+  # Phân giải ký tự '~' trong LOADGEN_DIR thành đường dẫn tuyệt đối trên máy phát tải
+  # (Tránh lỗi single quote '~' không expand trong ssh/scp và os.Stat của Go)
+  if [[ "$LOADGEN_DIR" == "~"* ]]; then
+    local remote_home
+    remote_home=$(run_loadgen_ssh "pwd" 2>/dev/null || echo "/tmp")
+    LOADGEN_DIR="${remote_home}${LOADGEN_DIR#\~}"
+  fi
+
   local bin_dir="${PROJECT_ROOT}/bin"
   mkdir -p "$bin_dir"
   local local_ramp_bin="${bin_dir}/capsizer-ramp-linux-amd64"
@@ -703,6 +718,15 @@ run_loadgen() {
 # ==============================================================================
 setup_k8s_debug_container() {
   echo "==> Đang kiểm tra / gắn Ephemeral Debug Container ($DEBUG_CONTAINER_NAME) vào Pod $POD_NAME..."
+
+  # Tự động lấy tên container chính của Pod nếu người dùng chưa truyền --container
+  if [[ -z "$CONTAINER_NAME" ]]; then
+    CONTAINER_NAME=$(run_kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.containers[0].name}' 2>/dev/null || true)
+    if [[ -n "$CONTAINER_NAME" ]]; then
+      echo "    -> Tự động nhận diện container ứng dụng mục tiêu (--target): $CONTAINER_NAME"
+    fi
+  fi
+
   local TARGET_FLAG=""
   if [[ -n "$CONTAINER_NAME" ]]; then
     TARGET_FLAG="--target=$CONTAINER_NAME"
@@ -713,21 +737,72 @@ setup_k8s_debug_container() {
   if echo "$HAS_DEBUG" | grep -qw "$DEBUG_CONTAINER_NAME"; then
     echo "    ✓ Ephemeral container $DEBUG_CONTAINER_NAME đã sẵn sàng trong Pod."
   else
-    echo "    Đang đính kèm container debug với quyền SYS_PTRACE..."
-    run_kubectl debug "$POD_NAME" -n "$NAMESPACE" \
-      --image="$SIDECAR_IMAGE" \
-      --custom='{"spec":{"ephemeralContainers":[{"name":"'"$DEBUG_CONTAINER_NAME"'","image":"'"$SIDECAR_IMAGE"'","securityContext":{"capabilities":{"add":["SYS_PTRACE"]},"runAsUser":0},"stdin":true,"tty":true}]}}' \
-      $TARGET_FLAG \
-      --profile=sysadmin 2>/dev/null || \
-    run_kubectl debug "$POD_NAME" -n "$NAMESPACE" \
-      --image="$SIDECAR_IMAGE" \
-      $TARGET_FLAG \
-      --profile=sysadmin 2>/dev/null || \
-    run_kubectl debug "$POD_NAME" -n "$NAMESPACE" \
-      --image="$SIDECAR_IMAGE" \
-      $TARGET_FLAG || true
+    echo "    Đang tạo cấu hình debug-root.yaml (runAsUser: 0, runAsNonRoot: false, SYS_PTRACE, SYS_ADMIN)..."
+    local debug_yaml="/tmp/capsizer-debug-root.yaml"
+    local debug_min_yaml="/tmp/capsizer-debug-root-min.yaml"
+    local yaml_content="securityContext:
+  runAsUser: 0
+  runAsGroup: 0
+  runAsNonRoot: false
+  allowPrivilegeEscalation: true
+  capabilities:
+    add:
+      - SYS_PTRACE
+      - SYS_ADMIN"
+    local min_yaml_content="securityContext:
+  runAsUser: 0
+  runAsNonRoot: false
+  allowPrivilegeEscalation: true
+  capabilities:
+    add:
+      - SYS_PTRACE"
 
-    sleep 5
+    if [[ -n "$K8S_SSH_HOST" ]]; then
+      run_k8s_ssh "cat << 'EOF' > '$debug_yaml'
+$yaml_content
+EOF
+cat << 'EOF' > '$debug_min_yaml'
+$min_yaml_content
+EOF"
+    else
+      printf "%s\n" "$yaml_content" > "$debug_yaml"
+      printf "%s\n" "$min_yaml_content" > "$debug_min_yaml"
+    fi
+
+    echo "    Đang đính kèm container debug ($DEBUG_CONTAINER_NAME) với debug-root.yaml..."
+    run_kubectl debug "$POD_NAME" -n "$NAMESPACE" \
+      --attach=false \
+      -c "$DEBUG_CONTAINER_NAME" \
+      --image="$SIDECAR_IMAGE" \
+      $TARGET_FLAG \
+      --custom="$debug_yaml" \
+      --profile=sysadmin \
+      -- sh -c "sleep infinity" 2>/dev/null || \
+    run_kubectl debug "$POD_NAME" -n "$NAMESPACE" \
+      --attach=false \
+      -c "$DEBUG_CONTAINER_NAME" \
+      --image="$SIDECAR_IMAGE" \
+      $TARGET_FLAG \
+      --custom="$debug_min_yaml" \
+      -- sh -c "sleep infinity" 2>/dev/null || \
+    run_kubectl debug "$POD_NAME" -n "$NAMESPACE" \
+      --attach=false \
+      -c "$DEBUG_CONTAINER_NAME" \
+      --image="$SIDECAR_IMAGE" \
+      $TARGET_FLAG \
+      --profile=sysadmin \
+      -- sh -c "sleep infinity" || true
+
+    echo "    Đang chờ container $DEBUG_CONTAINER_NAME chuyển sang trạng thái Running..."
+    for _ in {1..15}; do
+      local state
+      state=$(run_kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath="{.status.ephemeralContainerStatuses[?(@.name=='$DEBUG_CONTAINER_NAME')].state}" 2>/dev/null || true)
+      if echo "$state" | grep -q "running"; then
+        echo "    ✓ Ephemeral container $DEBUG_CONTAINER_NAME đã Running (runAsUser: 0, runAsNonRoot: false)."
+        break
+      fi
+      sleep 2
+    done
   fi
 }
 
@@ -830,10 +905,10 @@ if [[ -n "$POD_NAME" ]]; then
   elif [[ "$K8S_MODE" == "cp" ]]; then
     echo "==> Đang biên dịch tĩnh và copy binary probe vào Pod..."
     CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o "$OUT_DIR/probe" ./cmd/probe
-    local C_FLAG=""
+    C_FLAG=""
     if [[ -n "$CONTAINER_NAME" ]]; then C_FLAG="-c $CONTAINER_NAME"; fi
     copy_to_target "$OUT_DIR/probe" "/tmp/probe"
-    run_kubectl exec -n "$NAMESPACE" "$POD_NAME" $C_FLAG -- sh -c "nohup /tmp/probe -port $PORT -out /tmp/probe.jsonl >/tmp/probe.log 2>&1 &"
+    run_kubectl exec -n "$NAMESPACE" "$POD_NAME" $C_FLAG -- sh -c "chmod +x /tmp/probe && nohup /tmp/probe -port $PORT -out /tmp/probe.jsonl >/tmp/probe.log 2>&1 &"
   fi
 else
   echo "==> Đang khởi chạy probe trên máy local..."
