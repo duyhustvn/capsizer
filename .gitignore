@@ -17,6 +17,7 @@ dist/
 build/
 bin/
 results/
+benchmark-results/
 .last_run_dir
 
 # IDEs & OS

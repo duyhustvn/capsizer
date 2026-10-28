@@ -1,0 +1,5 @@
+Xin chào, bạn có thể giới thiệu về bạn được không?
+Giải thích cho tôi kiến trúc microservices và ưu nhược điểm của nó.
+Làm sao để tối ưu hóa hiệu năng ứng dụng Python FastAPI chạy trên Kubernetes?
+Hãy viết một đoạn mã Golang minh họa thuật toán Connection Pooling.
+Tóm tắt các nguyên tắc thiết kế RESTful API chuẩn quốc tế.

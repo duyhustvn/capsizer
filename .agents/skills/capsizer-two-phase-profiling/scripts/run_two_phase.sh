@@ -11,7 +11,7 @@ set -euo pipefail
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 
 # Tự động nạp file cấu hình môi trường nếu tồn tại
 ENV_FILE="${PROJECT_ROOT}/.env.remote"
@@ -81,11 +81,83 @@ OUT_DIR="${PROJECT_ROOT}/benchmark-results/$(date +%Y%m%d_%H%M%S)"
 EXTRA_OPTS=()
 ONLY_CHECK=false
 
+# ==============================================================================
+# HÀM NẠP CẤU HÌNH KỊCH BẢN ĐỘC LẬP (SCENARIO CONFIG)
+# ==============================================================================
+SCENARIO_ENV=""
+
+load_scenario_env() {
+  local target_env="$1"
+  if [[ -f "$target_env" ]]; then
+    local env_dir
+    env_dir="$(cd "$(dirname "$target_env")" && pwd)"
+    echo "==> [Cấu hình Kịch bản] Đang nạp từ: $target_env"
+    # shellcheck disable=SC1090
+    source "$target_env"
+
+    if [[ -n "${TARGET_URL:-}" ]]; then URL="$TARGET_URL"; fi
+    if [[ -n "${SCENARIO:-}" ]]; then SCENARIO="$SCENARIO"; fi
+    if [[ -n "${METHOD:-}" ]]; then METHOD="$METHOD"; fi
+    if [[ -n "${BODY:-}" ]]; then BODY="$BODY"; fi
+    if [[ -n "${STEPS:-}" ]]; then STEPS="$STEPS"; fi
+    if [[ -n "${STEP_SECONDS:-}" ]]; then STEP_SECONDS="$STEP_SECONDS"; fi
+    if [[ -n "${BASELINE_WAIT:-}" ]]; then BASELINE_WAIT="$BASELINE_WAIT"; fi
+    if [[ -n "${COOLDOWN:-}" ]]; then COOLDOWN="$COOLDOWN"; fi
+    if [[ -n "${SETTLE:-}" ]]; then SETTLE="$SETTLE"; fi
+    if [[ -n "${TIMEOUT:-}" ]]; then TIMEOUT="$TIMEOUT"; fi
+    if [[ -n "${MAX_INFLIGHT:-}" ]]; then MAX_INFLIGHT="$MAX_INFLIGHT"; fi
+    if [[ -n "${CACHE_BUST:-}" ]]; then CACHE_BUST="$CACHE_BUST"; fi
+    if [[ -n "${PROFILE_TYPE:-}" ]]; then PROFILE_TYPE="$PROFILE_TYPE"; fi
+    if [[ -n "${TARGET_PORT:-}" ]]; then PORT="$TARGET_PORT"; fi
+    if [[ -n "${K8S_SELECTOR:-}" && -z "${POD_NAME:-}" ]]; then K8S_SELECTOR="$K8S_SELECTOR"; fi
+
+    # Tự động chuyển file path tương đối thành tuyệt đối dựa vào thư mục kịch bản
+    if [[ -n "${QUERIES_FILE:-}" && ! "$QUERIES_FILE" = /* && -f "$env_dir/$QUERIES_FILE" ]]; then
+      QUERIES_FILE="$env_dir/$QUERIES_FILE"
+    fi
+    if [[ -n "${USERS_FILE:-}" && ! "$USERS_FILE" = /* && -f "$env_dir/$USERS_FILE" ]]; then
+      USERS_FILE="$env_dir/$USERS_FILE"
+    elif [[ -n "${USERS_CSV:-}" && ! "$USERS_CSV" = /* && -f "$env_dir/$USERS_CSV" ]]; then
+      USERS_FILE="$env_dir/$USERS_CSV"
+    fi
+    if [[ -n "${BODY_FILE:-}" && ! "$BODY_FILE" = /* && -f "$env_dir/$BODY_FILE" ]]; then
+      BODY_FILE="$env_dir/$BODY_FILE"
+    fi
+  fi
+}
+
+# Quét trước cờ --scenario-env hoặc --scenario để nạp cấu hình kịch bản trước khi ghi đè bằng cờ CLI
+for ((i=1; i<=$#; i++)); do
+  arg="${!i}"
+  next_idx=$((i+1))
+  next_arg="${!next_idx:-}"
+  if [[ "$arg" == "--scenario-env" && -n "$next_arg" ]]; then
+    SCENARIO_ENV="$next_arg"
+  elif [[ "$arg" == "--scenario" && -n "$next_arg" && -z "$SCENARIO_ENV" ]]; then
+    if [[ -f "${PROJECT_ROOT}/scenarios/${next_arg}/scenario.env" ]]; then
+      SCENARIO_ENV="${PROJECT_ROOT}/scenarios/${next_arg}/scenario.env"
+    elif [[ -f "${PROJECT_ROOT}/scenarios/${next_arg}/.env" ]]; then
+      SCENARIO_ENV="${PROJECT_ROOT}/scenarios/${next_arg}/.env"
+    fi
+  fi
+done
+
+if [[ -n "$SCENARIO_ENV" ]]; then
+  load_scenario_env "$SCENARIO_ENV"
+fi
+
 # Parse cờ dòng lệnh (ghi đè cấu hình)
 while [[ $# -gt 0 ]]; do
   case $1 in
+    --scenario-env) SCENARIO_ENV="$2"; shift 2 ;;
     --url) URL="$2"; shift 2 ;;
-    --scenario) SCENARIO="$2"; shift 2 ;;
+    --scenario)
+      if [[ -f "${PROJECT_ROOT}/scenarios/$2/scenario.env" || -f "${PROJECT_ROOT}/scenarios/$2/.env" ]]; then
+        :
+      else
+        SCENARIO="$2"
+      fi
+      shift 2 ;;
     --method) METHOD="$2"; shift 2 ;;
     --body) BODY="$2"; shift 2 ;;
     --body-file) BODY_FILE="$2"; shift 2 ;;
@@ -144,7 +216,11 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       echo "Sử dụng: $0 [OPTIONS]"
       echo ""
-      echo "Tùy chọn Kiểm thử Tải & Kịch bản:"
+      echo "Tùy chọn Kịch bản (Scenario Packages):"
+      echo "  --scenario <name>           Tên kịch bản (tự động nạp scenarios/<name>/scenario.env nếu có)"
+      echo "  --scenario-env <file>       Đường dẫn file cấu hình kịch bản độc lập (scenario.env)"
+      echo ""
+      echo "Tùy chọn Kiểm thử Tải & Kịch bản (Ghi đè):"
       echo "  --url <url>                 Endpoint nhận request từ máy phát tải (default: $URL)"
       echo "  --scenario <name>           Kịch bản: chat-sse, sample-get, sample-post (default: $SCENARIO)"
       echo "  --method <method>           HTTP method cho REST (default: $METHOD)"
@@ -691,7 +767,11 @@ if [[ -n "$POD_NAME" ]]; then
   fi
 else
   echo "==> Đang khởi chạy probe trên máy local..."
-  go run ./cmd/probe -port "$PORT" -out "$PROBE_LOG" &
+  mkdir -p "$PROJECT_ROOT/bin"
+  if [[ ! -f "$PROJECT_ROOT/bin/probe" ]]; then
+    (cd "$PROJECT_ROOT" && go build -ldflags="-s -w" -o "$PROJECT_ROOT/bin/probe" ./cmd/probe)
+  fi
+  "$PROJECT_ROOT/bin/probe" -port "$PORT" -out "$PROBE_LOG" &
   PROBE_PID=$!
 fi
 
