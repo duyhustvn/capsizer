@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -16,26 +17,33 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"text/template"
 	"time"
 )
 
 // DeclarativeConfig định nghĩa toàn bộ kịch bản kiểm thử tải bằng JSON.
-// Không cần viết code Go, người dùng chỉ cần viết file scenario.json giống như k6.
+// Người dùng khai báo request, headers, template body và các dataset theo cơ chế Generic Datasets.
 type DeclarativeConfig struct {
-	Name           string            `json:"name"`                     // Tên kịch bản (ví dụ: my-api-test)
-	Type           string            `json:"type"`                     // "http" (REST thông thường) hoặc "sse" (Streaming LLM Chatbot)
-	URL            string            `json:"url"`                      // URL endpoint nhận tải (hỗ trợ template)
-	Method         string            `json:"method"`                   // GET, POST, PUT, DELETE,...
-	Headers        map[string]string `json:"headers"`                  // HTTP Headers (hỗ trợ template)
-	Body           string            `json:"body"`                     // Chuỗi body template
-	BodyFile       string            `json:"body_file"`                // Đường dẫn file body template
-	QueriesFile    string            `json:"queries_file"`             // File danh sách câu hỏi / prompts
-	UsersFile      string            `json:"users_file"`               // File users.csv chứa pool token
-	ExpectedStatus []int             `json:"expected_status"`          // Danh sách HTTP status hợp lệ (mặc định [200, 201])
-	TimeoutSeconds float64           `json:"timeout_seconds"`          // Read timeout (giây)
-	CacheBust      bool              `json:"cache_bust"`               // Thêm chuỗi ngẫu nhiên chống cache
-	SSE            SSEOptions        `json:"sse"`                      // Cấu hình riêng cho kịch bản SSE Streaming
+	Name           string                   `json:"name"`               // Tên kịch bản (ví dụ: my-api-test)
+	Type           string                   `json:"type"`               // "http" (REST thông thường) hoặc "sse" (Streaming LLM Chatbot)
+	URL            string                   `json:"url"`                // URL endpoint nhận tải (hỗ trợ template)
+	Method         string                   `json:"method"`             // GET, POST, PUT, DELETE,...
+	Headers        map[string]string        `json:"headers"`            // HTTP Headers (hỗ trợ template)
+	Body           string                   `json:"body"`               // Chuỗi body template
+	BodyFile       string                   `json:"body_file"`          // Đường dẫn file body template
+	Datasets       map[string]DatasetConfig `json:"datasets,omitempty"` // Bộ cấp dữ liệu đa nguồn độc lập (Generic Datasets / Data Feeders)
+	ExpectedStatus []int                    `json:"expected_status"`    // Danh sách HTTP status hợp lệ (mặc định [200, 201])
+	TimeoutSeconds float64                  `json:"timeout_seconds"`    // Read timeout (giây)
+	CacheBust      bool                     `json:"cache_bust"`         // Thêm chuỗi ngẫu nhiên chống cache vào URL
+	SSE            SSEOptions               `json:"sse"`                // Cấu hình riêng cho kịch bản SSE Streaming
+}
+
+// DatasetConfig cấu hình cho một nguồn dữ liệu nạp từ file.
+type DatasetConfig struct {
+	File   string `json:"file"`             // Đường dẫn tới file dữ liệu (tương đối theo thư mục scenario hoặc tuyệt đối)
+	Format string `json:"format,omitempty"` // Định dạng: "csv", "lines" (hoặc "txt"), "json", "jsonl" (mặc định tự nhận diện từ extension)
+	Mode   string `json:"mode,omitempty"`   // Chế độ nạp: "random" (ngẫu nhiên, mặc định) hoặc "sequential" (tuần tự xoay vòng)
 }
 
 type SSEOptions struct {
@@ -43,32 +51,307 @@ type SSEOptions struct {
 	EventFilter string `json:"event_filter"` // Lọc event name (ví dụ "message")
 }
 
-// TemplateContext chứa các biến cung cấp cho template mỗi request.
-type TemplateContext struct {
-	Query     string
-	Token     string
-	UserID    string
-	RandomInt int
-	Timestamp int64
-	UUID      string
-	User      struct {
-		Token string
-		ID    string
+// TextLine biểu diễn một dòng văn bản từ dataset kiểu lines/txt.
+// Triển khai fmt.Stringer để trong Go template có thể gọi trực tiếp {{.dataset}} hoặc {{.dataset.Line}}.
+type TextLine struct {
+	Line string
+}
+
+func (t TextLine) String() string {
+	return t.Line
+}
+
+// Dataset đại diện cho một kho dữ liệu đã nạp vào RAM và hỗ trợ cấp phát an toàn đa luồng.
+type Dataset struct {
+	Name     string
+	FilePath string
+	Format   string
+	Mode     string
+	Records  []any
+	idx      uint64
+}
+
+// Next trả về bản ghi tiếp theo dựa trên Mode (sequential hoặc random), an toàn đồng thời lock-free.
+func (d *Dataset) Next() any {
+	if len(d.Records) == 0 {
+		return nil
 	}
+	if d.Mode == "sequential" {
+		i := atomic.AddUint64(&d.idx, 1) - 1
+		return d.Records[i%uint64(len(d.Records))]
+	}
+	return d.Records[mrand.Intn(len(d.Records))]
 }
 
 // DeclarativeScenario triển khai interface Scenario.
 type DeclarativeScenario struct {
-	cfg          DeclarativeConfig
-	dir          string
-	headers      map[string]string
-	queries      []string
-	pool         *UserPool
-	timeout      time.Duration
-	urlTmpl      *template.Template
-	bodyTmpl     *template.Template
-	headerTmpls  map[string]*template.Template
-	statusMap    map[int]bool
+	cfg         DeclarativeConfig
+	dir         string
+	headers     map[string]string
+	datasets    map[string]*Dataset
+	timeout     time.Duration
+	urlTmpl     *template.Template
+	bodyTmpl    *template.Template
+	headerTmpls map[string]*template.Template
+	statusMap   map[int]bool
+}
+
+// Các hàm bổ trợ sẵn có trong template engine
+var defaultFuncMap = template.FuncMap{
+	"json": func(v any) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Sprint(v)
+		}
+		return string(b)
+	},
+	"quote": func(v any) string {
+		s := fmt.Sprint(v)
+		b, err := json.Marshal(s)
+		if err != nil {
+			return fmt.Sprintf("%q", s)
+		}
+		return string(b)
+	},
+	"lower": strings.ToLower,
+	"upper": strings.ToUpper,
+	"trim":  strings.TrimSpace,
+}
+
+func normalizeMapKeys(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m)*2)
+	for k, v := range m {
+		out[k] = v
+		lower := strings.ToLower(k)
+		if _, exists := out[lower]; !exists {
+			out[lower] = v
+		}
+		if nestedMap, ok := v.(map[string]any); ok {
+			out[k] = normalizeMapKeys(nestedMap)
+		}
+	}
+	return out
+}
+
+func loadCSVDataset(name string, filePath string) ([]any, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("dataset '%s': không mở được file %s: %w", name, filePath, err)
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	r.FieldsPerRecord = -1
+	r.TrimLeadingSpace = true
+
+	allRows, err := r.ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("dataset '%s': lỗi cú pháp CSV trong %s: %w", name, filePath, err)
+	}
+	if len(allRows) == 0 {
+		return nil, fmt.Errorf("dataset '%s': file CSV rỗng (%s)", name, filePath)
+	}
+	if len(allRows) == 1 {
+		return nil, fmt.Errorf("dataset '%s': file CSV chỉ có header mà không có dữ liệu (%s)", name, filePath)
+	}
+
+	headers := make([]string, len(allRows[0]))
+	for i, h := range allRows[0] {
+		headers[i] = strings.TrimSpace(h)
+	}
+
+	var records []any
+	for _, row := range allRows[1:] {
+		if len(row) == 0 {
+			continue
+		}
+		allEmpty := true
+		for _, v := range row {
+			if strings.TrimSpace(v) != "" {
+				allEmpty = false
+				break
+			}
+		}
+		if allEmpty {
+			continue
+		}
+
+		rowMap := make(map[string]string)
+		for i, val := range row {
+			if i < len(headers) {
+				h := headers[i]
+				v := strings.TrimSpace(val)
+				rowMap[h] = v
+				rowMap[strings.ToLower(h)] = v
+				rowMap[strings.ToUpper(h)] = v
+			}
+		}
+		records = append(records, rowMap)
+	}
+
+	if len(records) == 0 {
+		return nil, fmt.Errorf("dataset '%s': không tìm thấy dòng dữ liệu nào hợp lệ trong %s", name, filePath)
+	}
+	return records, nil
+}
+
+func loadLinesDataset(name string, filePath string) ([]any, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("dataset '%s': không mở được file %s: %w", name, filePath, err)
+	}
+
+	var records []any
+	scanner := bufio.NewScanner(bytes.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		records = append(records, TextLine{Line: line})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("dataset '%s': lỗi đọc file %s: %w", name, filePath, err)
+	}
+	if len(records) == 0 {
+		return nil, fmt.Errorf("dataset '%s': file không chứa dòng dữ liệu nào (%s)", name, filePath)
+	}
+	return records, nil
+}
+
+func loadJSONLDataset(name string, filePath string) ([]any, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("dataset '%s': không mở được file %s: %w", name, filePath, err)
+	}
+
+	var records []any
+	scanner := bufio.NewScanner(bytes.NewReader(content))
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		var val any
+		if err := json.Unmarshal([]byte(line), &val); err != nil {
+			return nil, fmt.Errorf("dataset '%s': JSON không hợp lệ tại dòng %d trong %s: %w", name, lineNum, filePath, err)
+		}
+		if m, ok := val.(map[string]any); ok {
+			records = append(records, normalizeMapKeys(m))
+		} else {
+			records = append(records, val)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("dataset '%s': lỗi đọc file %s: %w", name, filePath, err)
+	}
+	if len(records) == 0 {
+		return nil, fmt.Errorf("dataset '%s': file JSONL không chứa bản ghi nào (%s)", name, filePath)
+	}
+	return records, nil
+}
+
+func loadJSONDataset(name string, filePath string) ([]any, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("dataset '%s': không mở được file %s: %w", name, filePath, err)
+	}
+
+	var root any
+	if err := json.Unmarshal(content, &root); err != nil {
+		return nil, fmt.Errorf("dataset '%s': JSON không hợp lệ trong %s: %w", name, filePath, err)
+	}
+
+	var records []any
+	switch v := root.(type) {
+	case []any:
+		for _, item := range v {
+			if m, ok := item.(map[string]any); ok {
+				records = append(records, normalizeMapKeys(m))
+			} else {
+				records = append(records, item)
+			}
+		}
+	case map[string]any:
+		records = append(records, normalizeMapKeys(v))
+	default:
+		records = append(records, v)
+	}
+
+	if len(records) == 0 {
+		return nil, fmt.Errorf("dataset '%s': file JSON không chứa bản ghi nào (%s)", name, filePath)
+	}
+	return records, nil
+}
+
+func loadDataset(name string, cfg DatasetConfig, baseDir string) (*Dataset, error) {
+	if cfg.File == "" {
+		return nil, fmt.Errorf("dataset '%s': thiếu trường 'file'", name)
+	}
+
+	filePath := cfg.File
+	if !filepath.IsAbs(filePath) {
+		filePath = filepath.Join(baseDir, filePath)
+	}
+
+	if _, err := os.Stat(filePath); err != nil {
+		return nil, fmt.Errorf("dataset '%s': không tìm thấy file %s: %w", name, filePath, err)
+	}
+
+	format := strings.ToLower(strings.TrimSpace(cfg.Format))
+	if format == "" {
+		ext := strings.ToLower(filepath.Ext(filePath))
+		switch ext {
+		case ".csv":
+			format = "csv"
+		case ".txt":
+			format = "lines"
+		case ".jsonl", ".ndjson":
+			format = "jsonl"
+		case ".json":
+			format = "json"
+		default:
+			format = "lines"
+		}
+	}
+	if format == "txt" {
+		format = "lines"
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(cfg.Mode))
+	if mode != "sequential" && mode != "seq" {
+		mode = "random"
+	}
+
+	var records []any
+	var err error
+
+	switch format {
+	case "csv":
+		records, err = loadCSVDataset(name, filePath)
+	case "lines":
+		records, err = loadLinesDataset(name, filePath)
+	case "jsonl":
+		records, err = loadJSONLDataset(name, filePath)
+	case "json":
+		records, err = loadJSONDataset(name, filePath)
+	default:
+		records, err = loadLinesDataset(name, filePath)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &Dataset{
+		Name:     name,
+		FilePath: filePath,
+		Format:   format,
+		Mode:     mode,
+		Records:  records,
+	}, nil
 }
 
 // LoadDeclarativeScenario đọc file JSON hoặc thư mục chứa scenario.json để khởi tạo kịch bản động.
@@ -154,60 +437,81 @@ func LoadDeclarativeScenario(targetPath string, params ScenarioParams) (*Declara
 	}
 
 	// Parse templates
-	urlTmpl, _ := template.New("url").Parse(cfg.URL)
+	urlTmpl, err := template.New("url").Funcs(defaultFuncMap).Parse(cfg.URL)
+	if err != nil {
+		return nil, fmt.Errorf("lỗi cú pháp template trong 'url': %w", err)
+	}
+
 	var bodyTmpl *template.Template
 	if cfg.Body != "" {
-		bodyTmpl, _ = template.New("body").Parse(cfg.Body)
+		bodyTmpl, err = template.New("body").Funcs(defaultFuncMap).Parse(cfg.Body)
+		if err != nil {
+			return nil, fmt.Errorf("lỗi cú pháp template trong 'body': %w", err)
+		}
 	}
 
 	headerTmpls := make(map[string]*template.Template)
 	for k, v := range cfg.Headers {
-		t, _ := template.New(k).Parse(v)
+		t, err := template.New(k).Funcs(defaultFuncMap).Parse(v)
+		if err != nil {
+			return nil, fmt.Errorf("lỗi cú pháp template trong header '%s': %w", k, err)
+		}
 		headerTmpls[k] = t
 	}
-	// Gộp thêm headers truyền từ CLI (-H)
 	for k, v := range params.Headers {
-		t, _ := template.New(k).Parse(v)
+		t, err := template.New(k).Funcs(defaultFuncMap).Parse(v)
+		if err != nil {
+			return nil, fmt.Errorf("lỗi cú pháp template trong CLI header '%s': %w", k, err)
+		}
 		headerTmpls[k] = t
 	}
 
-	// Nạp queries
-	var queries []string
-	if cfg.QueriesFile != "" {
-		qPath := cfg.QueriesFile
-		if !filepath.IsAbs(qPath) {
-			qPath = filepath.Join(baseDir, qPath)
-		}
-		queries = ResolveQueries(qPath, "")
-	}
-	if len(queries) == 0 {
-		if qOpt := params.GetOpt("queries", params.GetOpt("queries-file", "")); qOpt != "" {
-			queries = ResolveQueries(qOpt, "")
-		}
+	// Chuẩn bị danh mục Datasets
+	if cfg.Datasets == nil {
+		cfg.Datasets = make(map[string]DatasetConfig)
 	}
 
-	// Nạp users
-	var userPool *UserPool
-	if cfg.UsersFile != "" {
-		uPath := cfg.UsersFile
-		if !filepath.IsAbs(uPath) {
-			uPath = filepath.Join(baseDir, uPath)
-		}
-		users, err := LoadUsers(uPath)
-		if err == nil && len(users) > 0 {
-			userPool = NewUserPool(users)
-		}
-	}
-	if userPool == nil {
-		if uOpt := params.GetOpt("users", params.GetOpt("users-file", params.GetOpt("users-csv", ""))); uOpt != "" {
-			if users, err := LoadUsers(uOpt); err == nil && len(users) > 0 {
-				userPool = NewUserPool(users)
+	// Quét đăng ký dataset động từ CLI (-opt dataset.<name>.file / -opt dataset.<name>.mode)
+	for k, v := range params.Options {
+		if strings.HasPrefix(k, "dataset.") && strings.HasSuffix(k, ".file") {
+			parts := strings.Split(k, ".")
+			if len(parts) == 3 {
+				dsName := parts[1]
+				dCfg := cfg.Datasets[dsName]
+				dCfg.File = v
+				if optFmt := params.GetOpt("dataset."+dsName+".format", ""); optFmt != "" {
+					dCfg.Format = optFmt
+				}
+				if optMode := params.GetOpt("dataset."+dsName+".mode", ""); optMode != "" {
+					dCfg.Mode = optMode
+				}
+				cfg.Datasets[dsName] = dCfg
 			}
 		}
 	}
-	if userPool == nil {
-		token := params.GetOpt("token", "loadtest-token")
-		userPool = NewUserPool([]User{{Token: token}})
+
+	// Kiểm tra ghi đè từng dataset đã khai báo từ CLI (-opt dataset.<name>.file / -opt <name>=file)
+	for name, dCfg := range cfg.Datasets {
+		if optFile := params.GetOpt("dataset."+name+".file", params.GetOpt(name, "")); optFile != "" {
+			dCfg.File = optFile
+		}
+		if optMode := params.GetOpt("dataset."+name+".mode", ""); optMode != "" {
+			dCfg.Mode = optMode
+		}
+		if optFmt := params.GetOpt("dataset."+name+".format", ""); optFmt != "" {
+			dCfg.Format = optFmt
+		}
+		cfg.Datasets[name] = dCfg
+	}
+
+	// Nạp tất cả datasets vào bộ nhớ
+	datasets := make(map[string]*Dataset)
+	for name, dCfg := range cfg.Datasets {
+		ds, err := loadDataset(name, dCfg, baseDir)
+		if err != nil {
+			return nil, err
+		}
+		datasets[name] = ds
 	}
 
 	// Danh sách status hợp lệ
@@ -230,8 +534,7 @@ func LoadDeclarativeScenario(targetPath string, params ScenarioParams) (*Declara
 		cfg:         cfg,
 		dir:         baseDir,
 		headers:     cfg.Headers,
-		queries:     queries,
-		pool:        userPool,
+		datasets:    datasets,
 		timeout:     timeout,
 		urlTmpl:     urlTmpl,
 		bodyTmpl:    bodyTmpl,
@@ -257,6 +560,13 @@ func (s *DeclarativeScenario) Target() string {
 
 func (s *DeclarativeScenario) Setup(ctx context.Context, client *http.Client) error {
 	fmt.Printf("[Declarative Scenario: %s] Kiểu: %s | Endpoint: %s\n", s.cfg.Name, strings.ToUpper(s.cfg.Type), s.cfg.URL)
+	if len(s.datasets) > 0 {
+		fmt.Printf("datasets : %d nguồn dữ liệu đã nạp:\n", len(s.datasets))
+		for name, ds := range s.datasets {
+			fmt.Printf("  - %-12s: %d bản ghi (định dạng: %s, chế độ: %s, file: %s)\n",
+				name, len(ds.Records), ds.Format, ds.Mode, filepath.Base(ds.FilePath))
+		}
+	}
 	return nil
 }
 
@@ -266,45 +576,48 @@ func randomUUID() string {
 	return hex.EncodeToString(b)
 }
 
-func (s *DeclarativeScenario) renderTmpl(t *template.Template, ctx TemplateContext) string {
+func (s *DeclarativeScenario) renderTmpl(t *template.Template, data any) string {
 	if t == nil {
 		return ""
 	}
 	var buf bytes.Buffer
-	if err := t.Execute(&buf, ctx); err != nil {
+	if err := t.Execute(&buf, data); err != nil {
 		return ""
 	}
 	return buf.String()
 }
 
 func (s *DeclarativeScenario) Execute(ctx context.Context, client *http.Client) Record {
-	q := ""
-	if len(s.queries) > 0 {
-		q = s.queries[mrand.Intn(len(s.queries))]
-	}
-	if s.cfg.CacheBust {
-		q = fmt.Sprintf("%s (id %d)", q, mrand.Intn(900000)+100000)
+	tmplData := make(map[string]any, len(s.datasets)+5)
+
+	// Các biến động hệ thống sinh ngẫu nhiên cho mỗi request
+	tmplData["RandomInt"] = mrand.Intn(900000) + 100000
+	tmplData["Timestamp"] = time.Now().Unix()
+	tmplData["TimestampNano"] = time.Now().UnixNano()
+	tmplData["UUID"] = randomUUID()
+
+	// Trích xuất bản ghi tiếp theo từ mỗi Dataset đã khai báo
+	for name, ds := range s.datasets {
+		tmplData[name] = ds.Next()
 	}
 
-	userID, token := s.pool.Next()
+	// Cung cấp trường "Data" tự tham chiếu cho phép cú pháp {{.Data.dataset.field}}
+	tmplData["Data"] = tmplData
 
-	tmplCtx := TemplateContext{
-		Query:     q,
-		Token:     token,
-		UserID:    userID,
-		RandomInt: mrand.Intn(900000) + 100000,
-		Timestamp: time.Now().Unix(),
-		UUID:      randomUUID(),
-	}
-	tmplCtx.User.Token = token
-	tmplCtx.User.ID = userID
-
-	finalURL := s.renderTmpl(s.urlTmpl, tmplCtx)
+	finalURL := s.renderTmpl(s.urlTmpl, tmplData)
 	if finalURL == "" {
 		finalURL = s.cfg.URL
 	}
 
-	finalBody := s.renderTmpl(s.bodyTmpl, tmplCtx)
+	if s.cfg.CacheBust {
+		separator := "?"
+		if strings.Contains(finalURL, "?") {
+			separator = "&"
+		}
+		finalURL = fmt.Sprintf("%s%s_cb=%d", finalURL, separator, time.Now().UnixNano())
+	}
+
+	finalBody := s.renderTmpl(s.bodyTmpl, tmplData)
 
 	tStart := float64(time.Now().UnixNano()) / 1e9
 	t0 := time.Now()
@@ -313,7 +626,6 @@ func (s *DeclarativeScenario) Execute(ctx context.Context, client *http.Client) 
 	rec := Record{
 		Type:     "req",
 		TStart:   tStart,
-		UserID:   userID,
 		TtftMs:   nil,
 		NoticeMs: nil,
 		TotalMs:  nil,
@@ -340,7 +652,7 @@ func (s *DeclarativeScenario) Execute(ctx context.Context, client *http.Client) 
 	}
 
 	for k, tmpl := range s.headerTmpls {
-		val := s.renderTmpl(tmpl, tmplCtx)
+		val := s.renderTmpl(tmpl, tmplData)
 		httpReq.Header.Set(k, val)
 	}
 

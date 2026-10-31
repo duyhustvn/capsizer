@@ -41,8 +41,6 @@ TIMEOUT="${TIMEOUT:-120}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-2000}"
 CACHE_BUST="${CACHE_BUST:-false}"
 SKIP_VERIFY="${SKIP_VERIFY:-false}"
-QUERIES_FILE="${QUERIES_FILE:-}"
-USERS_FILE="${USERS_CSV:-${USERS_FILE:-}}"
 
 # ------------------------------------------------------------------------------
 # Machine 2: Máy phát tải (Load Generator Host qua SSH)
@@ -118,14 +116,6 @@ load_scenario_env() {
     if [[ -n "${K8S_SELECTOR:-}" && -z "${POD_NAME:-}" ]]; then K8S_SELECTOR="$K8S_SELECTOR"; fi
 
     # Tự động chuyển file path tương đối thành tuyệt đối dựa vào thư mục kịch bản
-    if [[ -n "${QUERIES_FILE:-}" && ! "$QUERIES_FILE" = /* && -f "$env_dir/$QUERIES_FILE" ]]; then
-      QUERIES_FILE="$env_dir/$QUERIES_FILE"
-    fi
-    if [[ -n "${USERS_FILE:-}" && ! "$USERS_FILE" = /* && -f "$env_dir/$USERS_FILE" ]]; then
-      USERS_FILE="$env_dir/$USERS_FILE"
-    elif [[ -n "${USERS_CSV:-}" && ! "$USERS_CSV" = /* && -f "$env_dir/$USERS_CSV" ]]; then
-      USERS_FILE="$env_dir/$USERS_CSV"
-    fi
     if [[ -n "${BODY_FILE:-}" && ! "$BODY_FILE" = /* && -f "$env_dir/$BODY_FILE" ]]; then
       BODY_FILE="$env_dir/$BODY_FILE"
     fi
@@ -191,8 +181,7 @@ while [[ $# -gt 0 ]]; do
     --max-inflight) MAX_INFLIGHT="$2"; shift 2 ;;
     --cache-bust) CACHE_BUST="true"; shift 1 ;;
     --skip-verify) SKIP_VERIFY="true"; shift 1 ;;
-    --queries) QUERIES_FILE="$2"; shift 2 ;;
-    --users) USERS_FILE="$2"; shift 2 ;;
+    # Tùy chọn riêng dạng --opt key=val
     --opt) EXTRA_OPTS+=("-opt" "$2"); shift 2 ;;
 
     --profile-type) PROFILE_TYPE="$2"; shift 2 ;;
@@ -251,9 +240,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --step-seconds <sec>        Thời gian mỗi bậc phát tải (default: $STEP_SECONDS)"
       echo "  --baseline-wait <sec>       Thời gian chờ lấy mẫu CPU/RAM nền (default: $BASELINE_WAIT)"
       echo "  --cooldown <sec>            Nghỉ giữa hai bậc (default: $COOLDOWN)"
-      echo "  --queries <file>            File câu hỏi cho chatbot"
-      echo "  --users <file>              File users.csv"
-      echo "  --opt <key=val>             Tùy chọn riêng cho Scenario (dùng nhiều lần)"
+      echo "  --opt <key=val>             Tùy chọn riêng cho Scenario / Dataset (dùng nhiều lần)"
       echo "  --cache-bust                Thêm tham số timestamp ngẫu nhiên chống cache"
       echo "  --skip-verify               Bỏ qua xác thực TLS/SSL"
       echo "  --profile-type <type>       Công cụ profiling: pyspy, perf, 'pyspy,perf' hoặc 'all' (default: $PROFILE_TYPE)"
@@ -614,21 +601,17 @@ setup_remote_loadgen() {
     run_loadgen_scp_to "$SCENARIO_JSON" "${LOADGEN_DIR}/scenario.json"
   fi
 
-  # Đồng bộ toàn bộ các file dữ liệu trong thư mục kịch bản
+  # Đồng bộ toàn bộ các file dữ liệu trong thư mục kịch bản (datasets, payloads, templates)
   if [[ -n "${SCENARIO_DIR:-}" && -d "$SCENARIO_DIR" ]]; then
-    for extra in "$SCENARIO_DIR"/*.json "$SCENARIO_DIR"/*.txt "$SCENARIO_DIR"/*.csv; do
-      if [[ -f "$extra" && "$(basename "$extra")" != "scenario.json" ]]; then
-        run_loadgen_scp_to "$extra" "${LOADGEN_DIR}/$(basename "$extra")"
+    for extra in "$SCENARIO_DIR"/*; do
+      local base_extra
+      base_extra="$(basename "$extra")"
+      if [[ -f "$extra" && "$base_extra" != "scenario.json" && "$base_extra" != "scenario.env" && "$base_extra" != ".env" ]]; then
+        run_loadgen_scp_to "$extra" "${LOADGEN_DIR}/${base_extra}"
       fi
     done
   fi
 
-  if [[ -n "$QUERIES_FILE" && -f "$QUERIES_FILE" ]]; then
-    run_loadgen_scp_to "$QUERIES_FILE" "${LOADGEN_DIR}/queries.txt"
-  fi
-  if [[ -n "$USERS_FILE" && -f "$USERS_FILE" ]]; then
-    run_loadgen_scp_to "$USERS_FILE" "${LOADGEN_DIR}/users.csv"
-  fi
   if [[ -n "$BODY_FILE" && -f "$BODY_FILE" ]]; then
     run_loadgen_scp_to "$BODY_FILE" "${LOADGEN_DIR}/body_payload"
   fi
@@ -666,8 +649,6 @@ run_loadgen() {
     if [[ "$SKIP_VERIFY" == "true" ]]; then r_cmd+=" -skip-verify"; fi
     if [[ -n "$BODY" ]]; then r_cmd+=" -body '${BODY}'"; fi
     if [[ -n "$BODY_FILE" && -f "$BODY_FILE" ]]; then r_cmd+=" -body-file '${LOADGEN_DIR}/body_payload'"; fi
-    if [[ -n "$QUERIES_FILE" && -f "$QUERIES_FILE" ]]; then r_cmd+=" -queries '${LOADGEN_DIR}/queries.txt'"; fi
-    if [[ -n "$USERS_FILE" && -f "$USERS_FILE" ]]; then r_cmd+=" -users '${LOADGEN_DIR}/users.csv'"; fi
     for opt in "${EXTRA_OPTS[@]}"; do r_cmd+=" $opt"; done
 
     if [[ "$l_bg" == "true" ]]; then
@@ -700,8 +681,6 @@ run_loadgen() {
     if [[ "$SKIP_VERIFY" == "true" ]]; then local_args+=(-skip-verify); fi
     if [[ -n "$BODY" ]]; then local_args+=(-body "$BODY"); fi
     if [[ -n "$BODY_FILE" && -f "$BODY_FILE" ]]; then local_args+=(-body-file "$BODY_FILE"); fi
-    if [[ -n "$QUERIES_FILE" && -f "$QUERIES_FILE" ]]; then local_args+=(-queries "$QUERIES_FILE"); fi
-    if [[ -n "$USERS_FILE" && -f "$USERS_FILE" ]]; then local_args+=(-users "$USERS_FILE"); fi
     if [[ ${#EXTRA_OPTS[@]} -gt 0 ]]; then local_args+=("${EXTRA_OPTS[@]}"); fi
 
     if [[ "$l_bg" == "true" ]]; then

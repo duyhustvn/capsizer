@@ -73,13 +73,13 @@ K8S_NAMESPACE="default"
 
 ### B. Cấu hình Kịch bản độc lập (`scenarios/<tên_dịch_vụ>/`)
 Mỗi kịch bản được tổ chức gọn gàng trong thư mục riêng, không trùng lặp cấu hình:
-- `scenario.json`: **[Khai báo Request tương tự k6]** Định nghĩa URL, HTTP method, headers, dynamic template body (`{{.Query}}`, `{{.Token}}`, `{{.UUID}}`), `queries_file`, `users_file`, logic SSE.
+- `scenario.json`: **[Khai báo Request tương tự k6]** Định nghĩa URL, HTTP method, headers, dynamic template body, datasets (Generic Data Feeders), logic SSE.
 - `scenario.env`: **[Thông số thực thi & K8s]**
   - `STEPS`, `STEP_SECONDS`, `BASELINE_WAIT`, `COOLDOWN`: Dải bậc tải và thời gian.
   - `K8S_SELECTOR`: Label selector tìm Pod mục tiêu (vd: `app=chatbot`).
   - `PROFILE_TYPE`: Hỗ trợ đơn lẻ (`pyspy`, `perf`) hoặc **đa profiler chạy tuần tự** (`pyspy,perf` hoặc `all`) để triệt tiêu nhiễu mẫu (Probe Effect), xuất riêng từng file `flamegraph_knee_<RPS>rps_<prof>.svg`.
   - `TARGET_PORT` *(Tùy chọn)*: Mặc định tự động bóc tách từ `url` trong `scenario.json`. Chỉ cần khai báo khi cổng nội bộ Pod khác với cổng của Ingress/Gateway bên ngoài.
-- Tệp dữ liệu đi kèm (`queries.txt`, `users.csv`, `payload.json`) đặt ngay trong thư mục với đường dẫn tương đối.
+- Tệp dữ liệu datasets đi kèm (đặt ngay trong thư mục với đường dẫn tương đối).
 
 *Ví dụ `scenarios/chatbot/`:*
 - `scenario.json`:
@@ -91,11 +91,13 @@ Mỗi kịch bản được tổ chức gọn gàng trong thư mục riêng, kh�
     "method": "POST",
     "headers": {
       "Content-Type": "application/json",
-      "Authorization": "Bearer {{.Token}}"
+      "Authorization": "Bearer {{.users.token}}"
     },
-    "body": "{\"prompt\": \"{{.Query}}\", \"stream\": true}",
-    "queries_file": "queries.txt",
-    "users_file": "users.csv",
+    "body": "{\"prompt\": {{quote .prompts}}, \"stream\": true}",
+    "datasets": {
+      "prompts": { "file": "queries.txt", "mode": "random" },
+      "users": { "file": "users.csv", "mode": "sequential" }
+    },
     "sse": { "end_marker": "[DONE]" }
   }
   ```

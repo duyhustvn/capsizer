@@ -119,8 +119,6 @@ func main() {
 		methodLegacy      = flag.String("method", "", "[Legacy alias] HTTP method cho kịch bản REST")
 		bodyLegacy        = flag.String("body", "", "[Legacy alias] chuỗi body gửi kèm cho request")
 		bodyFileLegacy    = flag.String("body-file", "", "[Legacy alias] file chứa body payload")
-		queriesFileLegacy = flag.String("queries", "", "[Legacy alias] đường dẫn file queries/prompts cho chatbot")
-		usersFileLegacy   = flag.String("users", "", "[Legacy alias] đường dẫn file users.csv")
 		cacheBustLegacy   = flag.Bool("cache-bust", false, "[Legacy alias] thêm tham số timestamp ngẫu nhiên chống cache")
 	)
 
@@ -155,8 +153,8 @@ func main() {
 
 		fmt.Fprintf(os.Stderr, "TÙY CHỌN RIÊNG CHO TỪNG KỊCH BẢN (-opt key=value):\n")
 		fmt.Fprintf(os.Stderr, "  -opt, -set, -param      Truyền tham số tùy biến cho kịch bản (dùng nhiều lần).\n")
-		fmt.Fprintf(os.Stderr, "                          Ví dụ cho 'chat-sse':\n")
-		fmt.Fprintf(os.Stderr, "                            -opt queries=queries.txt -opt users=users.csv -opt cache-bust=true\n")
+		fmt.Fprintf(os.Stderr, "                          Ví dụ nạp hoặc ghi đè Dataset:\n")
+		fmt.Fprintf(os.Stderr, "                            -opt dataset.prompts.file=queries.txt -opt dataset.users.file=users.csv\n")
 		fmt.Fprintf(os.Stderr, "                          Ví dụ cho REST API (sample-post, sample-get):\n")
 		fmt.Fprintf(os.Stderr, "                            -opt method=POST -opt body='{\"msg\":\"hi\"}' -opt body-file=req.json\n\n")
 
@@ -208,12 +206,6 @@ func main() {
 	}
 	if *bodyFileLegacy != "" {
 		scenarioOptions["body-file"] = *bodyFileLegacy
-	}
-	if *queriesFileLegacy != "" {
-		scenarioOptions["queries"] = *queriesFileLegacy
-	}
-	if *usersFileLegacy != "" {
-		scenarioOptions["users"] = *usersFileLegacy
 	}
 	if *cacheBustLegacy {
 		scenarioOptions["cache-bust"] = "true"

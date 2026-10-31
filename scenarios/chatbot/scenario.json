@@ -5,11 +5,19 @@
   "method": "POST",
   "headers": {
     "Content-Type": "application/json",
-    "Authorization": "Bearer {{.Token}}"
+    "Authorization": "Bearer {{.users.token}}"
   },
-  "body": "{\"prompt\": \"{{.Query}}\", \"stream\": true}",
-  "queries_file": "queries.txt",
-  "users_file": "users.csv",
+  "body": "{\"prompt\": {{quote .prompts}}, \"stream\": true}",
+  "datasets": {
+    "prompts": {
+      "file": "queries.txt",
+      "mode": "random"
+    },
+    "users": {
+      "file": "users.csv",
+      "mode": "sequential"
+    }
+  },
   "expected_status": [200],
   "sse": {
     "end_marker": "[DONE]"
