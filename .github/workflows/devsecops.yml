@@ -1,0 +1,193 @@
+name: DevSecOps Security & Build Pipeline
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+  schedule:
+    # Quét định kỳ lúc 03:00 UTC thứ Hai hàng tuần để phát hiện CVE mới
+    - cron: "0 3 * * 1"
+  workflow_dispatch: # Cho phép kích hoạt thủ công từ giao diện GitHub
+
+permissions:
+  contents: read
+  security-events: write # Ghi kết quả quét vào thẻ GitHub Security
+
+jobs:
+  # =============================================================
+  # 1. SECRET SCANNING: Chặn lộ lọt mật khẩu, token, private key
+  # =============================================================
+  secret-scan:
+    name: Secret Leak Detection (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Quét toàn bộ commit history
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+  # =============================================================
+  # 2. BACKEND SAST & SCA: Quét mã nguồn Go và kiểm tra lỗ hổng CVE
+  # =============================================================
+  backend-security:
+    name: Backend Security (Go SAST & Govulncheck)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: Go Vet (Phát hiện lỗi logic và syntax)
+        run: go vet ./...
+
+      - name: Run Unit Tests
+        run: go test -v ./...
+
+      # Gosec: Quét mã nguồn Go tìm lỗ hổng bảo mật
+      - name: Run Gosec (Go SAST)
+        uses: securego/gosec@master
+        with:
+          args: "-no-fail -fmt=sarif -out=gosec.sarif -exclude-dir=scenarios -exclude-dir=dist -exclude-dir=build ./..."
+        continue-on-error: true
+
+      # Govulncheck: Công cụ chính thức của Go Team quét CVE trong dependency
+      - name: Run Govulncheck (Go SCA)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+        continue-on-error: true
+
+      - name: Upload Gosec SARIF report
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: gosec.sarif
+
+  # =============================================================
+  # 3. BUILD & DEBIAN PACKAGE: Đóng gói và kiểm tra file .deb
+  # =============================================================
+  build-and-package:
+    name: Build & Debian Packaging (.deb)
+    runs-on: ubuntu-latest
+    needs: [backend-security]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: Build Debian Package
+        run: |
+          chmod +x packaging/build_deb.sh
+          ./packaging/build_deb.sh
+
+      - name: Test Installing .deb Package
+        run: |
+          sudo dpkg -i dist/capsizer_*.deb
+          capsizer --help
+          probe -h || true
+          report -h || true
+
+      - name: Upload Debian Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: capsizer-debian-package
+          path: dist/*.deb
+          retention-days: 30
+
+  # =============================================================
+  # 4. CONTAINER SECURITY: Lint Dockerfile & Quét lỗ hổng Image (Trivy)
+  # =============================================================
+  container-security:
+    name: Dockerfile Lint & Container Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Hadolint kiểm tra Dockerfile best practices
+      - name: Hadolint (Capsizer Dockerfile)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: "Dockerfile"
+          failure-threshold: "error"
+
+      - name: Hadolint (Sidecar Dockerfile)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: "profiling-sidecar/Dockerfile"
+          failure-threshold: "error"
+
+      # Build images cục bộ để quét
+      - name: Build Docker Images
+        run: |
+          docker build -t capsizer:ci-test .
+          docker build -t capsizer-sidecar:ci-test -f profiling-sidecar/Dockerfile .
+
+      # Trivy quét CVE tầng OS packages & libraries cho Runner Image
+      - name: Run Trivy Scan (Capsizer Runner)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "capsizer:ci-test"
+          format: "table"
+          exit-code: "0"
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH"
+
+      # Trivy quét CVE cho Sidecar Debug Image
+      - name: Run Trivy Scan (Profiling Sidecar)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "capsizer-sidecar:ci-test"
+          format: "table"
+          exit-code: "0"
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH"
+
+      # =========================================================
+      # 5. SINH FILE SBOM (SOFTWARE BILL OF MATERIALS)
+      # =========================================================
+      # Sinh SBOM chuẩn quốc tế CycloneDX cho Container Image
+      - name: Generate CycloneDX SBOM for Container Image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "capsizer:ci-test"
+          format: "cyclonedx"
+          output: "sbom-container.cdx.json"
+
+      # Sinh SBOM chuẩn quốc tế CycloneDX cho Repository Filesystem
+      - name: Generate CycloneDX SBOM for Repository Filesystem
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "cyclonedx"
+          output: "sbom-source.cdx.json"
+
+      # Upload file SBOM lên GitHub Actions Artifacts
+      - name: Upload SBOM Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom-cyclonedx-reports
+          path: |
+            sbom-container.cdx.json
+            sbom-source.cdx.json
+          retention-days: 30

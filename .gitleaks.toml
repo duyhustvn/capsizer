@@ -1,0 +1,17 @@
+# Gitleaks configuration for capsizer
+title = "Gitleaks Config"
+
+[allowlist]
+description = "Ignore build artifacts, benchmark logs, sample tokens, and scenarios"
+paths = [
+    '''(?i)\.(jsonl|csv|svg|deb|tar\.gz)$''',
+    '''(?i)(^|/)dist/.*''',
+    '''(?i)(^|/)build/.*''',
+    '''(?i)(^|/)bin/.*''',
+    '''(?i)(^|/)benchmark-results/.*''',
+    '''(?i)(^|/)scenarios/.*''',
+]
+regexes = [
+    '''(?i)loadtest-token''',
+    '''(?i)your-jwt-secret-key''',
+]
