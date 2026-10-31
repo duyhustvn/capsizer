@@ -714,7 +714,47 @@ setup_k8s_debug_container() {
   local HAS_DEBUG
   HAS_DEBUG=$(run_kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath="{.spec.ephemeralContainers[*].name}" 2>/dev/null || true)
   if echo "$HAS_DEBUG" | grep -qw "$DEBUG_CONTAINER_NAME"; then
-    echo "    ✓ Ephemeral container $DEBUG_CONTAINER_NAME đã sẵn sàng trong Pod."
+    # Container debug tồn tại nhưng terminated thì không exec được; ephemeral container
+    # không thể xóa khỏi pod -> buộc phải tạo lại pod để dọn sạch.
+    local dbg_state
+    dbg_state=$(run_kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath="{.status.ephemeralContainerStatuses[?(@.name=='$DEBUG_CONTAINER_NAME')].state}" 2>/dev/null || true)
+    if echo "$dbg_state" | grep -q '"running"'; then
+      echo "    ✓ Ephemeral container $DEBUG_CONTAINER_NAME đã sẵn sàng trong Pod."
+    else
+      echo "    ⚠ Ephemeral container $DEBUG_CONTAINER_NAME đã tồn tại nhưng terminated."
+      if [[ -z "$K8S_SELECTOR" ]]; then
+        echo "[ERROR] Không có K8S_SELECTOR để tạo lại Pod. Hãy xóa thủ công pod '$POD_NAME' rồi chạy lại." >&2
+        return 1
+      fi
+      local old_pod="$POD_NAME"
+      echo "      -> Đang xóa pod '$old_pod' để tạo lại (ephemeral container không thể gỡ riêng)..."
+      run_kubectl delete pod "$old_pod" -n "$NAMESPACE" --wait=false >/dev/null 2>&1 || true
+      POD_NAME=""
+      local wait_iter new_pod ready_cond
+      for wait_iter in {1..60}; do
+        new_pod=$(run_kubectl get pods -n "$NAMESPACE" -l "$K8S_SELECTOR" --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+        if [[ -n "$new_pod" && "$new_pod" != "$old_pod" ]]; then
+          ready_cond=$(run_kubectl get pod "$new_pod" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+          if [[ "$ready_cond" == "True" || "$ready_cond" == "true" ]]; then
+            POD_NAME="$new_pod"
+            break
+          fi
+          ready_cond=$(run_kubectl get pod "$new_pod" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+          if [[ "$ready_cond" == "true" ]]; then
+            POD_NAME="$new_pod"
+            break
+          fi
+        fi
+        sleep 5
+      done
+      if [[ -z "$POD_NAME" ]]; then
+        echo "[ERROR] Hết thời gian chờ pod mới Ready sau khi xóa '$old_pod'." >&2
+        return 1
+      fi
+      echo "    ✓ Pod mới đã sẵn sàng: $POD_NAME"
+      setup_k8s_debug_container
+      return $?
+    fi
   else
     echo "    Đang tạo cấu hình debug-root.yaml (runAsUser: 0, runAsNonRoot: false, SYS_PTRACE, SYS_ADMIN)..."
     local debug_yaml="/tmp/capsizer-debug-root.yaml"
