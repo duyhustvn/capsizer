@@ -286,18 +286,78 @@ func loadJSONDataset(name string, filePath string) ([]any, error) {
 	return records, nil
 }
 
+// resolveFilePath phân giải đường dẫn file hỗ trợ đầy đủ:
+// 1. Đường dẫn tuyệt đối (vd: /var/data/users.csv)
+// 2. Ký tự thư mục home '~' (vd: ~/data/users.csv)
+// 3. Biến môi trường hệ thống (vd: $DATA_DIR/users.csv, ${DATA_DIR}/items.json)
+// 4. Đường dẫn tương đối (vd: queries.txt, ./data/users.csv, ../shared/items.json)
+//    - Ưu tiên 1: Tương đối theo thư mục kịch bản baseDir
+//    - Ưu tiên 2: Tương đối theo thư mục làm việc hiện tại (working directory)
+func resolveFilePath(rawPath string, baseDir string) (string, error) {
+	if strings.TrimSpace(rawPath) == "" {
+		return "", errors.New("đường dẫn file rỗng")
+	}
+
+	// 1. Phân giải biến môi trường
+	p := os.ExpandEnv(strings.TrimSpace(rawPath))
+
+	// 2. Phân giải ký tự home directory '~'
+	if p == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			p = home
+		}
+	} else if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil {
+			p = filepath.Join(home, p[2:])
+		}
+	}
+
+	p = filepath.Clean(p)
+
+	// 3. Nếu là đường dẫn tuyệt đối (Absolute path)
+	if filepath.IsAbs(p) {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+		return "", fmt.Errorf("không tìm thấy file tuyệt đối: %s", p)
+	}
+
+	// 4. Nếu là đường dẫn tương đối (Relative path)
+	// Ưu tiên 1: Tương đối theo thư mục kịch bản (baseDir)
+	if baseDir != "" {
+		candidate := filepath.Clean(filepath.Join(baseDir, p))
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+
+	// Ưu tiên 2: Tương đối theo thư mục làm việc hiện tại (cwd)
+	if cwd, err := os.Getwd(); err == nil {
+		candidate := filepath.Clean(filepath.Join(cwd, p))
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+
+	// Không tìm thấy ở cả hai vị trí
+	var tested []string
+	if baseDir != "" {
+		tested = append(tested, filepath.Clean(filepath.Join(baseDir, p)))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		tested = append(tested, filepath.Clean(filepath.Join(cwd, p)))
+	}
+	return "", fmt.Errorf("không tìm thấy file tương đối '%s' (đã kiểm tra: %s)", rawPath, strings.Join(tested, ", "))
+}
+
 func loadDataset(name string, cfg DatasetConfig, baseDir string) (*Dataset, error) {
 	if cfg.File == "" {
 		return nil, fmt.Errorf("dataset '%s': thiếu trường 'file'", name)
 	}
 
-	filePath := cfg.File
-	if !filepath.IsAbs(filePath) {
-		filePath = filepath.Join(baseDir, filePath)
-	}
-
-	if _, err := os.Stat(filePath); err != nil {
-		return nil, fmt.Errorf("dataset '%s': không tìm thấy file %s: %w", name, filePath, err)
+	filePath, err := resolveFilePath(cfg.File, baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("dataset '%s': %w", name, err)
 	}
 
 	format := strings.ToLower(strings.TrimSpace(cfg.Format))
@@ -326,7 +386,6 @@ func loadDataset(name string, cfg DatasetConfig, baseDir string) (*Dataset, erro
 	}
 
 	var records []any
-	var err error
 
 	switch format {
 	case "csv":
@@ -358,6 +417,18 @@ func loadDataset(name string, cfg DatasetConfig, baseDir string) (*Dataset, erro
 func LoadDeclarativeScenario(targetPath string, params ScenarioParams) (*DeclarativeScenario, error) {
 	var jsonPath string
 	var baseDir string
+
+	targetPath = os.ExpandEnv(strings.TrimSpace(targetPath))
+	if targetPath == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			targetPath = home
+		}
+	} else if strings.HasPrefix(targetPath, "~/") || strings.HasPrefix(targetPath, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil {
+			targetPath = filepath.Join(home, targetPath[2:])
+		}
+	}
+	targetPath = filepath.Clean(targetPath)
 
 	fi, err := os.Stat(targetPath)
 	if err != nil {
@@ -424,16 +495,17 @@ func LoadDeclarativeScenario(targetPath string, params ScenarioParams) (*Declara
 		timeout = 120 * time.Second
 	}
 
-	// Nạp Body từ file nếu được chỉ định
+	// Nạp Body từ file nếu được chỉ định (hỗ trợ cả relative và absolute path)
 	if cfg.BodyFile != "" {
-		bPath := cfg.BodyFile
-		if !filepath.IsAbs(bPath) {
-			bPath = filepath.Join(baseDir, bPath)
+		bPath, err := resolveFilePath(cfg.BodyFile, baseDir)
+		if err != nil {
+			return nil, fmt.Errorf("body_file: %w", err)
 		}
 		bData, err := os.ReadFile(bPath)
-		if err == nil {
-			cfg.Body = string(bData)
+		if err != nil {
+			return nil, fmt.Errorf("body_file '%s': %w", bPath, err)
 		}
+		cfg.Body = string(bData)
 	}
 
 	// Parse templates

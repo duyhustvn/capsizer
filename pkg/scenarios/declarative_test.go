@@ -325,3 +325,111 @@ func TestMissingFileError(t *testing.T) {
 		t.Errorf("Error should mention missing file name, got: %v", err)
 	}
 }
+
+func TestPathResolution(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "capsizer-path-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	scDir := filepath.Join(tmpDir, "scenarios", "my-test")
+	sharedDir := filepath.Join(tmpDir, "scenarios", "shared")
+	subDir := filepath.Join(scDir, "subdata")
+	absDir := filepath.Join(tmpDir, "opt", "external")
+
+	for _, d := range []string{scDir, sharedDir, subDir, absDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 1. File trong shared (dùng relative path ../shared/users.csv)
+	if err := os.WriteFile(filepath.Join(sharedDir, "users.csv"), []byte("token\ntok-shared\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// 2. File trong subdata (dùng relative path subdata/items.txt)
+	if err := os.WriteFile(filepath.Join(subDir, "items.txt"), []byte("item-1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// 3. File ngoài (dùng absolute path)
+	absFile := filepath.Join(absDir, "config.json")
+	if err := os.WriteFile(absFile, []byte(`{"env": "prod"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// 4. File qua biến môi trường
+	envFile := filepath.Join(sharedDir, "env_prompts.txt")
+	if err := os.WriteFile(envFile, []byte("prompt from env\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MY_DATA_DIR", sharedDir)
+
+	// 5. Body payload file
+	bodyFile := filepath.Join(scDir, "payload.json")
+	if err := os.WriteFile(bodyFile, []byte(`{"test": true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	scenarioJSON := fmt.Sprintf(`{
+		"name": "path-test",
+		"type": "http",
+		"url": "http://127.0.0.1/test",
+		"body_file": "payload.json",
+		"datasets": {
+			"shared_users": {
+				"file": "../shared/users.csv"
+			},
+			"sub_items": {
+				"file": "subdata/items.txt"
+			},
+			"abs_config": {
+				"file": "%s"
+			},
+			"env_prompts": {
+				"file": "$MY_DATA_DIR/env_prompts.txt"
+			}
+		}
+	}`, absFile)
+
+	scPath := filepath.Join(scDir, "scenario.json")
+	if err := os.WriteFile(scPath, []byte(scenarioJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	sc, err := LoadDeclarativeScenario(scPath, ScenarioParams{})
+	if err != nil {
+		t.Fatalf("LoadDeclarativeScenario failed: %v", err)
+	}
+
+	if sc.cfg.Body != `{"test": true}` {
+		t.Errorf("Expected body_file to be resolved and loaded, got: %s", sc.cfg.Body)
+	}
+
+	// Verify all 4 datasets were resolved properly
+	if ds, ok := sc.datasets["shared_users"]; !ok || len(ds.Records) != 1 {
+		t.Errorf("Failed loading shared_users via relative path ../shared/users.csv")
+	}
+	if ds, ok := sc.datasets["sub_items"]; !ok || len(ds.Records) != 1 {
+		t.Errorf("Failed loading sub_items via subdata/items.txt")
+	}
+	if ds, ok := sc.datasets["abs_config"]; !ok || len(ds.Records) != 1 {
+		t.Errorf("Failed loading abs_config via absolute path %s", absFile)
+	}
+	if ds, ok := sc.datasets["env_prompts"]; !ok || len(ds.Records) != 1 {
+		t.Errorf("Failed loading env_prompts via $MY_DATA_DIR/env_prompts.txt")
+	}
+
+	// 6. Test ký tự tilde '~/'
+	homeDir, err := os.UserHomeDir()
+	if err == nil {
+		tildeFileName := fmt.Sprintf(".test_capsizer_%d.txt", os.Getpid())
+		tildeFilePath := filepath.Join(homeDir, tildeFileName)
+		if err := os.WriteFile(tildeFilePath, []byte("tilde data\n"), 0644); err == nil {
+			defer os.Remove(tildeFilePath)
+			resolved, err := resolveFilePath("~/"+tildeFileName, scDir)
+			if err != nil || resolved != tildeFilePath {
+				t.Errorf("Failed resolving tilde path: %v, got: %s, expected: %s", err, resolved, tildeFilePath)
+			}
+		}
+	}
+}

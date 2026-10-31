@@ -76,6 +76,23 @@ Hệ thống tự động nhận diện định dạng dựa vào phần mở r�
 - `"random"` *(Mặc định)*: Chọn ngẫu nhiên một bản ghi trong tập dữ liệu cho mỗi request. Phù hợp cho câu hỏi prompt, từ khóa tìm kiếm, sản phẩm ngẫu nhiên.
 - `"sequential"`: Cấp phát tuần tự xoay vòng (Round-Robin) lần lượt qua danh sách bản ghi, an toàn tuyệt đối đa luồng (`atomic.AddUint64`, lock-free 100%). Phù hợp cho danh sách Account/Token người dùng, đơn hàng cần đi theo trình tự.
 
+### 3.3. Hỗ trợ đường dẫn File linh hoạt (Relative & Absolute Path)
+
+Trường `"file"` trong `datasets` và trường `"body_file"` hỗ trợ toàn diện tất cả các kiểu đường dẫn:
+
+1. **Đường dẫn tương đối theo thư mục kịch bản (Scenario-relative)**:
+   - `"file": "users.csv"`: Tìm file nằm cùng thư mục với `scenario.json`.
+   - `"file": "subdata/items.jsonl"`: Tìm file trong thư mục con.
+   - `"file": "../shared/tokens.csv"`: Tìm file ở thư mục cha hoặc thư mục dùng chung giữa các scenarios.
+2. **Đường dẫn tương đối theo thư mục làm việc (Terminal Working Directory)**:
+   - Khi ghi đè qua CLI: `-opt dataset.users.file=./local_users.csv`, file được tìm kiếm theo thư mục bạn đang đứng gõ lệnh.
+3. **Đường dẫn tuyệt đối (Absolute path)**:
+   - `"file": "/var/data/users.csv"` hoặc `"file": "/data/test/prompts.txt"`.
+4. **Ký tự thư mục Home (`~`)**:
+   - `"file": "~/data/prompts.txt"`: Tự động phân giải thành thư mục home của người dùng hiện tại.
+5. **Biến môi trường hệ thống (`$ENV` / `${ENV}`)**:
+   - `"file": "$DATA_DIR/users.csv"` hoặc `"file": "${SHARED_PATH}/items.jsonl"`.
+
 ---
 
 ## 4. Các biến Template và Helper Functions có sẵn
