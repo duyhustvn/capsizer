@@ -89,3 +89,14 @@ type EvalRow struct {
 	Ok         bool
 	KneeReason string
 }
+
+// AnalysisReport lưu kết quả tổng hợp sau khi chạy phân tích.
+type AnalysisReport struct {
+	KneeRPS      float64
+	HasKnee      bool
+	KneeReason   string
+	LastOkRPS    float64
+	LastP95Ms    float64
+	TheoreticalC float64
+	ReportText   string
+}

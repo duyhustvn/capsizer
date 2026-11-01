@@ -2,12 +2,37 @@ package analyzer
 
 import (
 	"fmt"
+	"io"
 	"math"
+	"os"
 	"strings"
 )
 
-// RunAnalysis phân tích toàn bộ dữ liệu từ ramp và probe, in bảng báo cáo và kết luận.
+// RunAnalysis phân tích toàn bộ dữ liệu từ ramp và probe, in bảng báo cáo và kết luận ra os.Stdout.
 func RunAnalysis(ramp []RampRecord, probe []ProbeRecord) error {
+	_, err := RunAnalysisTo(ramp, probe, os.Stdout)
+	return err
+}
+
+// Analyze phân tích dữ liệu và trả về cấu trúc kết quả AnalysisReport (không in ra stdout).
+func Analyze(ramp []RampRecord, probe []ProbeRecord) (*AnalysisReport, error) {
+	var buf strings.Builder
+	report, err := RunAnalysisTo(ramp, probe, &buf)
+	if err != nil {
+		return nil, err
+	}
+	report.ReportText = buf.String()
+	return report, nil
+}
+
+// RunAnalysisTo phân tích dữ liệu và ghi kết quả dạng text vào io.Writer được chỉ định.
+func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*AnalysisReport, error) {
+	if out == nil {
+		out = io.Discard
+	}
+	printf := func(format string, a ...interface{}) { fmt.Fprintf(out, format, a...) }
+	println := func(a ...interface{}) { fmt.Fprintln(out, a...) }
+
 	var meta *ProbeRecord
 	for i := range probe {
 		if probe[i].Type == "probe_meta" {
@@ -31,7 +56,7 @@ func RunAnalysis(ramp []RampRecord, probe []ProbeRecord) error {
 
 	wins := BuildWindows(ramp, stepSeconds)
 	if len(wins) == 0 {
-		return fmt.Errorf("không tìm thấy bậc nào trong file ramp")
+		return nil, fmt.Errorf("không tìm thấy bậc nào trong file ramp")
 	}
 
 	var (
@@ -58,55 +83,55 @@ func RunAnalysis(ramp []RampRecord, probe []ProbeRecord) error {
 		}
 	}
 
-	fmt.Println(strings.Repeat("=", 142))
-	fmt.Println("                             CAPSIZER - KẾT QUẢ ĐỊNH CHUẨN HIỆU NĂNG & NĂNG LỰC")
-	fmt.Println(strings.Repeat("=", 142))
+	println(strings.Repeat("=", 142))
+	println("                             CAPSIZER - KẾT QUẢ ĐỊNH CHUẨN HIỆU NĂNG & NĂNG LỰC")
+	println(strings.Repeat("=", 142))
 	if meta != nil {
 		if quota != nil {
 			if *quota == math.Trunc(*quota) {
-				fmt.Printf("CPU Quota Cores : %.1f core\n", *quota)
+				printf("CPU Quota Cores : %.1f core\n", *quota)
 			} else {
-				fmt.Printf("CPU Quota Cores : %g core\n", *quota)
+				printf("CPU Quota Cores : %g core\n", *quota)
 			}
 		} else {
-			fmt.Println("CPU Quota Cores : không giới hạn (unlimited)")
+			println("CPU Quota Cores : không giới hạn (unlimited)")
 		}
 		nprocStr := "None"
 		if meta.NProcVisible != nil {
 			nprocStr = fmt.Sprintf("%d", *meta.NProcVisible)
 		}
-		fmt.Printf("NProc nhìn thấy : %s (core của Node, không phải quota)\n", nprocStr)
+		printf("NProc nhìn thấy : %s (core của Node, không phải quota)\n", nprocStr)
 		execStr := "None"
 		if meta.DefaultExecutorMaxWorkers != nil {
 			execStr = fmt.Sprintf("%d", *meta.DefaultExecutorMaxWorkers)
 		}
-		fmt.Printf("Executor Threads: %s / worker\n", execStr)
+		printf("Executor Threads: %s / worker\n", execStr)
 		if workersSeen > 0 {
-			fmt.Printf("Workers quan sát: %d worker\n", workersSeen)
+			printf("Workers quan sát: %d worker\n", workersSeen)
 		}
 	}
 
 	if baselineCPU != nil {
-		fmt.Printf("CPU Nền (khi rỗi): %.3f core (%d mẫu / %.0fs)\n", *baselineCPU, baseCPUN, baseCPUSpan)
+		printf("CPU Nền (khi rỗi): %.3f core (%d mẫu / %.0fs)\n", *baselineCPU, baseCPUN, baseCPUSpan)
 		if baseCPUSpan < 90 {
-			fmt.Printf("  LƯU Ý: Cửa sổ đo nền chỉ %.0fs. Cửa sổ ngắn có thể làm baseline nhảy giữa các lần chạy.\n", baseCPUSpan)
+			printf("  LƯU Ý: Cửa sổ đo nền chỉ %.0fs. Cửa sổ ngắn có thể làm baseline nhảy giữa các lần chạy.\n", baseCPUSpan)
 		}
 	} else if len(probe) > 0 {
-		fmt.Printf("CPU Nền          : KHÔNG đo được (%d mẫu trước bậc đầu, cần >= 3)\n", baseCPUN)
+		printf("CPU Nền          : KHÔNG đo được (%d mẫu trước bậc đầu, cần >= 3)\n", baseCPUN)
 	}
 
 	if baselineRAM != nil {
-		fmt.Printf("RAM Nền (khi rỗi): %.1f MB (%d mẫu)\n", *baselineRAM, baseRAMN)
+		printf("RAM Nền (khi rỗi): %.1f MB (%d mẫu)\n", *baselineRAM, baseRAMN)
 	}
 
-	fmt.Println()
+	println()
 
 	// In header bảng kết quả (có bổ sung cột RAM)
 	cols := fmt.Sprintf("%6s %7s %5s %4s %8s %8s %6s %7s %7s %7s %7s %6s %6s %8s %5s  verdict",
 		"offer", "achiev", "ok", "err", "ttftP50", "ttftP95",
 		"cores", "C_ms", "ramMB", "pkRAM", "dRAM", "thr%", "acptQ", "hlthP99", "thrd")
-	fmt.Println(cols)
-	fmt.Println(strings.Repeat("-", 142))
+	println(cols)
+	println(strings.Repeat("-", 142))
 
 	var rows []EvalRow
 	var noisy []float64
@@ -261,7 +286,7 @@ func RunAnalysis(ramp []RampRecord, probe []ProbeRecord) error {
 			KneeReason: strings.Join(reasons, ", "),
 		})
 
-		fmt.Printf("%6s %7s %5d %4d %8s %8s %6s %7s %7s %7s %7s %6s %6s %8s %5s  %s\n",
+		printf("%6s %7s %5d %4d %8s %8s %6s %7s %7s %7s %7s %6s %6s %8s %5s  %s\n",
 			FmtNum(&w.RPS, 1),
 			FmtNum(&achieved, 1),
 			len(okReqs),
@@ -281,12 +306,12 @@ func RunAnalysis(ramp []RampRecord, probe []ProbeRecord) error {
 		)
 	}
 
-	fmt.Println(strings.Repeat("=", 142))
-	fmt.Println("                                           KẾT LUẬN & ĐỊNH CHUẨN")
-	fmt.Println(strings.Repeat("=", 142))
+	println(strings.Repeat("=", 142))
+	println("                                           KẾT LUẬN & ĐỊNH CHUẨN")
+	println(strings.Repeat("=", 142))
 
 	// 1. Phân tích CPU
-	fmt.Println("▶ 1. ĐỊNH CHUẨN CPU & THROUGHPUT:")
+	println("▶ 1. ĐỊNH CHUẨN CPU & THROUGHPUT:")
 	var healthyC []float64
 	var lastOk []EvalRow
 	var knees []EvalRow
@@ -306,32 +331,32 @@ func RunAnalysis(ramp []RampRecord, probe []ProbeRecord) error {
 
 	if len(healthyC) > 0 {
 		c := Median(healthyC)
-		fmt.Printf("  • C (trung vị các bậc còn khoẻ)    : %.1f ms CPU / request\n", c)
-		fmt.Printf("  • Trần lý thuyết 1 worker (1 core)  : %.1f req/s\n", 1000.0/c)
+		printf("  • C (trung vị các bậc còn khoẻ)    : %.1f ms CPU / request\n", c)
+		printf("  • Trần lý thuyết 1 worker (1 core)  : %.1f req/s\n", 1000.0/c)
 		if workersSeen > 1 {
-			fmt.Printf("  • Trần lý thuyết %d worker (%d core) : %.1f req/s\n", workersSeen, workersSeen, float64(workersSeen)*1000.0/c)
+			printf("  • Trần lý thuyết %d worker (%d core) : %.1f req/s\n", workersSeen, workersSeen, float64(workersSeen)*1000.0/c)
 		}
 		if quota != nil && *quota > 0 {
-			fmt.Printf("  • Trần lý thuyết Pod (%g core quota): %.1f req/s\n", *quota, (*quota)*1000.0/c)
+			printf("  • Trần lý thuyết Pod (%g core quota): %.1f req/s\n", *quota, (*quota)*1000.0/c)
 			recWorkers := int(math.RoundToEven(*quota))
 			if recWorkers < 1 {
 				recWorkers = 1
 			}
-			fmt.Printf("  • Số worker hợp lý khuyến nghị      : %d worker (= quota)\n", recWorkers)
+			printf("  • Số worker hợp lý khuyến nghị      : %d worker (= quota)\n", recWorkers)
 			if workersSeen > 0 && workersSeen < recWorkers {
-				fmt.Printf("    ⚠️ CẢNH BÁO: Số worker đang chạy (%d) thấp hơn CPU quota (%g core). Cần nâng lên %d worker để khai thác hết quota.\n",
+				printf("    ⚠️ CẢNH BÁO: Số worker đang chạy (%d) thấp hơn CPU quota (%g core). Cần nâng lên %d worker để khai thác hết quota.\n",
 					workersSeen, *quota, recWorkers)
 			}
 		}
 	} else if !anyOk {
-		fmt.Println("  • Chưa có bậc nào 'OK' -> Hãy hạ dải --steps xuống rồi đo lại.")
+		println("  • Chưa có bậc nào 'OK' -> Hãy hạ dải --steps xuống rồi đo lại.")
 	} else {
-		fmt.Println("  • Có bậc còn khoẻ nhưng không tính được C -> Thiếu file --probe hoặc probe chưa phủ trùng thời gian.")
+		println("  • Có bậc còn khoẻ nhưng không tính được C -> Thiếu file --probe hoặc probe chưa phủ trùng thời gian.")
 	}
 
 	if len(lastOk) > 0 {
 		lastOkRPS := lastOk[len(lastOk)-1].RPS
-		fmt.Printf("  • Bậc cao nhất còn đạt chuẩn SLO   : %g req/s\n", lastOkRPS)
+		printf("  • Bậc cao nhất còn đạt chuẩn SLO   : %g req/s\n", lastOkRPS)
 		var nextKnees []EvalRow
 		for _, r := range rows {
 			if !r.Ok && r.RPS > lastOkRPS {
@@ -339,32 +364,62 @@ func RunAnalysis(ramp []RampRecord, probe []ProbeRecord) error {
 			}
 		}
 		if len(nextKnees) > 0 {
-			fmt.Printf("  • Điểm gãy quan sát được (KNEE)     : %g req/s (Nguyên nhân: %s)\n", nextKnees[0].RPS, nextKnees[0].KneeReason)
+			printf("  • Điểm gãy quan sát được (KNEE)     : %g req/s (Nguyên nhân: %s)\n", nextKnees[0].RPS, nextKnees[0].KneeReason)
 		} else {
-			fmt.Println("  • Chưa chạm điểm gãy sau bậc khoẻ cuối -> Có thể tăng tiếp dải --steps để tìm trần chịu tải.")
+			println("  • Chưa chạm điểm gãy sau bậc khoẻ cuối -> Có thể tăng tiếp dải --steps để tìm trần chịu tải.")
 		}
 	} else if len(knees) > 0 {
-		fmt.Printf("  • Điểm gãy quan sát được            : %g req/s (Nguyên nhân: %s)\n", knees[0].RPS, knees[0].KneeReason)
+		printf("  • Điểm gãy quan sát được            : %g req/s (Nguyên nhân: %s)\n", knees[0].RPS, knees[0].KneeReason)
 	}
 
 	// 2. Phân tích RAM (BỔ SUNG MỚI)
-	fmt.Println("\n▶ 2. ĐỊNH CHUẨN BỘ NHỚ (RAM / MEMORY):")
+	println("\n▶ 2. ĐỊNH CHUẨN BỘ NHỚ (RAM / MEMORY):")
 	memRec := AnalyzeMemory(baselineRAM, rows)
 	if memRec != nil {
-		fmt.Printf("  • RAM nền (Baseline khi không tải) : %.1f MB\n", memRec.BaseMB)
-		fmt.Printf("  • RAM đỉnh quan sát được khi tải   : %.1f MB\n", memRec.PeakObservedMB)
-		fmt.Printf("  • Mức tăng RAM tối đa do tải (ΔRAM): %.1f MB\n", math.Max(0.0, memRec.PeakObservedMB-memRec.BaseMB))
-		fmt.Printf("  • Khuyến nghị cấu hình Kubernetes Pod:\n")
-		fmt.Printf("      - resources.requests.memory    : %.0fMi\n", memRec.RecommendedReqMB)
-		fmt.Printf("      - resources.limits.memory      : %.0fMi (bao gồm 30%% buffer chống OOM-Killed)\n", memRec.RecommendedLimMB)
+		printf("  • RAM nền (Baseline khi không tải) : %.1f MB\n", memRec.BaseMB)
+		printf("  • RAM đỉnh quan sát được khi tải   : %.1f MB\n", memRec.PeakObservedMB)
+		printf("  • Mức tăng RAM tối đa do tải (ΔRAM): %.1f MB\n", math.Max(0.0, memRec.PeakObservedMB-memRec.BaseMB))
+		printf("  • Khuyến nghị cấu hình Kubernetes Pod:\n")
+		printf("      - resources.requests.memory    : %.0fMi\n", memRec.RecommendedReqMB)
+		printf("      - resources.limits.memory      : %.0fMi (bao gồm 30%% buffer chống OOM-Killed)\n", memRec.RecommendedLimMB)
 		if memRec.HasGrowthTrend {
-			fmt.Println("    ⚠️ CẢNH BÁO RÒ RỈ RAM: Mức RAM đỉnh liên tục tăng qua các bậc tải và không giảm.")
-			fmt.Println("       Hãy kiểm tra nguy cơ rò rỉ bộ nhớ (connection leak / unbounded cache / buffer tích lũy).")
+			println("    ⚠️ CẢNH BÁO RÒ RỈ RAM: Mức RAM đỉnh liên tục tăng qua các bậc tải và không giảm.")
+			println("       Hãy kiểm tra nguy cơ rò rỉ bộ nhớ (connection leak / unbounded cache / buffer tích lũy).")
 		}
 	} else {
-		fmt.Println("  • Không có dữ liệu đo RAM trong file probe (chưa đọc được memory cgroup).")
+		println("  • Không có dữ liệu đo RAM trong file probe (chưa đọc được memory cgroup).")
 	}
 
-	fmt.Println()
-	return nil
+	println()
+
+	report := &AnalysisReport{}
+	if len(lastOk) > 0 {
+		report.LastOkRPS = lastOk[len(lastOk)-1].RPS
+		var nextKnees []EvalRow
+		for _, r := range rows {
+			if !r.Ok && r.RPS > report.LastOkRPS {
+				nextKnees = append(nextKnees, r)
+			}
+		}
+		if len(nextKnees) > 0 {
+			report.HasKnee = true
+			report.KneeRPS = nextKnees[0].RPS
+			report.KneeReason = nextKnees[0].KneeReason
+		}
+	} else if len(knees) > 0 {
+		report.HasKnee = true
+		report.KneeRPS = knees[0].RPS
+		report.KneeReason = knees[0].KneeReason
+	}
+	if len(rows) > 0 {
+		lastRow := rows[len(rows)-1]
+		if lastRow.P95 != nil {
+			report.LastP95Ms = *lastRow.P95
+		}
+	}
+	if len(healthyC) > 0 {
+		report.TheoreticalC = Median(healthyC)
+	}
+
+	return report, nil
 }

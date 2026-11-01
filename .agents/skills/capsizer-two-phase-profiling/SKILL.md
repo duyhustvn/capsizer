@@ -117,27 +117,41 @@ Mỗi kịch bản được tổ chức gọn gàng trong thư mục riêng, kh�
 
 ---
 
-## 2. Quy trình Thực thi của Agent
+## 2. Quy trình Thực thi của Agent (Golang CLI & Scripts)
 
-### Trường hợp 1: Chạy một kịch bản đơn lẻ
+Hệ thống hỗ trợ cả bộ điều phối chuẩn **Golang Core CLI (`capsizer`)** lẫn Bash script:
+
+### Trường hợp 1: Chạy một kịch bản đơn lẻ (Single Scenario)
 Agent kích hoạt kịch bản theo tên thư mục:
 ```bash
+# Cách 1: Bằng Golang Core CLI (Khuyến nghị)
+./bin/capsizer run --scenario chatbot
+
+# Cách 2: Bằng Bash Script
 ./.agents/skills/capsizer-two-phase-profiling/scripts/run_two_phase.sh --scenario chatbot
 ```
-*(Script sẽ tự động tìm nạp `scenarios/chatbot/scenario.env` + `scenario.json`, tự động đồng bộ file kịch bản và dữ liệu lên máy phát tải từ xa qua SSH).*
+*(Hệ thống sẽ tự động tìm nạp `scenarios/chatbot/scenario.env` + `scenario.json`, tự động đồng bộ file kịch bản và dữ liệu lên máy phát tải từ xa qua SSH).*
 
 ### Trường hợp 2: Kiểm tra kết nối trước khi chạy (Preflight Check)
 ```bash
+# Bằng Golang CLI:
+./bin/capsizer check --scenario chatbot
+
+# Bằng Bash Script:
 ./.agents/skills/capsizer-two-phase-profiling/scripts/run_two_phase.sh --scenario chatbot --check
 ```
 
 ### Trường hợp 3: Chạy TỰ ĐỘNG HÀNG LOẠT nhiều kịch bản (Batch Runner)
 Khi người dùng yêu cầu: *"Hãy chạy kiểm thử tải lần lượt cả chatbot, sample-post và sample-get"*:
 ```bash
+# Bằng Golang CLI:
+./bin/capsizer batch chatbot sample-post sample-get
+
+# Bằng Bash Script:
 ./.agents/skills/capsizer-two-phase-profiling/scripts/run_batch.sh chatbot sample-post sample-get
 ```
 Hoặc quét và chạy toàn bộ kịch bản có trong thư mục `scenarios/`:
 ```bash
-./.agents/skills/capsizer-two-phase-profiling/scripts/run_batch.sh
+./bin/capsizer batch
 ```
 Sau khi hoàn thành tất cả các kịch bản, Agent sẽ đọc file tổng hợp `batch_summary.txt` để đưa ra bảng so sánh hiệu năng và năng lực tổng thể của tất cả các service cho người dùng.
