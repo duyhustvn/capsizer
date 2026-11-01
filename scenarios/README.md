@@ -11,7 +11,7 @@ Mỗi kịch bản được đóng gói trong một thư mục riêng biệt:
 ```text
 scenarios/my-api-test/
 ├── scenario.json       # [Bắt buộc] Khai báo chi tiết request, headers, body, datasets, logic SSE/REST
-├── scenario.env        # [Tùy chọn] Cấu hình bậc tải (STEPS), hạ tầng profiling (K8S_SELECTOR, PROFILE_TYPE)
+├── scenario.env        # [Tùy chọn] Cấu hình bậc tải (STEPS), hạ tầng profiling (K8S_SELECTOR, SET_POD_CPU, PROFILE_TYPE)
 ├── payload.json        # [Tùy chọn] File template body payload nếu không viết inline trong JSON
 ├── queries.txt         # [Tùy chọn] File dữ liệu dòng (Text lines)
 ├── users.csv           # [Tùy chọn] File dữ liệu người dùng (CSV)
@@ -215,3 +215,22 @@ capsizer-ramp -scenario ./scenarios/chatbot \
   -opt prompts=/tmp/test_prompts.txt \
   -steps 10,20
 ```
+
+---
+
+## 8. Cấu trúc file `scenario.env` (Hạ tầng & Thực thi)
+
+File `scenario.env` dùng để khai báo các tham số môi trường và điều phối hạ tầng K8s cho kịch bản khi chạy qua Skill / `run_two_phase.sh`:
+
+| Biến môi trường | Mặc định | Mô tả |
+| :--- | :--- | :--- |
+| `K8S_SELECTOR` | `""` | Label selector để tự động tìm Pod mục tiêu trên cụm K8s (vd: `"app=chatbot"`). |
+| `SET_POD_CPU` | `""` | Tự động điều chỉnh CPU của Pod/Deployment về mức chỉ định (vd: `"1"` hoặc `"1000m"`) trước khi đo. Hệ thống tự động truy vết ra Deployment cha qua `ownerReferences` (không cần khai báo thêm `K8S_DEPLOYMENT`) và tự động hoàn nguyên về CPU ban đầu sau khi kết thúc. |
+| `RESTORE_POD_CPU`| `"true"` | Tự động hoàn nguyên CPU ban đầu sau khi chạy xong (hoặc khi bị gián đoạn). Đặt `"false"` nếu muốn giữ nguyên mức CPU mới. |
+| `PROFILE_TYPE` | `"pyspy"` | Công cụ profiling: `"pyspy"`, `"perf"`, `"pyspy,perf"` hoặc `"all"`. |
+| `TARGET_PORT` | `""` | Cổng TCP nội bộ của Pod (tự động bóc tách từ `url` nếu để trống). |
+| `STEPS` | `"2,4,8,16,32"` | Dải bậc RPS phát tải. |
+| `STEP_SECONDS` | `30` | Thời gian chạy cho mỗi bậc tải (giây). |
+| `BASELINE_WAIT`| `60` | Thời gian chờ đo CPU/RAM nền trước bậc 1 (giây). |
+| `COOLDOWN` | `15` | Thời gian nghỉ giữa các bậc tải (giây). |
+

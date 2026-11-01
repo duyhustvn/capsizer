@@ -41,7 +41,7 @@ flowchart TD
     ScenariosDir -.-> Skill
 
     Skill ==>|"1. SSH scp binary & scenario.json"| Ramp
-    Skill ==>|"2. SSH sudo kubectl chui vào Pod"| K8sServer
+    Skill ==>|"2. SSH sudo kubectl hạ CPU 1 core & chui vào Pod"| K8sServer
     K8sServer -.->|"gắn sidecar & đo"| Sidecar
     Ramp ==>|"3. Bắn tải Open-Loop HTTP / SSE"| App
     Sidecar -.->|"Lấy mẫu CPU, RAM, TCP"| App
@@ -77,6 +77,8 @@ Mỗi kịch bản được tổ chức gọn gàng trong thư mục riêng, kh�
 - `scenario.env`: **[Thông số thực thi & K8s]**
   - `STEPS`, `STEP_SECONDS`, `BASELINE_WAIT`, `COOLDOWN`: Dải bậc tải và thời gian.
   - `K8S_SELECTOR`: Label selector tìm Pod mục tiêu (vd: `app=chatbot`).
+  - `SET_POD_CPU` *(Khuyến nghị)*: Tự động đưa CPU Pod về 1 core (`"1"` hoặc `"1000m"`) để tìm điểm gãy chính xác và đo chuẩn $C$ của 1 worker. Tự động nhận diện Deployment cha qua `ownerReferences` (không cần khai báo thêm `K8S_DEPLOYMENT`) và tự động hoàn nguyên về CPU ban đầu sau khi kết thúc.
+  - `RESTORE_POD_CPU` *(Tùy chọn)*: Mặc định `true` (tự hoàn nguyên CPU cũ). Đặt `false` nếu muốn giữ nguyên mức 1 core sau khi chạy.
   - `PROFILE_TYPE`: Hỗ trợ đơn lẻ (`pyspy`, `perf`) hoặc **đa profiler chạy tuần tự** (`pyspy,perf` hoặc `all`) để triệt tiêu nhiễu mẫu (Probe Effect), xuất riêng từng file `flamegraph_knee_<RPS>rps_<prof>.svg`.
   - `TARGET_PORT` *(Tùy chọn)*: Mặc định tự động bóc tách từ `url` trong `scenario.json`. Chỉ cần khai báo khi cổng nội bộ Pod khác với cổng của Ingress/Gateway bên ngoài.
 - Tệp dữ liệu datasets đi kèm (đặt ngay trong thư mục với đường dẫn tương đối).
@@ -104,6 +106,7 @@ Mỗi kịch bản được tổ chức gọn gàng trong thư mục riêng, kh�
 - `scenario.env`:
   ```bash
   K8S_SELECTOR="app=chatbot"
+  SET_POD_CPU="1"                    # Tự động hạ CPU Pod về 1 core & khôi phục khi kết thúc
   PROFILE_TYPE="pyspy,perf"          # Chạy tuần tự py-spy (Python stack) rồi perf (Kernel/C++ stack)
   # TARGET_PORT="8000"               # Tùy chọn (chỉ bật khi đi qua Ingress cổng 443 -> Pod cổng 8000)
   STEPS="2,4,8,16,32"

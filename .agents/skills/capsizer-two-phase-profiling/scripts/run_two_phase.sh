@@ -75,6 +75,14 @@ PORT="${TARGET_PORT:-8000}"
 TARGET_PID=""
 PROFILE_TYPE="${PROFILE_TYPE:-pyspy}" # pyspy hoặc perf
 OUT_DIR="${PROJECT_ROOT}/benchmark-results/$(date +%Y%m%d_%H%M%S)"
+SET_POD_CPU="${SET_POD_CPU:-}"
+RESTORE_POD_CPU="${RESTORE_POD_CPU:-true}"
+WORKLOAD_CPU_MODIFIED=false
+TARGET_WORKLOAD_TYPE=""
+TARGET_WORKLOAD_NAME=""
+TARGET_CONTAINER_IDX=0
+ORIG_CONTAINER_RESOURCES_JSON=""
+CLEANED_UP=false
 
 EXTRA_OPTS=()
 ONLY_CHECK=false
@@ -114,6 +122,8 @@ load_scenario_env() {
     if [[ -n "${PROFILE_TYPE:-}" ]]; then PROFILE_TYPE="$PROFILE_TYPE"; fi
     if [[ -n "${TARGET_PORT:-}" ]]; then PORT="$TARGET_PORT"; fi
     if [[ -n "${K8S_SELECTOR:-}" && -z "${POD_NAME:-}" ]]; then K8S_SELECTOR="$K8S_SELECTOR"; fi
+    if [[ -n "${SET_POD_CPU:-}" ]]; then SET_POD_CPU="$SET_POD_CPU"; fi
+    if [[ -n "${RESTORE_POD_CPU:-}" ]]; then RESTORE_POD_CPU="$RESTORE_POD_CPU"; fi
 
     # Tự động chuyển file path tương đối thành tuyệt đối dựa vào thư mục kịch bản
     if [[ -n "${BODY_FILE:-}" && ! "$BODY_FILE" = /* && -f "$env_dir/$BODY_FILE" ]]; then
@@ -197,6 +207,8 @@ while [[ $# -gt 0 ]]; do
     --port) PORT="$2"; EXPLICIT_PORT=true; shift 2 ;;
     --pid) TARGET_PID="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
+    --set-pod-cpu) SET_POD_CPU="$2"; shift 2 ;;
+    --no-restore-cpu) RESTORE_POD_CPU="false"; shift 1 ;;
 
     # Máy phát tải
     --loadgen-mode) LOADGEN_MODE="$2"; shift 2 ;;
@@ -266,6 +278,8 @@ while [[ $# -gt 0 ]]; do
       echo "  --pod <pod_name>            Tên Pod mục tiêu trên K8s"
       echo "  --selector <label>          Label selector để tự động tìm Pod (vd: app=chatbot)"
       echo "  --container <name>          Tên container chứa app trong Pod (để debug target)"
+      echo "  --set-pod-cpu <cores>       Tự động đưa CPU Pod về số core chỉ định (ví dụ: 1 hoặc 1000m) trước khi đo"
+      echo "  --no-restore-cpu            Không tự động khôi phục cấu hình CPU ban đầu sau khi kết thúc"
       echo "  --k8s-mode <mode>           'debug' (gắn Ephemeral container), 'sidecar', hoặc 'cp' (default: $K8S_MODE)"
       echo "  --sidecar-image <image>     Image profiling sidecar (default: $SIDECAR_IMAGE)"
       echo "  --sidecar-container <name>  Tên container sidecar có sẵn (default: $SIDECAR_CONTAINER)"
@@ -381,6 +395,192 @@ resolve_target_pod() {
   fi
   return 0
 }
+
+# ==============================================================================
+# HÀM PHÁT HIỆN VÀ ĐIỀU CHỈNH CPU POD (SCALE TO 1 CORE & AUTO-RESTORE)
+# ==============================================================================
+detect_target_workload() {
+  TARGET_WORKLOAD_TYPE=""
+  TARGET_WORKLOAD_NAME=""
+
+  if [[ -z "$POD_NAME" ]]; then
+    return 1
+  fi
+
+  local owner_kind owner_name
+  owner_kind=$(run_kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].kind}' 2>/dev/null || true)
+  owner_name=$(run_kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].name}' 2>/dev/null || true)
+  if [[ -z "$owner_kind" ]]; then
+    owner_kind=$(run_kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null || true)
+    owner_name=$(run_kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[0].name}' 2>/dev/null || true)
+  fi
+
+  if [[ "$owner_kind" == "ReplicaSet" ]]; then
+    local rs_owner_kind rs_owner_name
+    rs_owner_kind=$(run_kubectl get rs "$owner_name" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].kind}' 2>/dev/null || true)
+    rs_owner_name=$(run_kubectl get rs "$owner_name" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].name}' 2>/dev/null || true)
+    if [[ -z "$rs_owner_kind" ]]; then
+      rs_owner_kind=$(run_kubectl get rs "$owner_name" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null || true)
+      rs_owner_name=$(run_kubectl get rs "$owner_name" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[0].name}' 2>/dev/null || true)
+    fi
+    if [[ "$rs_owner_kind" == "Deployment" ]]; then
+      TARGET_WORKLOAD_TYPE="deployment"
+      TARGET_WORKLOAD_NAME="$rs_owner_name"
+    fi
+  elif [[ "$owner_kind" == "Deployment" ]]; then
+    TARGET_WORKLOAD_TYPE="deployment"
+    TARGET_WORKLOAD_NAME="$owner_name"
+  elif [[ "$owner_kind" == "StatefulSet" ]]; then
+    TARGET_WORKLOAD_TYPE="statefulset"
+    TARGET_WORKLOAD_NAME="$owner_name"
+  fi
+
+  # Fallback: tìm qua K8S_SELECTOR nếu không tìm thấy qua ownerReferences
+  if [[ -z "$TARGET_WORKLOAD_NAME" && -n "$K8S_SELECTOR" ]]; then
+    local found_dep
+    found_dep=$(run_kubectl get deployment -n "$NAMESPACE" -l "$K8S_SELECTOR" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    if [[ -n "$found_dep" ]]; then
+      TARGET_WORKLOAD_TYPE="deployment"
+      TARGET_WORKLOAD_NAME="$found_dep"
+    fi
+  fi
+
+  [[ -n "$TARGET_WORKLOAD_NAME" ]]
+}
+
+apply_workload_cpu() {
+  if [[ -z "${SET_POD_CPU:-}" ]]; then
+    return 0
+  fi
+
+  if [[ -z "$POD_NAME" ]]; then
+    echo "    [CẢNH BÁO] Không tìm thấy Pod mục tiêu để xác định Workload cha cần cấu hình CPU." >&2
+    return 0
+  fi
+
+  echo ""
+  echo "================================================================================"
+  echo "==> [Cấu hình CPU] Đang phát hiện Workload quản lý Pod '$POD_NAME'..."
+
+  # 1. Xác định Container mục tiêu
+  if [[ -z "$CONTAINER_NAME" ]]; then
+    CONTAINER_NAME=$(run_kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.containers[0].name}' 2>/dev/null || true)
+  fi
+
+  # 2. Phát hiện Controller quản lý
+  if ! detect_target_workload; then
+    echo "    [CẢNH BÁO] Không thể tự động phát hiện Deployment/StatefulSet quản lý Pod '$POD_NAME'."
+    echo "               Bỏ qua bước cấu hình CPU xuống ${SET_POD_CPU} core."
+    echo "================================================================================"
+    return 0
+  fi
+
+  echo "    ✓ Đã phát hiện Workload: ${TARGET_WORKLOAD_TYPE}/${TARGET_WORKLOAD_NAME} (Container: ${CONTAINER_NAME:-default})"
+
+  # 3. Tìm chỉ số container_idx trong .spec.template.spec.containers
+  local idx=0
+  TARGET_CONTAINER_IDX=0
+  local cname
+  while IFS= read -r cname; do
+    [[ -z "$cname" ]] && continue
+    if [[ "$cname" == "$CONTAINER_NAME" ]]; then
+      TARGET_CONTAINER_IDX=$idx
+      break
+    fi
+    idx=$((idx + 1))
+  done < <(run_kubectl get "$TARGET_WORKLOAD_TYPE" "$TARGET_WORKLOAD_NAME" -n "$NAMESPACE" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null || true)
+
+  # 4. Lưu lại cấu hình tài nguyên ban đầu của container
+  ORIG_CONTAINER_RESOURCES_JSON=$(run_kubectl get "$TARGET_WORKLOAD_TYPE" "$TARGET_WORKLOAD_NAME" -n "$NAMESPACE" -o jsonpath="{.spec.template.spec.containers[${TARGET_CONTAINER_IDX}].resources}" 2>/dev/null || true)
+  if [[ -z "$ORIG_CONTAINER_RESOURCES_JSON" ]]; then
+    ORIG_CONTAINER_RESOURCES_JSON="{}"
+  fi
+  echo "    • Cấu hình tài nguyên ban đầu: $ORIG_CONTAINER_RESOURCES_JSON"
+
+  # 5. Cấu hình CPU mới
+  echo "    • Đang cấu hình CPU về '${SET_POD_CPU}' core (limits & requests)..."
+  local c_arg=()
+  if [[ -n "$CONTAINER_NAME" ]]; then
+    c_arg=(-c "$CONTAINER_NAME")
+  fi
+
+  if run_kubectl set resources "${TARGET_WORKLOAD_TYPE}/${TARGET_WORKLOAD_NAME}" -n "$NAMESPACE" "${c_arg[@]}" --limits=cpu="$SET_POD_CPU" --requests=cpu="$SET_POD_CPU" >/dev/null 2>&1; then
+    WORKLOAD_CPU_MODIFIED=true
+    echo "    • Đang chờ rollout cập nhật Pod mới..."
+    run_kubectl rollout status "${TARGET_WORKLOAD_TYPE}/${TARGET_WORKLOAD_NAME}" -n "$NAMESPACE" --timeout=180s >/dev/null 2>&1 || true
+
+    # 6. Re-resolve target pod sau khi rollout hoàn tất
+    echo "    • Đang cập nhật Pod mục tiêu mới sau rollout..."
+    POD_NAME=""
+    local wait_iter new_pod ready_cond
+    for wait_iter in {1..30}; do
+      if [[ -n "$K8S_SELECTOR" ]]; then
+        new_pod=$(run_kubectl get pods -n "$NAMESPACE" -l "$K8S_SELECTOR" --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+      else
+        resolve_target_pod >/dev/null 2>&1 || true
+        new_pod="$POD_NAME"
+      fi
+      if [[ -n "$new_pod" ]]; then
+        ready_cond=$(run_kubectl get pod "$new_pod" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+        if [[ "$ready_cond" == "True" || "$ready_cond" == "true" ]]; then
+          POD_NAME="$new_pod"
+          break
+        fi
+      fi
+      sleep 2
+    done
+    echo "    ✓ Pod mới đã sẵn sàng cho đo đạc: $POD_NAME (CPU: ${SET_POD_CPU} core)"
+  else
+    echo "    [CẢNH BÁO] Không thể cập nhật resources qua 'kubectl set resources'. Bỏ qua." >&2
+  fi
+  echo "================================================================================"
+}
+
+restore_workload_cpu() {
+  if [[ "${WORKLOAD_CPU_MODIFIED:-false}" != "true" || "${RESTORE_POD_CPU:-true}" != "true" ]]; then
+    return 0
+  fi
+
+  echo ""
+  echo "================================================================================"
+  echo "==> [Khôi phục Hạ tầng] Đang khôi phục cấu hình CPU ban đầu cho ${TARGET_WORKLOAD_TYPE}/${TARGET_WORKLOAD_NAME}..."
+  
+  if [[ -n "${ORIG_CONTAINER_RESOURCES_JSON:-}" && -n "${TARGET_WORKLOAD_NAME:-}" ]]; then
+    local patch_payload
+    local c_idx="${TARGET_CONTAINER_IDX:-0}"
+    patch_payload="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/${c_idx}/resources\", \"value\": ${ORIG_CONTAINER_RESOURCES_JSON}}]"
+    if run_kubectl patch "$TARGET_WORKLOAD_TYPE" "$TARGET_WORKLOAD_NAME" -n "$NAMESPACE" --type=json -p "$patch_payload" >/dev/null 2>&1; then
+      echo "    ✓ Đã gửi lệnh khôi phục qua JSON patch."
+      echo "    Đang chờ rollout hoàn tất..."
+      run_kubectl rollout status "${TARGET_WORKLOAD_TYPE}/${TARGET_WORKLOAD_NAME}" -n "$NAMESPACE" --timeout=180s >/dev/null 2>&1 || true
+      echo "    ✓ Khôi phục thành công ${TARGET_WORKLOAD_TYPE}/${TARGET_WORKLOAD_NAME} về tài nguyên ban đầu: ${ORIG_CONTAINER_RESOURCES_JSON}"
+    else
+      echo "    [CẢNH BÁO] Không thể tự động khôi phục cấu hình CPU. Hãy kiểm tra thủ công!" >&2
+    fi
+  fi
+  WORKLOAD_CPU_MODIFIED=false
+  echo "================================================================================"
+}
+
+cleanup() {
+  if [[ "$CLEANED_UP" == "true" ]]; then
+    return
+  fi
+  CLEANED_UP=true
+
+  if [[ -n "${PROBE_PID:-}" ]]; then
+    kill -INT "$PROBE_PID" 2>/dev/null || true
+  fi
+
+  if [[ -n "${LOADGEN_BG_PID:-}" ]]; then
+    kill -INT "$LOADGEN_BG_PID" 2>/dev/null || true
+  fi
+
+  if [[ "${WORKLOAD_CPU_MODIFIED:-false}" == "true" && "${RESTORE_POD_CPU:-true}" == "true" ]]; then
+    restore_workload_cpu
+  fi
+}
+trap cleanup EXIT INT TERM
 
 # ==============================================================================
 # HÀM KẾT NỐI VÀ ĐIỀU PHỐI MÁY PHÁT TẢI (MACHINE 2: LOAD GENERATOR)
@@ -510,6 +710,14 @@ preflight_check() {
     else
       echo "      [CẢNH BÁO] Pod ${NAMESPACE}/${POD_NAME} có trạng thái: '$pod_status' (chưa phải Running)."
     fi
+
+    if [[ -n "$SET_POD_CPU" ]]; then
+      if detect_target_workload; then
+        echo "      ✓ Đã nhận diện Workload cha: ${TARGET_WORKLOAD_TYPE}/${TARGET_WORKLOAD_NAME} (sẵn sàng điều chỉnh CPU: ${SET_POD_CPU} core)"
+      else
+        echo "      [CẢNH BÁO] Không thể nhận diện Deployment/StatefulSet từ Pod ${POD_NAME} để điều chỉnh CPU."
+      fi
+    fi
   fi
 
   echo "================================================================================"
@@ -551,6 +759,9 @@ else
 fi
 echo "Endpoint nhận request : $URL (Scenario: $SCENARIO)"
 echo "Dải bậc tải           : $STEPS (Mỗi bậc: ${STEP_SECONDS}s, Cooldown: ${COOLDOWN}s)"
+if [[ -n "$SET_POD_CPU" ]]; then
+  echo "Cấu hình CPU Pod      : Tự động đưa về ${SET_POD_CPU} core (Khôi phục khi xong: ${RESTORE_POD_CPU})"
+fi
 echo "Thư mục output        : $OUT_DIR"
 echo "================================================================================"
 
@@ -898,6 +1109,11 @@ copy_to_target() {
     run_kubectl cp "$LOCAL_PATH" "${NAMESPACE}/${POD_NAME}:${REMOTE_PATH}" $C_FLAG 2>/dev/null || true
   fi
 }
+
+# ==============================================================================
+# ĐIỀU CHỈNH TÀI NGUYÊN POD (SCALE CPU TO 1 CORE NẾU CẤU HÌNH)
+# ==============================================================================
+apply_workload_cpu
 
 # ==============================================================================
 # KHỞI CHẠY THIẾT LẬP MÁY BẮN TẢI
