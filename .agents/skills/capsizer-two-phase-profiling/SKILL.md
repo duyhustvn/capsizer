@@ -88,18 +88,19 @@ Mỗi kịch bản được tổ chức gọn gàng trong thư mục riêng:
 
 Bộ điều phối Golang (`pkg/orchestrator/runner.go` & `pkg/orchestrator/k8s.go`) xử lý tự động hoàn toàn vòng đời Pod qua 2 Pha:
 
-1. **Trước Pha 1 (Chuẩn bị & Health Gate)**:
+1. **Trước Pha 1 (Chuẩn bị, Health Gate & Business Warm-up)**:
    - Hạ CPU Workload về `SET_POD_CPU` (nếu cấu hình), gắn Ephemeral Debug Container (`capsizer-debugger`) với quyền root (`runAsNonRoot: false`), biên dịch tĩnh và đồng bộ `/tmp/probe` mới nhất (đọc đúng cgroup của container ứng dụng qua `/proc/<pid>/root/sys/fs/cgroup`).
-   - Chạy **Health Gate (`waitAppStable`)**: Poll `/health/live` qua `probe -once` cho đến khi đạt `3` lần liên tiếp `health_code: 200` (tối đa `90s`) để đảm bảo ứng dụng đã warm-up xong trước khi lấy mẫu nền.
+   - Chạy **Health Gate (`waitAppStable`)**: Poll `/health/live` qua `probe -once` cho đến khi đạt `3` lần liên tiếp `health_code: 200` (tối đa `90s`).
+   - Chạy **Business Warm-up (`warmupApplication`)**: Bắn request mồi thật từ kịch bản (`0.5 req/s`) để ép ứng dụng hoàn tất mọi tác vụ khởi tạo lười (như giải nén model `langid`/`bz2.decompress`, nạp từ điển BM25, mở DB pool) cho đến khi `TTFT` ổn định trước khi bắt đầu đo Pha 1.
 2. **Trong Pha 1 (Giữ nguyên Probes gốc & Stream thời gian thực)**:
    - Giữ nguyên `livenessProbe` / `readinessProbe` thực tế của Production để phát hiện trung thực bậc tải làm ứng dụng bị nghẽn hoặc bị K8s Liveness kill.
-   - Luồng `probe.jsonl` được stream thời gian thực về máy chạy Skill (kèm vòng lặp auto-retry `2s` và ticker đồng bộ dự phòng + kiểm tra trạng thái container mỗi `10s`). Nếu container ứng dụng bị K8s Liveness/OOM kill giữa Pha 1, `./bin/capsizer` bảo toàn toàn bộ mẫu `probe.jsonl` đến giây cuối cùng, dừng sớm Pha 1 và ghi nhận điểm gãy (`KneeRPS`).
-3. **Trước Pha 2 (Tự động Nới lỏng `livenessProbe` & `readinessProbe` — Phương án 1)**:
-   - Khi chuyển sang Pha 2 để bắn tải duy trì tại bậc `KneeRPS` (nơi ứng dụng từng bị nghẽn/kill ở Pha 1), `./bin/capsizer` tự động gọi `RelaxWorkloadProbes`:
+   - Luồng `probe.jsonl` được stream thời gian thực về máy chạy Skill (kèm vòng lặp auto-retry `2s` và ticker đồng bộ dự phòng + kiểm tra trạng thái container mỗi `10s`).
+   - Bộ phân tích `pkg/analyzer` đánh giá 2 chiều: tự động lọc nhiễu cold-start ở bậc đầu (nếu có), kết hợp tiêu chí nhảy vọt độ trễ (`ttftP50 >= 4x` nền) và ngưỡng CFS CPU throttling thực tế trên 1 core để xác định chính xác `KneeRPS` và `ProfileRPS` (vùng ứng dụng còn sống và đang chịu áp lực thật).
+3. **Trước Pha 2 (Tự động Nới lỏng `livenessProbe` & `readinessProbe` + Warm-up lại Pod mới)**:
+   - Khi chuyển sang Pha 2, `./bin/capsizer` tự động gọi `RelaxWorkloadProbes`:
      - Sao lưu nguyên vẹn JSON gốc của `livenessProbe` và `readinessProbe`.
      - Patch tạm thời `failureThreshold: 60` và `timeoutSeconds: 10` (nếu `< 10s`) cho cả `livenessProbe` và `readinessProbe`.
-     - Chờ Pod mới rollout `Ready` $\rightarrow$ gắn lại `capsizer-debugger` & `/tmp/probe` $\rightarrow$ chờ `waitAppStable` (`2` lần `/health/live = 200` liên tiếp).
-   - Nhờ đó, trong suốt quá trình bắn tải `KneeRPS` và chạy tuần tự `py-spy` (30s) + `perf` (30s), Kubelet **không kill Pod lần 2** và **không rút Pod khỏi Service Endpoints**.
+     - Chờ Pod mới rollout `Ready` $\rightarrow$ gắn lại `capsizer-debugger` & `/tmp/probe` $\rightarrow$ chờ `waitAppStable` $\rightarrow$ **chạy lại `warmupApplication` (bắn request kịch bản thật)** để Pod mới ấm hoàn toàn trước khi bật `py-spy` (30s) và `perf` (30s) tại `ProfileRPS`.
 4. **Khi kết thúc (hoặc nhấn `Ctrl+C`)**:
    - Cơ chế `defer` gọi `RestoreWorkloadState` gộp cả `resources` (CPU) lẫn `livenessProbe` và `readinessProbe` gốc vào **1 lệnh JSON patch nguyên tử duy nhất**, khôi phục hoàn toàn cấu hình ban đầu của Workload chỉ trong 1 lần rollout.
 

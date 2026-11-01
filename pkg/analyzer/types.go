@@ -2,11 +2,14 @@ package analyzer
 
 // Các ngưỡng nhận diện điểm nghẽn hệ thống (saturation point).
 const (
-	KneeAchievedRatio = 0.90   // Throughput thực tế đạt được < 90% mức yêu cầu
-	KneeAcceptQueue   = 1      // Hàng đợi TCP socket lắng nghe có kết nối chờ xử lý
-	KneeAcceptSamples = 3      // Số mẫu tối thiểu thấy accept queue > 0 (chống false knee 1 mẫu)
-	KneeHealthMs      = 1000.0 // Độ trễ /health/live vượt quá 1000ms (event loop tắc nghẽn)
-	KneeThrottlePct   = 5.0    // Tỷ lệ chu kỳ CPU bị bóp nghẽn CFS quota > 5%
+	KneeAchievedRatio   = 0.90   // Throughput thực tế đạt được < 90% mức yêu cầu
+	KneeAcceptQueue     = 1      // Hàng đợi TCP socket lắng nghe có kết nối chờ xử lý
+	KneeAcceptSamples   = 3      // Số mẫu tối thiểu thấy accept queue > 0 (chống false knee 1 mẫu)
+	KneeHealthMs        = 1000.0 // Độ trễ /health/live vượt quá 1000ms (event loop tắc nghẽn)
+	KneeThrottlePct     = 15.0   // Tỷ lệ chu kỳ CPU bị bóp nghẽn CFS quota kèm suy giảm hiệu năng
+	KneeThrottleHardPct = 50.0   // Tỷ lệ chu kỳ CPU bị bóp nghẽn CFS quota nghiêm trọng (> 50%)
+	KneeTTFTJumpRatio   = 4.0    // Hệ số tăng vọt độ trễ TTFT p50 so với bậc khỏe tốt nhất (>= 4x)
+	KneeTTFTMinMs       = 1000.0 // Ngưỡng sàn TTFT p50 tối thiểu (ms) để kết luận suy giảm độ trễ
 )
 
 // RampRecord đại diện cho một bản ghi trong file loadtest-ramp.jsonl.
@@ -68,31 +71,35 @@ type StepWindow struct {
 
 // EvalRow lưu kết quả tính toán chi tiết của từng bậc kiểm thử.
 type EvalRow struct {
-	RPS        float64
-	Achieved   float64
-	OkCount    int
-	ErrCount   int
-	P50        *float64
-	P95        *float64
-	P99        *float64
-	Cores      *float64
-	CMs        *float64
-	BaseRAMMB  *float64
-	AvgRAMMB   *float64
-	PeakRAMMB  *float64
-	DeltaRAMMB *float64
-	HealthP99  *float64
-	AccQueue   *int
-	Throttle   *float64
-	Threads    *int
-	FDs        *int
-	Ok         bool
-	KneeReason string
+	RPS         float64
+	Achieved    float64
+	OkCount     int
+	ErrCount    int
+	Abandoned   int
+	AcptSamples int
+	P50         *float64
+	P95         *float64
+	P99         *float64
+	Cores       *float64
+	CMs         *float64
+	BaseRAMMB   *float64
+	AvgRAMMB    *float64
+	PeakRAMMB   *float64
+	DeltaRAMMB  *float64
+	HealthP99   *float64
+	AccQueue    *int
+	Throttle    *float64
+	Threads     *int
+	FDs         *int
+	Ok          bool
+	IsColdStart bool
+	KneeReason  string
 }
 
 // AnalysisReport lưu kết quả tổng hợp sau khi chạy phân tích.
 type AnalysisReport struct {
 	KneeRPS      float64
+	ProfileRPS   float64
 	HasKnee      bool
 	KneeReason   string
 	LastOkRPS    float64

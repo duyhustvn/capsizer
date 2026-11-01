@@ -255,6 +255,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
+	// 4.5. Làm nóng ứng dụng bằng request kịch bản thật (tránh cold-start như giải nén langid/BM25 ở bậc đầu Pha 1)
+	r.warmupApplication(ctx, r.toolContainer())
+
 	// 5. [PHA 1] Đo Capacity Sizing sạch (Ramp + Probe)
 	fmt.Println("\n▶ [PHA 1] KHỞI ĐỘNG ĐO CAPACITY SIZING SẠCH (KHÔNG BẬT PROFILER)...")
 
@@ -538,6 +541,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		if !report.HasKnee && report.LastOkRPS > 0 {
 			report.HasKnee = true
 			report.KneeRPS = report.LastOkRPS
+			report.ProfileRPS = report.LastOkRPS
 			report.KneeReason = cDetail
 		}
 	}
@@ -556,9 +560,17 @@ func (r *Runner) Run(ctx context.Context) error {
 		return nil
 	}
 
+	profRPS := report.ProfileRPS
+	if profRPS <= 0 {
+		profRPS = report.KneeRPS
+	}
+
 	// 6. [PHA 2] Chẩn đoán sâu tại Knee Point
 	fmt.Println("\n================================================================================")
 	fmt.Printf("⚠️ PHÁT HIỆN ĐIỂM GÃY TẠI MỨC TẢI: %.1f req/s\n", report.KneeRPS)
+	if profRPS != report.KneeRPS {
+		fmt.Printf("🎯 MỨC TẢI PROFILING PHA 2      : %.1f req/s (vùng ứng dụng còn sống và chịu áp lực thực tế)\n", profRPS)
+	}
 	fmt.Println("▶ [PHA 2] TỰ ĐỘNG CHUYỂN SANG CHẨN ĐOÁN NGUYÊN NHÂN SÂU (FLAMEGRAPH)...")
 	fmt.Println("================================================================================")
 
@@ -601,6 +613,8 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 				execContainer = r.toolContainer()
 				r.waitAppStable(ctx, execContainer, 2, 60*time.Second)
+				// Làm nóng lại Pod mới vừa rollout bằng request kịch bản thật để tránh chụp nhầm cold-start (bz2.decompress / langid)
+				r.warmupApplication(ctx, execContainer)
 			} else {
 				fmt.Println("    • Workload không khai báo livenessProbe/readinessProbe, bỏ qua bước patch Probes.")
 			}
@@ -639,6 +653,9 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 			}
 			r.waitAppStable(ctx, execContainer, 2, 60*time.Second)
+			if podCrashedInPhase1.Load() {
+				r.warmupApplication(ctx, execContainer)
+			}
 		}
 	}
 
@@ -663,7 +680,7 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	go func() {
 		defer close(bgDone)
-		kneeStr := fmt.Sprintf("%.1f", report.KneeRPS)
+		kneeStr := fmt.Sprintf("%.1f", profRPS)
 		_ = r.runLoadgen(bgCtx, kneeStr, totalDuration, 0, 0, phase2RampLog, true)
 	}()
 
@@ -671,8 +688,8 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	generatedSVGs := []string{}
 	for _, prof := range profilers {
-		fmt.Printf("\n--> [PROFILING: %s] Đang lấy mẫu %ds trong container '%s'...\n", prof, profDuration, execContainer)
-		localSVG := filepath.Join(r.cfg.OutDir, fmt.Sprintf("flamegraph_knee_%.0frps_%s.svg", report.KneeRPS, prof))
+		fmt.Printf("\n--> [PROFILING: %s] Đang lấy mẫu %ds trong container '%s' (tại %.1f req/s)...\n", prof, profDuration, execContainer, profRPS)
+		localSVG := filepath.Join(r.cfg.OutDir, fmt.Sprintf("flamegraph_knee_%.0frps_%s.svg", profRPS, prof))
 		remoteSVG := fmt.Sprintf("/tmp/flamegraph_%s.svg", prof)
 
 		if r.cfg.K8sPod != "" {
@@ -868,6 +885,62 @@ func (r *Runner) waitAppStable(ctx context.Context, execContainer string, requir
 
 	fmt.Printf("    [CẢNH BÁO] Hết thời gian chờ %ds nhưng ứng dụng chưa đạt %d lần /health/live 200 liên tiếp (streak: %d/%d). Tiếp tục chạy...\n",
 		int(timeout.Seconds()), requiredStreak, streak, requiredStreak)
+}
+
+// warmupApplication bắn một loạt request thật từ kịch bản ở tần suất thấp (0.5 req/s trong 10s, tối đa 2 vòng)
+// để kích hoạt trước các tác vụ khởi tạo lười (lazy-init như giải nén model langid/bz2, nạp từ điển BM25, kết nối DB)
+// cho đến khi độ trễ TTFT ổn định trước khi bước vào đo đạc chính thức hoặc chạy Profiler.
+func (r *Runner) warmupApplication(ctx context.Context, execContainer string) {
+	if ctx.Err() != nil {
+		return
+	}
+	fmt.Println("==> [Warm-up Nghiệp vụ] Đang bắn request mồi thật (0.5 req/s) để khởi tạo sẵn model/cache (tránh nhiễu cold-start như langid/BM25)...")
+	warmupLog := filepath.Join(r.cfg.OutDir, "warmup-ramp.jsonl")
+
+	for round := 1; round <= 2; round++ {
+		if ctx.Err() != nil {
+			return
+		}
+		_ = r.runLoadgen(ctx, "0.5", 10, 0, 0, warmupLog, true)
+		if r.cfg.LoadgenMode == "remote" && r.loadSSH != nil {
+			remoteLog := fmt.Sprintf("%s/current-ramp.jsonl", r.cfg.LoadgenDir)
+			_ = r.loadSSH.DownloadFile(ctx, remoteLog, warmupLog)
+		}
+
+		recs, err := analyzer.LoadRamp(warmupLog)
+		if err != nil {
+			break
+		}
+
+		var ttfts []float64
+		for _, rec := range recs {
+			if rec.Type != "run_meta" && rec.Ok && rec.TtftMs != nil {
+				ttfts = append(ttfts, *rec.TtftMs)
+			}
+		}
+
+		if len(ttfts) >= 2 {
+			firstTTFT := ttfts[0]
+			lastTTFT := ttfts[len(ttfts)-1]
+			prevTTFT := ttfts[len(ttfts)-2]
+			if (lastTTFT < 2000 && prevTTFT < 2000) || (firstTTFT > 3000 && lastTTFT < firstTTFT/3) || round == 2 {
+				fmt.Printf("    ✓ Warm-up hoàn tất (vòng %d, %d req OK: TTFT đầu=%.0fms -> cuối=%.0fms).\n",
+					round, len(ttfts), firstTTFT, lastTTFT)
+				break
+			}
+			fmt.Printf("    • Vòng warm-up %d: ứng dụng vừa nạp model (TTFT đầu=%.0fms -> cuối=%.0fms), chạy thêm 1 vòng ngắn để ổn định hẳn...\n",
+				round, firstTTFT, lastTTFT)
+		} else if round < 2 {
+			fmt.Printf("    • Vòng warm-up %d: mới hoàn tất %d request (model đang khởi tạo), chạy thêm 1 vòng ngắn...\n",
+				round, len(ttfts))
+		}
+	}
+
+	// Chờ 3s để CPU/queue hạ nhiệt hoàn toàn sau warm-up và xác nhận lại /health/live = 200
+	time.Sleep(3 * time.Second)
+	if r.cfg.K8sPod != "" && execContainer != "" {
+		r.waitAppStable(ctx, execContainer, 2, 30*time.Second)
+	}
 }
 
 func (r *Runner) ensureLinuxBinary(name, pkgPath string) (string, error) {

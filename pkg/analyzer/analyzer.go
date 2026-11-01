@@ -225,36 +225,11 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 
 		achieved := float64(len(okReqs)) / dur
 
-		// Đánh giá Knee
-		var reasons []string
-		if achieved < KneeAchievedRatio*w.RPS {
-			reasons = append(reasons, fmt.Sprintf("achieved<%.0f%%", KneeAchievedRatio*100.0))
-		}
-		if acptSamples >= KneeAcceptSamples {
-			reasons = append(reasons, fmt.Sprintf("acptQ>=%d(%dx)", KneeAcceptQueue, acptSamples))
-		}
-		if healthP99 != nil && *healthP99 > KneeHealthMs {
-			reasons = append(reasons, fmt.Sprintf("hlth>%.0fms", KneeHealthMs))
-		}
-		if thrPct != nil && *thrPct > KneeThrottlePct {
-			reasons = append(reasons, fmt.Sprintf("thr>%.0f%%", KneeThrottlePct))
-		}
-
 		abandoned := 0
 		for _, r := range reqs {
 			if r.Err != nil && *r.Err == "abandoned" {
 				abandoned++
 			}
-		}
-		if abandoned > 0 {
-			reasons = append(reasons, fmt.Sprintf("abandoned=%d", abandoned))
-		}
-
-		verdict := "OK"
-		isOk := true
-		if len(reasons) > 0 {
-			isOk = false
-			verdict = "KNEE (" + strings.Join(reasons, ", ") + ")"
 		}
 
 		var accInt *int
@@ -264,22 +239,24 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 		}
 
 		rows = append(rows, EvalRow{
-			RPS:        w.RPS,
-			Achieved:   achieved,
-			OkCount:    len(okReqs),
-			ErrCount:   len(reqs) - len(okReqs),
-			P50:        Pct(ttfts, 50),
-			P95:        Pct(ttfts, 95),
-			P99:        Pct(ttfts, 99),
-			Cores:      cores,
-			CMs:        cMs,
-			BaseRAMMB:  baselineRAM,
-			AvgRAMMB:   memStats.AvgMB,
-			PeakRAMMB:  memStats.PeakMB,
-			DeltaRAMMB: memStats.DeltaMB,
-			HealthP99:  healthP99,
-			AccQueue:   accInt,
-			Throttle:   thrPct,
+			RPS:         w.RPS,
+			Achieved:    achieved,
+			OkCount:     len(okReqs),
+			ErrCount:    len(reqs) - len(okReqs),
+			Abandoned:   abandoned,
+			AcptSamples: acptSamples,
+			P50:         Pct(ttfts, 50),
+			P95:         Pct(ttfts, 95),
+			P99:         Pct(ttfts, 99),
+			Cores:       cores,
+			CMs:         cMs,
+			BaseRAMMB:   baselineRAM,
+			AvgRAMMB:    memStats.AvgMB,
+			PeakRAMMB:   memStats.PeakMB,
+			DeltaRAMMB:  memStats.DeltaMB,
+			HealthP99:   healthP99,
+			AccQueue:    accInt,
+			Throttle:    thrPct,
 			FDs: func() *int {
 				if fdmax == nil {
 					return nil
@@ -294,26 +271,114 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 				v := int(*thrd)
 				return &v
 			}(),
-			Ok:         isOk,
-			KneeReason: strings.Join(reasons, ", "),
+			Ok: true,
 		})
+	}
+
+	// Pass 2: Tìm mức độ trễ TTFT p50 khỏe tốt nhất (bestP50) và nhận diện hiện tượng Cold-Start ở bậc đầu tiên
+	bestP50 := 0.0
+	for i := range rows {
+		r := &rows[i]
+		if r.Achieved >= KneeAchievedRatio*r.RPS && r.Abandoned == 0 && r.P50 != nil && *r.P50 > 0 {
+			if bestP50 == 0 || *r.P50 < bestP50 {
+				bestP50 = *r.P50
+			}
+		}
+	}
+
+	// Nếu bậc đầu tiên (rows[0]) có TTFT p50 cao gấp > 3 lần một bậc tải cao hơn phía sau (mà bậc sau vẫn đạt throughput & 0 abandoned),
+	// thì bậc đầu tiên bị nhiễu bởi Cold-Start (ví dụ giải nén model langid/BM25 ở request đầu tiên).
+	if len(rows) >= 2 && rows[0].P50 != nil && *rows[0].P50 >= KneeTTFTMinMs && rows[0].Abandoned == 0 {
+		for j := 1; j < len(rows); j++ {
+			if rows[j].P50 != nil && *rows[j].P50 > 0 &&
+				rows[j].Achieved >= KneeAchievedRatio*rows[j].RPS && rows[j].Abandoned == 0 &&
+				*rows[0].P50 >= 3.0*(*rows[j].P50) {
+				rows[0].IsColdStart = true
+				break
+			}
+		}
+	}
+
+	// Đánh giá Knee và in từng dòng kết quả
+	for i := range rows {
+		r := &rows[i]
+		var reasons []string
+
+		if r.Achieved < KneeAchievedRatio*r.RPS {
+			reasons = append(reasons, fmt.Sprintf("achieved<%.0f%%", KneeAchievedRatio*100.0))
+		}
+		if r.AcptSamples >= KneeAcceptSamples {
+			reasons = append(reasons, fmt.Sprintf("acptQ>=%d(%dx)", KneeAcceptQueue, r.AcptSamples))
+		}
+		if r.HealthP99 != nil && *r.HealthP99 > KneeHealthMs {
+			reasons = append(reasons, fmt.Sprintf("hlth>%.0fms", KneeHealthMs))
+		}
+
+		// Phát hiện độ trễ TTFT p50 tăng vọt đột biến (>= 4x so với bậc khỏe tốt nhất và >= 1000ms)
+		ttftDegraded := false
+		if !r.IsColdStart && bestP50 > 0 && r.P50 != nil {
+			if *r.P50 >= math.Max(KneeTTFTMinMs, KneeTTFTJumpRatio*bestP50) {
+				ttftDegraded = true
+				reasons = append(reasons, fmt.Sprintf("ttftP50>=%.0fx", *r.P50/bestP50))
+			}
+		}
+
+		// Đánh giá CPU Throttling:
+		// Trên Pod 1 core, đa luồng burst ngắn thường tạo throttle 10-30% dù CPU trung bình chưa kịch trần và TTFT vẫn rất thấp.
+		// Chỉ tính là Knee do throttle khi:
+		//   1) Throttle > 50% (nghiêm trọng), HOẶC
+		//   2) Throttle > 15% kèm theo CPU đạt >= 85% quota hoặc TTFT đã suy giảm (>= 2.5x bestP50 và >= 500ms).
+		if !r.IsColdStart && r.Throttle != nil {
+			thr := *r.Throttle
+			highCPU := quota != nil && *quota > 0 && r.Cores != nil && *r.Cores >= 0.85*(*quota)
+			moderateTTFTJump := bestP50 > 0 && r.P50 != nil && *r.P50 >= math.Max(500.0, 2.5*bestP50)
+			if thr > KneeThrottleHardPct || (thr > KneeThrottlePct && (highCPU || ttftDegraded || moderateTTFTJump)) {
+				reasons = append(reasons, fmt.Sprintf("thr>%.0f%%", KneeThrottlePct))
+			}
+		}
+
+		if r.Abandoned > 0 {
+			reasons = append(reasons, fmt.Sprintf("abandoned=%d", r.Abandoned))
+		}
+
+		verdict := "OK"
+		isOk := true
+		if len(reasons) > 0 {
+			isOk = false
+			verdict = "KNEE (" + strings.Join(reasons, ", ") + ")"
+		} else if r.IsColdStart {
+			verdict = "OK (cold-start)"
+		}
+
+		r.Ok = isOk
+		r.KneeReason = strings.Join(reasons, ", ")
+
+		var accFloat, thrdFloat *float64
+		if r.AccQueue != nil {
+			v := float64(*r.AccQueue)
+			accFloat = &v
+		}
+		if r.Threads != nil {
+			v := float64(*r.Threads)
+			thrdFloat = &v
+		}
 
 		printf("%6s %7s %5d %4d %8s %8s %6s %7s %7s %7s %7s %6s %6s %8s %5s  %s\n",
-			FmtNum(&w.RPS, 1),
-			FmtNum(&achieved, 1),
-			len(okReqs),
-			len(reqs)-len(okReqs),
-			FmtNum(Pct(ttfts, 50), 1),
-			FmtNum(Pct(ttfts, 95), 1),
-			FmtNum(cores, 2),
-			FmtNum(cMs, 1),
-			FmtNum(memStats.AvgMB, 0),
-			FmtNum(memStats.PeakMB, 0),
-			FmtNum(memStats.DeltaMB, 0),
-			FmtNum(thrPct, 1),
-			FmtNum(acceptq, 0),
-			FmtNum(healthP99, 0),
-			FmtNum(thrd, 0),
+			FmtNum(&r.RPS, 1),
+			FmtNum(&r.Achieved, 1),
+			r.OkCount,
+			r.ErrCount,
+			FmtNum(r.P50, 1),
+			FmtNum(r.P95, 1),
+			FmtNum(r.Cores, 2),
+			FmtNum(r.CMs, 1),
+			FmtNum(r.AvgRAMMB, 0),
+			FmtNum(r.PeakRAMMB, 0),
+			FmtNum(r.DeltaRAMMB, 0),
+			FmtNum(r.Throttle, 1),
+			FmtNum(accFloat, 0),
+			FmtNum(r.HealthP99, 0),
+			FmtNum(thrdFloat, 0),
 			verdict,
 		)
 	}
@@ -333,11 +398,19 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 		if r.Ok {
 			anyOk = true
 			lastOk = append(lastOk, r)
-			if r.CMs != nil {
+			if r.CMs != nil && !r.IsColdStart {
 				healthyC = append(healthyC, *r.CMs)
 			}
 		} else {
 			knees = append(knees, r)
+		}
+	}
+	// Fallback nếu chỉ có duy nhất 1 bậc OK và bậc đó dính cold-start
+	if len(healthyC) == 0 {
+		for _, r := range rows {
+			if r.Ok && r.CMs != nil {
+				healthyC = append(healthyC, *r.CMs)
+			}
 		}
 	}
 
@@ -405,6 +478,7 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 	println()
 
 	report := &AnalysisReport{}
+	var selectedKneeRow *EvalRow
 	if len(lastOk) > 0 {
 		report.LastOkRPS = lastOk[len(lastOk)-1].RPS
 		var nextKnees []EvalRow
@@ -417,11 +491,26 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 			report.HasKnee = true
 			report.KneeRPS = nextKnees[0].RPS
 			report.KneeReason = nextKnees[0].KneeReason
+			selectedKneeRow = &nextKnees[0]
 		}
 	} else if len(knees) > 0 {
 		report.HasKnee = true
 		report.KneeRPS = knees[0].RPS
 		report.KneeReason = knees[0].KneeReason
+		selectedKneeRow = &knees[0]
+	}
+
+	if report.HasKnee {
+		report.ProfileRPS = report.KneeRPS
+		// Nếu bậc Knee đầu tiên đã là bậc sập hoàn toàn (abandoned > 0 hoặc achieved < 50%)
+		// và có LastOkRPS phía trước, chọn mức tải trung gian (vùng ứng dụng còn sống và đang chịu áp lực thật)
+		if selectedKneeRow != nil && report.LastOkRPS > 0 &&
+			(selectedKneeRow.Abandoned > 0 || selectedKneeRow.Achieved < 0.5*selectedKneeRow.RPS) {
+			mid := math.Round(((report.LastOkRPS+report.KneeRPS)/2.0)*10.0) / 10.0
+			if mid > report.LastOkRPS && mid < report.KneeRPS {
+				report.ProfileRPS = mid
+			}
+		}
 	}
 	if len(rows) > 0 {
 		lastRow := rows[len(rows)-1]
