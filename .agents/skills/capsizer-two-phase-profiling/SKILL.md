@@ -1,20 +1,20 @@
 ---
 name: capsizer-two-phase-profiling
 description: >-
-  Tự động hóa quy trình kiểm thử tải và profiling 2 Pha (README Mục 7.4) theo kiến trúc 3 máy.
+  Tự động hóa quy trình kiểm thử tải và profiling 2 Pha (README Mục 7.4) theo kiến trúc 3 máy bằng Golang CLI (./bin/capsizer).
   Tách biệt cấu hình Hạ tầng (.env.remote) và Kịch bản khai báo (scenarios/<name>/scenario.json & scenario.env).
   Hỗ trợ chạy đơn lẻ hoặc chạy tự động hàng loạt nhiều scenario (Multi-Scenario Batch).
 ---
 
-# Capsizer 2-Phase Capacity Sizing & Profiling Workflow (Kiến trúc 3 Máy & Declarative Scenarios)
+# Capsizer 2-Phase Capacity Sizing & Profiling Workflow (Golang CLI — Kiến trúc 3 Máy)
 
-Kỹ năng này tự động hóa toàn bộ quy trình kiểm thử tải và định chuẩn năng lực hệ thống theo chuẩn **2 Pha**, hỗ trợ triển khai phân tán **3 Máy độc lập** và kiến trúc **Kịch bản khai báo Declarative (tương tự k6)**:
+Kỹ năng này tự động hóa toàn bộ quy trình kiểm thử tải và định chuẩn năng lực hệ thống theo chuẩn **2 Pha** thông qua bộ điều phối thuần **Golang CLI (`./bin/capsizer`)**, hỗ trợ triển khai phân tán **3 Máy độc lập** và kiến trúc **Kịch bản khai báo Declarative (tương tự k6)**:
 
 ```mermaid
 flowchart TD
     subgraph Machine1["[MACHINE 1] MÁY CHẠY SKILL (Local Agent / Điều phối)"]
-        Skill["Antigravity Skill\n(run_two_phase.sh / run_batch.sh)"]
-        Report["capsizer-report\n(Tổng hợp Sizing & Đọc FlameGraph)"]
+        Skill["Antigravity Skill\n(./bin/capsizer run | check | batch)"]
+        Analyzer["pkg/analyzer\n(Tổng hợp Sizing & Đọc FlameGraph)"]
     end
 
     subgraph Configs["CẤU HÌNH TÁCH BIỆT"]
@@ -28,28 +28,28 @@ flowchart TD
     end
 
     subgraph Machine3["[MACHINE 3] CỤM KUBERNETES TỪ XA"]
-        K8sServer["Server Cụm K8s (Master / Bastion)\nSSH passwordless + sudo root"]
+        K8sServer["Server Cụm K8s (Master / Bastion)\nSSH (~/.ssh/config, ProxyCommand/Jump) + sudo kubectl"]
         subgraph TargetPod["TARGET POD"]
             App["App Server (FastAPI / Gin / ...)"]
-            Sidecar["Debug Container / Sidecar\n(probe + py-spy / perf)"]
+            Sidecar["Ephemeral Debug Container / Sidecar\n(/tmp/probe + py-spy / perf)"]
         end
-        ProbeLog["probe.jsonl"]
+        ProbeLog["probe.jsonl (Real-time Stream)"]
         SVG["flamegraph.svg"]
     end
 
     InfraEnv -.-> Skill
     ScenariosDir -.-> Skill
 
-    Skill ==>|"1. SSH scp binary & scenario.json"| Ramp
-    Skill ==>|"2. SSH sudo kubectl hạ CPU 1 core & chui vào Pod"| K8sServer
-    K8sServer -.->|"gắn sidecar & đo"| Sidecar
+    Skill ==>|"1. Biên dịch tĩnh & SCP capsizer-ramp + scenario.json"| Ramp
+    Skill ==>|"2. SSH kubectl hạ CPU 1 core, gắn debug container & đẩy /tmp/probe"| K8sServer
+    K8sServer -.->|"WaitAppStable (/health/live 200) & đo"| Sidecar
     Ramp ==>|"3. Bắn tải Open-Loop HTTP / SSE"| App
-    Sidecar -.->|"Lấy mẫu CPU, RAM, TCP"| App
+    Sidecar -.->|"Đọc Cgroup của App (/proc/<pid>/root/sys/fs/cgroup), TCP, Health"| App
 
-    RampLog -->|"4. scp về"| Skill
-    ProbeLog -->|"5. kubectl cp + scp về"| Skill
-    SVG -->|"6. scp về (Pha 2)"| Skill
-    Skill --> Report
+    ProbeLog -->|"4. Stream thời gian thực (auto-retry + sync 10s)"| Skill
+    RampLog -->|"5. SCP về"| Skill
+    SVG -->|"6. Nới lỏng Liveness/Readiness -> Profile 30s -> Tải SVG về (Pha 2)"| Skill
+    Skill --> Analyzer
 ```
 
 ---
@@ -57,7 +57,7 @@ flowchart TD
 ## 1. Phân tách Cấu hình Chuẩn Kiến trúc
 
 ### A. Cấu hình Hạ tầng cố định (`.env.remote`)
-Chỉ chứa thông tin kết nối giữa 3 máy, dùng chung cho mọi kịch bản:
+Chỉ chứa thông tin kết nối giữa 3 máy, dùng chung cho mọi kịch bản (hỗ trợ đầy đủ alias, `ProxyJump` và `ProxyCommand` trong `~/.ssh/config` khi để trống user/port/key):
 ```bash
 # [Machine 2] Máy phát tải
 LOADGEN_MODE="remote"
@@ -72,86 +72,67 @@ K8S_NAMESPACE="default"
 ```
 
 ### B. Cấu hình Kịch bản độc lập (`scenarios/<tên_dịch_vụ>/`)
-Mỗi kịch bản được tổ chức gọn gàng trong thư mục riêng, không trùng lặp cấu hình:
+Mỗi kịch bản được tổ chức gọn gàng trong thư mục riêng:
 - `scenario.json`: **[Khai báo Request tương tự k6]** Định nghĩa URL, HTTP method, headers, dynamic template body, datasets (Generic Data Feeders), logic SSE.
 - `scenario.env`: **[Thông số thực thi & K8s]**
   - `STEPS`, `STEP_SECONDS`, `BASELINE_WAIT`, `COOLDOWN`: Dải bậc tải và thời gian.
   - `K8S_SELECTOR`: Label selector tìm Pod mục tiêu (vd: `app=chatbot`).
-  - `SET_POD_CPU` *(Khuyến nghị)*: Tự động đưa CPU Pod về 1 core (`"1"` hoặc `"1000m"`) để tìm điểm gãy chính xác và đo chuẩn $C$ của 1 worker. Tự động nhận diện Deployment cha qua `ownerReferences` (không cần khai báo thêm `K8S_DEPLOYMENT`) và tự động hoàn nguyên về CPU ban đầu sau khi kết thúc.
-  - `RESTORE_POD_CPU` *(Tùy chọn)*: Mặc định `true` (tự hoàn nguyên CPU cũ). Đặt `false` nếu muốn giữ nguyên mức 1 core sau khi chạy.
-  - `PROFILE_TYPE`: Hỗ trợ đơn lẻ (`pyspy`, `perf`) hoặc **đa profiler chạy tuần tự** (`pyspy,perf` hoặc `all`) để triệt tiêu nhiễu mẫu (Probe Effect), xuất riêng từng file `flamegraph_knee_<RPS>rps_<prof>.svg`.
-  - `TARGET_PORT` *(Tùy chọn)*: Mặc định tự động bóc tách từ `url` trong `scenario.json`. Chỉ cần khai báo khi cổng nội bộ Pod khác với cổng của Ingress/Gateway bên ngoài.
-- Tệp dữ liệu datasets đi kèm (đặt ngay trong thư mục với đường dẫn tương đối).
-
-*Ví dụ `scenarios/chatbot/`:*
-- `scenario.json`:
-  ```json
-  {
-    "name": "chat-sse",
-    "type": "sse",
-    "url": "http://10.0.0.10:8000/chat",
-    "method": "POST",
-    "headers": {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer {{.users.token}}"
-    },
-    "body": "{\"prompt\": {{quote .prompts}}, \"stream\": true}",
-    "datasets": {
-      "prompts": { "file": "queries.txt", "mode": "random" },
-      "users": { "file": "users.csv", "mode": "sequential" }
-    },
-    "sse": { "end_marker": "[DONE]" }
-  }
-  ```
-- `scenario.env`:
-  ```bash
-  K8S_SELECTOR="app=chatbot"
-  SET_POD_CPU="1"                    # Tự động hạ CPU Pod về 1 core & khôi phục khi kết thúc
-  PROFILE_TYPE="pyspy,perf"          # Chạy tuần tự py-spy (Python stack) rồi perf (Kernel/C++ stack)
-  # TARGET_PORT="8000"               # Tùy chọn (chỉ bật khi đi qua Ingress cổng 443 -> Pod cổng 8000)
-  STEPS="2,4,8,16,32"
-  STEP_SECONDS="30"
-  BASELINE_WAIT="60"
-  COOLDOWN="15"
-  ```
+  - `SET_POD_CPU` *(Khuyến nghị)*: Tự động đưa CPU Pod về 1 core (`"1"` hoặc `"1000m"`) để tìm điểm gãy chính xác và đo chuẩn $C$ của 1 worker. Tự động nhận diện Deployment/StatefulSet cha qua `ownerReferences` và tự động hoàn nguyên về CPU ban đầu sau khi kết thúc.
+  - `RESTORE_POD_CPU` *(Tùy chọn)*: Mặc định `true` (tự hoàn nguyên CPU cũ).
+  - `PROFILE_TYPE`: Hỗ trợ đơn lẻ (`pyspy`, `perf`) hoặc **đa profiler chạy tuần tự** (`pyspy,perf` hoặc `all`), xuất riêng từng file `flamegraph_knee_<RPS>rps_<prof>.svg`.
+  - `TARGET_PORT` *(Tùy chọn)*: Mặc định tự động bóc tách từ `url` trong `scenario.json`.
 
 ---
 
-## 2. Quy trình Thực thi của Agent (Golang CLI & Scripts)
+## 2. Cơ chế Tự động Bảo vệ & Nới lỏng Liveness/Readiness Probes trong `./bin/capsizer`
 
-Hệ thống hỗ trợ cả bộ điều phối chuẩn **Golang Core CLI (`capsizer`)** lẫn Bash script:
+Bộ điều phối Golang (`pkg/orchestrator/runner.go` & `pkg/orchestrator/k8s.go`) xử lý tự động hoàn toàn vòng đời Pod qua 2 Pha:
 
-### Trường hợp 1: Chạy một kịch bản đơn lẻ (Single Scenario)
-Agent kích hoạt kịch bản theo tên thư mục:
+1. **Trước Pha 1 (Chuẩn bị & Health Gate)**:
+   - Hạ CPU Workload về `SET_POD_CPU` (nếu cấu hình), gắn Ephemeral Debug Container (`capsizer-debugger`) với quyền root (`runAsNonRoot: false`), biên dịch tĩnh và đồng bộ `/tmp/probe` mới nhất (đọc đúng cgroup của container ứng dụng qua `/proc/<pid>/root/sys/fs/cgroup`).
+   - Chạy **Health Gate (`waitAppStable`)**: Poll `/health/live` qua `probe -once` cho đến khi đạt `3` lần liên tiếp `health_code: 200` (tối đa `90s`) để đảm bảo ứng dụng đã warm-up xong trước khi lấy mẫu nền.
+2. **Trong Pha 1 (Giữ nguyên Probes gốc & Stream thời gian thực)**:
+   - Giữ nguyên `livenessProbe` / `readinessProbe` thực tế của Production để phát hiện trung thực bậc tải làm ứng dụng bị nghẽn hoặc bị K8s Liveness kill.
+   - Luồng `probe.jsonl` được stream thời gian thực về máy chạy Skill (kèm vòng lặp auto-retry `2s` và ticker đồng bộ dự phòng + kiểm tra trạng thái container mỗi `10s`). Nếu container ứng dụng bị K8s Liveness/OOM kill giữa Pha 1, `./bin/capsizer` bảo toàn toàn bộ mẫu `probe.jsonl` đến giây cuối cùng, dừng sớm Pha 1 và ghi nhận điểm gãy (`KneeRPS`).
+3. **Trước Pha 2 (Tự động Nới lỏng `livenessProbe` & `readinessProbe` — Phương án 1)**:
+   - Khi chuyển sang Pha 2 để bắn tải duy trì tại bậc `KneeRPS` (nơi ứng dụng từng bị nghẽn/kill ở Pha 1), `./bin/capsizer` tự động gọi `RelaxWorkloadProbes`:
+     - Sao lưu nguyên vẹn JSON gốc của `livenessProbe` và `readinessProbe`.
+     - Patch tạm thời `failureThreshold: 60` và `timeoutSeconds: 10` (nếu `< 10s`) cho cả `livenessProbe` và `readinessProbe`.
+     - Chờ Pod mới rollout `Ready` $\rightarrow$ gắn lại `capsizer-debugger` & `/tmp/probe` $\rightarrow$ chờ `waitAppStable` (`2` lần `/health/live = 200` liên tiếp).
+   - Nhờ đó, trong suốt quá trình bắn tải `KneeRPS` và chạy tuần tự `py-spy` (30s) + `perf` (30s), Kubelet **không kill Pod lần 2** và **không rút Pod khỏi Service Endpoints**.
+4. **Khi kết thúc (hoặc nhấn `Ctrl+C`)**:
+   - Cơ chế `defer` gọi `RestoreWorkloadState` gộp cả `resources` (CPU) lẫn `livenessProbe` và `readinessProbe` gốc vào **1 lệnh JSON patch nguyên tử duy nhất**, khôi phục hoàn toàn cấu hình ban đầu của Workload chỉ trong 1 lần rollout.
+
+---
+
+## 3. Quy trình Thực thi của Agent (100% Golang CLI `./bin/capsizer`)
+
+Trước khi chạy (hoặc khi mã nguồn Go vừa cập nhật), đảm bảo binary `./bin/capsizer` đã được biên dịch mới nhất:
 ```bash
-# Cách 1: Bằng Golang Core CLI (Khuyến nghị)
-./bin/capsizer run --scenario chatbot
-
-# Cách 2: Bằng Bash Script
-./.agents/skills/capsizer-two-phase-profiling/scripts/run_two_phase.sh --scenario chatbot
+go build -o bin/capsizer ./cmd/capsizer
 ```
-*(Hệ thống sẽ tự động tìm nạp `scenarios/chatbot/scenario.env` + `scenario.json`, tự động đồng bộ file kịch bản và dữ liệu lên máy phát tải từ xa qua SSH).*
 
-### Trường hợp 2: Kiểm tra kết nối trước khi chạy (Preflight Check)
+### Trường hợp 1: Kiểm tra kết nối 3 máy trước khi chạy (Preflight Check)
 ```bash
-# Bằng Golang CLI:
 ./bin/capsizer check --scenario chatbot
-
-# Bằng Bash Script:
-./.agents/skills/capsizer-two-phase-profiling/scripts/run_two_phase.sh --scenario chatbot --check
 ```
+
+### Trường hợp 2: Chạy một kịch bản đơn lẻ (Single Scenario)
+```bash
+./bin/capsizer run --scenario chatbot
+```
+*(Hệ thống tự động nạp `.env.remote` + `scenarios/chatbot/scenario.env` + `scenario.json`, đồng bộ binary lên máy phát tải và cụm K8s, thực thi trọn vẹn Pha 1 & Pha 2).*
 
 ### Trường hợp 3: Chạy TỰ ĐỘNG HÀNG LOẠT nhiều kịch bản (Batch Runner)
-Khi người dùng yêu cầu: *"Hãy chạy kiểm thử tải lần lượt cả chatbot, sample-post và sample-get"*:
 ```bash
-# Bằng Golang CLI:
+# Chạy danh sách kịch bản chỉ định:
 ./bin/capsizer batch chatbot sample-post sample-get
 
-# Bằng Bash Script:
-./.agents/skills/capsizer-two-phase-profiling/scripts/run_batch.sh chatbot sample-post sample-get
-```
-Hoặc quét và chạy toàn bộ kịch bản có trong thư mục `scenarios/`:
-```bash
+# Hoặc quét và chạy toàn bộ kịch bản trong thư mục scenarios/:
 ./bin/capsizer batch
 ```
-Sau khi hoàn thành tất cả các kịch bản, Agent sẽ đọc file tổng hợp `batch_summary.txt` để đưa ra bảng so sánh hiệu năng và năng lực tổng thể của tất cả các service cho người dùng.
+
+### Trường hợp 4: Đọc và Phân tích Kết quả sau khi chạy
+Sau khi `./bin/capsizer` hoàn tất, Agent đọc trực tiếp các tạo phẩm trong thư mục kết quả (`benchmark-results/<run_id>/`):
+1. `phase1-report.txt`: Bảng phân tích theo từng bậc RPS (`p50`, `p95`, `p99`, `CPU cores`, `throttle%`, `ramMB`, `LISTEN queue`, `/health/live`), chẩn đoán cơ chế gây nghẽn, điểm gãy (`Knee Point`) và công thức tính số bản sao (Replicas / Workers) cần thiết.
+2. `flamegraph_knee_<RPS>rps_pyspy.svg` & `flamegraph_knee_<RPS>rps_perf.svg`: Biểu đồ FlameGraph tại bậc tải gãy để chỉ ra chính xác hàm Python / C-extension / Kernel gây nghẽn CPU.

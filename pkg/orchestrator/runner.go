@@ -185,28 +185,48 @@ func (r *Runner) Run(ctx context.Context) error {
 	// In banner
 	r.printBanner()
 
-	// 2. Điều chỉnh CPU Pod nếu có yêu cầu (Scale to 1 Core) & Setup Defer Restore
+	var (
+		targetWorkloadType string
+		targetWorkloadName string
+		targetContainerIdx int
+		origResourcesJSON  string
+		probesBackup       *WorkloadProbesBackup
+	)
+
+	// Defer hoàn nguyên đồng thời cấu hình CPU và Liveness/Readiness Probes trong 1 lần rollout duy nhất khi kết thúc
+	defer func() {
+		restoreCPU := ""
+		if r.cfg.RestorePodCPU {
+			restoreCPU = origResourcesJSON
+		}
+		if restoreCPU == "" && probesBackup == nil {
+			return
+		}
+		fmt.Println("\n==> [Khôi phục Hạ tầng] Đang hoàn nguyên cấu hình Workload (CPU / Liveness & Readiness Probes) ban đầu...")
+		if err := r.k8sClient.RestoreWorkloadState(context.Background(), targetWorkloadType, targetWorkloadName, targetContainerIdx, restoreCPU, probesBackup); err != nil {
+			fmt.Printf("    [CẢNH BÁO] Lỗi khi hoàn nguyên cấu hình Workload: %v\n", err)
+		} else {
+			fmt.Println("    ✓ Đã hoàn nguyên cấu hình Workload thành công.")
+		}
+	}()
+
+	// 2. Điều chỉnh CPU Pod nếu có yêu cầu (Scale to 1 Core)
 	if r.cfg.SetPodCPU != "" && r.cfg.K8sPod != "" {
 		cName, _ := r.k8sClient.GetContainerName(ctx, r.cfg.K8sPod, r.cfg.K8sContainer)
 		r.cfg.K8sContainer = cName
 
 		wType, wName, err := r.k8sClient.DetectTargetWorkload(ctx, r.cfg.K8sPod, r.cfg.K8sSelector)
 		if err == nil {
+			targetWorkloadType = wType
+			targetWorkloadName = wName
 			fmt.Printf("==> [Cấu hình CPU] Đang đưa %s/%s về %s core...\n", wType, wName, r.cfg.SetPodCPU)
 			origJSON, cIdx, err := r.k8sClient.ApplyWorkloadCPU(ctx, wType, wName, cName, r.cfg.SetPodCPU)
 			if err != nil {
 				fmt.Printf("    [CẢNH BÁO] Không thể điều chỉnh CPU: %v\n", err)
 			} else {
+				origResourcesJSON = origJSON
+				targetContainerIdx = cIdx
 				fmt.Printf("    ✓ Đã cấu hình CPU %s core (Bảo lưu: %s)\n", r.cfg.SetPodCPU, origJSON)
-
-				// Defer hoàn nguyên CPU khi thoát
-				if r.cfg.RestorePodCPU {
-					defer func() {
-						fmt.Println("\n==> [Khôi phục Hạ tầng] Đang hoàn nguyên cấu hình CPU ban đầu...")
-						_ = r.k8sClient.RestoreWorkloadCPU(context.Background(), wType, wName, cIdx, origJSON)
-						fmt.Println("    ✓ Đã hoàn nguyên thành công.")
-					}()
-				}
 
 				// Chờ Pod mới sẵn sàng
 				fmt.Println("    • Đang chờ Pod mới Ready sau rollout...")
@@ -542,49 +562,95 @@ func (r *Runner) Run(ctx context.Context) error {
 	fmt.Println("▶ [PHA 2] TỰ ĐỘNG CHUYỂN SANG CHẨN ĐOÁN NGUYÊN NHÂN SÂU (FLAMEGRAPH)...")
 	fmt.Println("================================================================================")
 
-	if r.cfg.Cooldown > 0 {
-		fmt.Printf("==> Đang chờ hệ thống hạ nhiệt %ds trước khi chạy Pha 2...\n", r.cfg.Cooldown)
-		time.Sleep(time.Duration(r.cfg.Cooldown) * time.Second)
-	}
-
-	// [GUARD PHA 2] Kiểm tra sức khỏe Pod & tự động hồi phục Debug Container nếu bị kill ở Pha 1
+	probesRelaxed := false
 	if r.cfg.K8sPod != "" {
-		fmt.Println("==> [Guard Pha 2] Đang kiểm tra trạng thái Pod và container công cụ trước khi profiling...")
-		if r.cfg.K8sMode == "debug" {
-			newPod, activeDbg, err := r.k8sClient.EnsureDebugContainerAlive(
-				ctx, r.cfg.K8sPod, r.cfg.K8sContainer, r.cfg.SidecarImage, r.cfg.K8sSelector, r.debugContainerName,
-			)
-			if err != nil {
-				return fmt.Errorf("[Guard Pha 2] Không thể thực hiện profiling do Pod không khả dụng: %w", err)
-			}
-			r.cfg.K8sPod = newPod
-			r.debugContainerName = activeDbg
-			execContainer = r.toolContainer()
-			fmt.Printf("    ✓ Guard Pha 2 OK: Pod %s sẵn sàng, container công cụ '%s' đang running.\n", r.cfg.K8sPod, execContainer)
-		} else {
-			st, err := r.k8sClient.GetPodContainerStatus(ctx, r.cfg.K8sPod, r.cfg.K8sContainer, execContainer)
-			if err != nil || !st.PodReady {
-				return fmt.Errorf("[Guard Pha 2] Pod %s chưa Ready (Waiting=%s, RestartCount=%d) — dừng Pha 2",
-					r.cfg.K8sPod, st.WaitingReason, st.RestartCount)
-			}
-			if r.cfg.K8sMode == "cp" && podCrashedInPhase1.Load() {
-				// Nếu container ứng dụng vừa restart ở chế độ cp, cần chép lại binary /tmp/probe nếu cần
-				_ = r.setupK8sTarget(ctx)
+		if r.cfg.K8sContainer == "" {
+			if cName, err := r.k8sClient.GetContainerName(ctx, r.cfg.K8sPod, ""); err == nil {
+				r.cfg.K8sContainer = cName
 			}
 		}
-		r.waitAppStable(ctx, execContainer, 2, 60*time.Second)
+		if targetWorkloadType == "" || targetWorkloadName == "" {
+			if wType, wName, err := r.k8sClient.DetectTargetWorkload(ctx, r.cfg.K8sPod, r.cfg.K8sSelector); err == nil {
+				targetWorkloadType = wType
+				targetWorkloadName = wName
+			}
+		}
+
+		// [PHƯƠNG ÁN 1] Tạm thời nới lỏng livenessProbe & readinessProbe trước Pha 2
+		// (failureThreshold=60, timeoutSeconds>=10s) để Kubelet không kill Pod và không rút Endpoint
+		// khỏi Service trong suốt thời gian giữ tải tại Knee Point để chạy py-spy & perf!
+		if targetWorkloadType != "" && targetWorkloadName != "" {
+			fmt.Printf("==> [Cấu hình Probes Pha 2] Đang tạm nới lỏng livenessProbe & readinessProbe của %s/%s (failureThreshold=60, timeoutSeconds>=10s)...\n",
+				targetWorkloadType, targetWorkloadName)
+			pb, err := r.k8sClient.RelaxWorkloadProbes(ctx, targetWorkloadType, targetWorkloadName, r.cfg.K8sContainer)
+			if pb != nil {
+				probesBackup = pb
+			}
+			if err != nil {
+				fmt.Printf("    [CẢNH BÁO] Không thể nới lỏng Probes cho Pha 2 (%v), chuyển sang Guard dự phòng.\n", err)
+			} else if pb != nil {
+				probesRelaxed = true
+				fmt.Println("    ✓ Đã nới lỏng livenessProbe & readinessProbe (sẽ tự động hoàn nguyên khi kết thúc).")
+				fmt.Println("    • Đang chờ Pod mới (với Probes đã nới lỏng) Ready sau rollout...")
+				if newPod, wErr := r.k8sClient.WaitForPodReady(ctx, r.cfg.K8sSelector, 180*time.Second); wErr == nil && newPod != "" {
+					r.cfg.K8sPod = newPod
+					fmt.Printf("    ✓ Pod mới đã sẵn sàng cho Pha 2: %s\n", newPod)
+				}
+				if sErr := r.setupK8sTarget(ctx); sErr != nil {
+					return fmt.Errorf("[Pha 2] Không thể thiết lập container công cụ trên Pod mới %s: %w", r.cfg.K8sPod, sErr)
+				}
+				execContainer = r.toolContainer()
+				r.waitAppStable(ctx, execContainer, 2, 60*time.Second)
+			} else {
+				fmt.Println("    • Workload không khai báo livenessProbe/readinessProbe, bỏ qua bước patch Probes.")
+			}
+		}
+	}
+
+	if !probesRelaxed {
+		if r.cfg.Cooldown > 0 {
+			fmt.Printf("==> Đang chờ hệ thống hạ nhiệt %ds trước khi chạy Pha 2...\n", r.cfg.Cooldown)
+			time.Sleep(time.Duration(r.cfg.Cooldown) * time.Second)
+		}
+
+		// [GUARD PHA 2] Kiểm tra sức khỏe Pod & tự động hồi phục Debug Container nếu bị kill ở Pha 1
+		if r.cfg.K8sPod != "" {
+			fmt.Println("==> [Guard Pha 2] Đang kiểm tra trạng thái Pod và container công cụ trước khi profiling...")
+			if r.cfg.K8sMode == "debug" {
+				newPod, activeDbg, err := r.k8sClient.EnsureDebugContainerAlive(
+					ctx, r.cfg.K8sPod, r.cfg.K8sContainer, r.cfg.SidecarImage, r.cfg.K8sSelector, r.debugContainerName,
+				)
+				if err != nil {
+					return fmt.Errorf("[Guard Pha 2] Không thể thực hiện profiling do Pod không khả dụng: %w", err)
+				}
+				r.cfg.K8sPod = newPod
+				r.debugContainerName = activeDbg
+				execContainer = r.toolContainer()
+				fmt.Printf("    ✓ Guard Pha 2 OK: Pod %s sẵn sàng, container công cụ '%s' đang running.\n", r.cfg.K8sPod, execContainer)
+			} else {
+				st, err := r.k8sClient.GetPodContainerStatus(ctx, r.cfg.K8sPod, r.cfg.K8sContainer, execContainer)
+				if err != nil || !st.PodReady {
+					return fmt.Errorf("[Guard Pha 2] Pod %s chưa Ready (Waiting=%s, RestartCount=%d) — dừng Pha 2",
+						r.cfg.K8sPod, st.WaitingReason, st.RestartCount)
+				}
+				if r.cfg.K8sMode == "cp" && podCrashedInPhase1.Load() {
+					// Nếu container ứng dụng vừa restart ở chế độ cp, cần chép lại binary /tmp/probe nếu cần
+					_ = r.setupK8sTarget(ctx)
+				}
+			}
+			r.waitAppStable(ctx, execContainer, 2, 60*time.Second)
+		}
 	}
 
 	profilers := r.parseProfilers(r.cfg.ProfileType)
 	profDuration := 30
 	warmupSec := 5
 
-	// Nếu ở Pha 1 container bị LivenessProbe kill (thường do ngưỡng 5s x 3 = 15s khi nghẽn CPU),
-	// tự động rút ngắn thời gian lấy mẫu xuống 12s (warmup 2s) để thu xong FlameGraph SVG trước khi LivenessProbe kịp kill!
-	if podCrashedInPhase1.Load() {
+	// Chỉ cần rút ngắn thời gian lấy mẫu xuống 12s nếu container từng bị kill ở Pha 1 VÀ không thể nới lỏng LivenessProbe
+	if podCrashedInPhase1.Load() && !probesRelaxed {
 		profDuration = 12
 		warmupSec = 2
-		fmt.Printf("    [!] Do container từng bị kill khi quá tải ở Pha 1, tự động tối ưu thời gian lấy mẫu xuống %ds (warmup %ds) để xuất xong FlameGraph trước ngưỡng LivenessProbe!\n",
+		fmt.Printf("    [!] Do container từng bị kill ở Pha 1 và không patch được LivenessProbe, tự động tối ưu thời gian lấy mẫu xuống %ds (warmup %ds)!\n",
 			profDuration, warmupSec)
 	}
 

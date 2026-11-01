@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -157,5 +158,35 @@ func TestQuoteShellArg_PreservesVariablesAndSingleQuotesInPOSIXShell(t *testing.
 		if string(out) != in {
 			t.Errorf("quoteShellArg(%q) expanded by outer shell:\n  got : %q\n  want: %q", in, string(out), in)
 		}
+	}
+}
+
+func TestRelaxSingleProbeJSON(t *testing.T) {
+	orig := `{"failureThreshold":3,"httpGet":{"path":"/health/live","port":8000,"scheme":"HTTP"},"initialDelaySeconds":10,"periodSeconds":5,"successThreshold":1,"timeoutSeconds":5}`
+	relaxed, ok := relaxSingleProbeJSON(orig)
+	if !ok {
+		t.Fatalf("expected relaxSingleProbeJSON to succeed")
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal([]byte(relaxed), &m); err != nil {
+		t.Fatalf("failed to unmarshal relaxed JSON: %v", err)
+	}
+	if m["failureThreshold"] != float64(60) {
+		t.Errorf("failureThreshold = %v; want 60", m["failureThreshold"])
+	}
+	if m["timeoutSeconds"] != float64(10) {
+		t.Errorf("timeoutSeconds = %v; want 10", m["timeoutSeconds"])
+	}
+	if m["periodSeconds"] != float64(5) {
+		t.Errorf("periodSeconds = %v; want 5", m["periodSeconds"])
+	}
+
+	// Kiểm tra trường hợp rỗng / "{}"
+	if _, ok := relaxSingleProbeJSON(""); ok {
+		t.Errorf("expected empty string to return ok=false")
+	}
+	if _, ok := relaxSingleProbeJSON("{}"); ok {
+		t.Errorf("expected {} to return ok=false")
 	}
 }

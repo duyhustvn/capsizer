@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -188,22 +189,58 @@ func (k *K8sClient) GetContainerName(ctx context.Context, podName, containerName
 	return strings.TrimSpace(out), nil
 }
 
-// ApplyWorkloadCPU lưu cấu hình cũ, set CPU về mức chỉ định và chờ rollout hoàn tất.
-func (k *K8sClient) ApplyWorkloadCPU(ctx context.Context, workloadType, workloadName, containerName, cpu string) (origResourcesJSON string, containerIdx int, err error) {
-	// 1. Tìm container index
+// WorkloadProbesBackup lưu cấu hình livenessProbe và readinessProbe gốc của container để khôi phục sau Pha 2.
+type WorkloadProbesBackup struct {
+	WorkloadType      string
+	WorkloadName      string
+	ContainerIdx      int
+	OrigLivenessJSON  string
+	OrigReadinessJSON string
+}
+
+func (k *K8sClient) findContainerIndex(ctx context.Context, workloadType, workloadName, containerName string) (int, error) {
 	outList, err := k.RunKubectl(ctx, "get", workloadType, workloadName, "-n", k.namespace,
 		"-o", "jsonpath={range .spec.template.spec.containers[*]}{.name}{\"\\n\"}{end}")
 	if err != nil {
-		return "", 0, fmt.Errorf("không đọc được danh sách containers: %w", err)
+		return 0, fmt.Errorf("không đọc được danh sách containers: %w", err)
 	}
-
 	lines := strings.Split(strings.TrimSpace(outList), "\n")
-	containerIdx = 0
 	for i, l := range lines {
 		if strings.TrimSpace(l) == containerName {
-			containerIdx = i
-			break
+			return i, nil
 		}
+	}
+	return 0, nil
+}
+
+func relaxSingleProbeJSON(rawJSON string) (string, bool) {
+	rawJSON = strings.TrimSpace(rawJSON)
+	if rawJSON == "" || rawJSON == "{}" || rawJSON == "null" {
+		return "", false
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(rawJSON), &m); err != nil || len(m) == 0 {
+		return "", false
+	}
+	// Nâng failureThreshold lên 60 (ví dụ periodSeconds=5s -> 300s mới kill/unready)
+	m["failureThreshold"] = 60
+	// Nâng timeoutSeconds tối thiểu lên 10s để chịu được độ trễ GIL/CPU khi lấy mẫu ở Knee Point
+	if curTimeout, ok := m["timeoutSeconds"].(float64); !ok || curTimeout < 10 {
+		m["timeoutSeconds"] = 10
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
+
+// ApplyWorkloadCPU lưu cấu hình cũ, set CPU về mức chỉ định và chờ rollout hoàn tất.
+func (k *K8sClient) ApplyWorkloadCPU(ctx context.Context, workloadType, workloadName, containerName, cpu string) (origResourcesJSON string, containerIdx int, err error) {
+	// 1. Tìm container index
+	containerIdx, err = k.findContainerIndex(ctx, workloadType, workloadName, containerName)
+	if err != nil {
+		return "", 0, err
 	}
 
 	// 2. Lưu snapshot resources ban đầu
@@ -235,24 +272,110 @@ func (k *K8sClient) ApplyWorkloadCPU(ctx context.Context, workloadType, workload
 	return origResourcesJSON, containerIdx, nil
 }
 
-// RestoreWorkloadCPU khôi phục lại tài nguyên ban đầu bằng JSON patch nguyên tử.
-func (k *K8sClient) RestoreWorkloadCPU(ctx context.Context, workloadType, workloadName string, containerIdx int, origResourcesJSON string) error {
-	if origResourcesJSON == "" {
-		origResourcesJSON = "{}"
+// RelaxWorkloadProbes tạm thời nới lỏng livenessProbe và readinessProbe (failureThreshold=60, timeoutSeconds>=10)
+// trước Pha 2 để Kubelet không kill container và không rút Endpoint khỏi Service khi giữ tải tại Knee Point.
+func (k *K8sClient) RelaxWorkloadProbes(ctx context.Context, workloadType, workloadName, containerName string) (*WorkloadProbesBackup, error) {
+	containerIdx, err := k.findContainerIndex(ctx, workloadType, workloadName, containerName)
+	if err != nil {
+		return nil, err
 	}
 
-	patchPayload := fmt.Sprintf(`[{"op": "replace", "path": "/spec/template/spec/containers/%d/resources", "value": %s}]`,
-		containerIdx, origResourcesJSON)
+	liveOut, _ := k.RunKubectl(ctx, "get", workloadType, workloadName, "-n", k.namespace,
+		"-o", fmt.Sprintf("jsonpath={.spec.template.spec.containers[%d].livenessProbe}", containerIdx))
+	readyOut, _ := k.RunKubectl(ctx, "get", workloadType, workloadName, "-n", k.namespace,
+		"-o", fmt.Sprintf("jsonpath={.spec.template.spec.containers[%d].readinessProbe}", containerIdx))
 
+	origLiveness := strings.TrimSpace(liveOut)
+	origReadiness := strings.TrimSpace(readyOut)
+
+	var ops []string
+	if relaxedLive, ok := relaxSingleProbeJSON(origLiveness); ok {
+		ops = append(ops, fmt.Sprintf(`{"op": "replace", "path": "/spec/template/spec/containers/%d/livenessProbe", "value": %s}`,
+			containerIdx, relaxedLive))
+	} else {
+		origLiveness = ""
+	}
+	if relaxedReady, ok := relaxSingleProbeJSON(origReadiness); ok {
+		ops = append(ops, fmt.Sprintf(`{"op": "replace", "path": "/spec/template/spec/containers/%d/readinessProbe", "value": %s}`,
+			containerIdx, relaxedReady))
+	} else {
+		origReadiness = ""
+	}
+
+	if len(ops) == 0 {
+		return nil, nil
+	}
+
+	backup := &WorkloadProbesBackup{
+		WorkloadType:      workloadType,
+		WorkloadName:      workloadName,
+		ContainerIdx:      containerIdx,
+		OrigLivenessJSON:  origLiveness,
+		OrigReadinessJSON: origReadiness,
+	}
+
+	patchPayload := "[" + strings.Join(ops, ",") + "]"
+	if _, err := k.RunKubectl(ctx, "patch", workloadType, workloadName, "-n", k.namespace,
+		"--type=json", "-p", patchPayload); err != nil {
+		return nil, fmt.Errorf("lỗi khi patch nới lỏng probes: %w", err)
+	}
+
+	targetRes := fmt.Sprintf("%s/%s", workloadType, workloadName)
+	if _, err := k.RunKubectl(ctx, "rollout", "status", targetRes, "-n", k.namespace, "--timeout=180s"); err != nil {
+		return backup, fmt.Errorf("lỗi khi chờ rollout sau khi nới lỏng probes: %w", err)
+	}
+
+	return backup, nil
+}
+
+// RestoreWorkloadState khôi phục đồng thời tài nguyên CPU và cấu hình livenessProbe/readinessProbe ban đầu
+// chỉ bằng một lần JSON patch và một lần rollout duy nhất.
+func (k *K8sClient) RestoreWorkloadState(ctx context.Context, workloadType, workloadName string, containerIdx int, origResourcesJSON string, probesBackup *WorkloadProbesBackup) error {
+	var ops []string
+
+	if origResourcesJSON != "" {
+		ops = append(ops, fmt.Sprintf(`{"op": "replace", "path": "/spec/template/spec/containers/%d/resources", "value": %s}`,
+			containerIdx, origResourcesJSON))
+	}
+
+	if probesBackup != nil {
+		if workloadType == "" {
+			workloadType = probesBackup.WorkloadType
+			workloadName = probesBackup.WorkloadName
+		}
+		pIdx := probesBackup.ContainerIdx
+		if probesBackup.OrigLivenessJSON != "" {
+			ops = append(ops, fmt.Sprintf(`{"op": "replace", "path": "/spec/template/spec/containers/%d/livenessProbe", "value": %s}`,
+				pIdx, probesBackup.OrigLivenessJSON))
+		}
+		if probesBackup.OrigReadinessJSON != "" {
+			ops = append(ops, fmt.Sprintf(`{"op": "replace", "path": "/spec/template/spec/containers/%d/readinessProbe", "value": %s}`,
+				pIdx, probesBackup.OrigReadinessJSON))
+		}
+	}
+
+	if len(ops) == 0 || workloadType == "" || workloadName == "" {
+		return nil
+	}
+
+	patchPayload := "[" + strings.Join(ops, ",") + "]"
 	_, err := k.RunKubectl(ctx, "patch", workloadType, workloadName, "-n", k.namespace,
 		"--type=json", "-p", patchPayload)
 	if err != nil {
-		return fmt.Errorf("lỗi patch khôi phục tài nguyên: %w", err)
+		return fmt.Errorf("lỗi patch khôi phục cấu hình workload: %w", err)
 	}
 
 	targetRes := fmt.Sprintf("%s/%s", workloadType, workloadName)
 	_, _ = k.RunKubectl(ctx, "rollout", "status", targetRes, "-n", k.namespace, "--timeout=180s")
 	return nil
+}
+
+// RestoreWorkloadCPU khôi phục lại tài nguyên ban đầu bằng JSON patch nguyên tử.
+func (k *K8sClient) RestoreWorkloadCPU(ctx context.Context, workloadType, workloadName string, containerIdx int, origResourcesJSON string) error {
+	if origResourcesJSON == "" {
+		origResourcesJSON = "{}"
+	}
+	return k.RestoreWorkloadState(ctx, workloadType, workloadName, containerIdx, origResourcesJSON, nil)
 }
 
 // WaitForPodReady chờ Pod mới xuất hiện và sẵn sàng sau rollout.
