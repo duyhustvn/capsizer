@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"fmt"
@@ -138,6 +140,41 @@ func (c *SSHClient) RunCommand(ctx context.Context, cmd string) (string, error) 
 			c.DisplayTarget(), err, strings.TrimSpace(string(out)))
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// StreamCommand thực thi một lệnh trên máy từ xa qua OpenSSH và đọc từng dòng stdout theo thời gian thực.
+func (c *SSHClient) StreamCommand(ctx context.Context, cmd string, onLine func(string)) error {
+	args := c.sshArgs(cmd)
+	execCmd := exec.CommandContext(ctx, "ssh", args...)
+
+	stdout, err := execCmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	var stderr bytes.Buffer
+	execCmd.Stderr = &stderr
+
+	if err := execCmd.Start(); err != nil {
+		return err
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		if onLine != nil {
+			onLine(scanner.Text())
+		}
+	}
+
+	waitErr := execCmd.Wait()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if waitErr != nil {
+		return fmt.Errorf("ssh stream [%s] kết thúc với lỗi: %w (%s)",
+			c.DisplayTarget(), waitErr, strings.TrimSpace(stderr.String()))
+	}
+	return scanner.Err()
 }
 
 // UploadFile copy file từ local lên remote qua scp (hỗ trợ ~/.ssh/config và ProxyJump).

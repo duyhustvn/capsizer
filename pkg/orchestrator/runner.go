@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"capsizer/pkg/analyzer"
@@ -14,17 +16,21 @@ import (
 
 // Runner thực thi quy trình chuẩn 2 Pha định chuẩn năng lực & profiling.
 type Runner struct {
-	cfg        *Config
-	loadSSH    *SSHClient
-	k8sSSH     *SSHClient
-	k8sClient  *K8sClient
-	LastReport *analyzer.AnalysisReport
+	cfg                *Config
+	loadSSH            *SSHClient
+	k8sSSH             *SSHClient
+	k8sClient          *K8sClient
+	debugContainerName string
+	LastReport         *analyzer.AnalysisReport
 }
 
 // NewRunner khởi tạo Runner từ Config.
 func NewRunner(cfg *Config) (*Runner, error) {
 	cfg.Finalize()
-	r := &Runner{cfg: cfg}
+	r := &Runner{
+		cfg:                cfg,
+		debugContainerName: "capsizer-debugger",
+	}
 
 	// 1. Khởi tạo SSH tới Máy Phát Tải (Machine 2) nếu mode=remote
 	if cfg.LoadgenMode == "remote" {
@@ -67,6 +73,9 @@ func (r *Runner) Close() {
 func (r *Runner) toolContainer() string {
 	switch r.cfg.K8sMode {
 	case "debug":
+		if r.debugContainerName != "" {
+			return r.debugContainerName
+		}
 		return "capsizer-debugger"
 	case "sidecar":
 		if r.cfg.SidecarContainer != "" {
@@ -228,49 +237,155 @@ func (r *Runner) Run(ctx context.Context) error {
 	// 5. [PHA 1] Đo Capacity Sizing sạch (Ramp + Probe)
 	fmt.Println("\n▶ [PHA 1] KHỞI ĐỘNG ĐO CAPACITY SIZING SẠCH (KHÔNG BẬT PROFILER)...")
 
-	execContainer := r.toolContainer()
-
-	// Khởi chạy probe trong Pod
-	if r.cfg.K8sPod != "" {
-		fmt.Printf("==> Đang khởi chạy probe trong Pod %s (container: %s, port: %d)...\n",
-			r.cfg.K8sPod, execContainer, r.cfg.TargetPort)
-		stopOldCmd := "pkill -f 'probe -port' 2>/dev/null || pkill -x probe 2>/dev/null || true"
-		_, _ = r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, stopOldCmd)
-
-		probeCmd := fmt.Sprintf(
-			"if command -v probe >/dev/null 2>&1; then PBIN=probe; else PBIN=/tmp/probe; fi; "+
-				"nohup $PBIN -port %d -target http://127.0.0.1:%d -out /tmp/probe.jsonl >/tmp/probe.log 2>&1 < /dev/null &",
-			r.cfg.TargetPort, r.cfg.TargetPort,
-		)
-		_, _ = r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, probeCmd)
-
-		defer func() {
-			_, _ = r.k8sClient.ExecInPod(context.Background(), r.cfg.K8sPod, execContainer,
-				"pkill -INT -f 'probe -port' 2>/dev/null || pkill -f 'probe' 2>/dev/null || true")
-		}()
-	}
-
-	time.Sleep(2 * time.Second)
-
-	// Chạy Ramp Pha 1
 	rampLog := filepath.Join(r.cfg.OutDir, "phase1-ramp.jsonl")
 	probeLog := filepath.Join(r.cfg.OutDir, "phase1-probe.jsonl")
 	reportLog := filepath.Join(r.cfg.OutDir, "phase1-report.txt")
 
+	execContainer := r.toolContainer()
+
+	// Ghi nhận restartCount của container ứng dụng trước khi chạy Pha 1
+	var initialRestartCount int
+	if r.cfg.K8sPod != "" {
+		if preSt, err := r.k8sClient.GetPodContainerStatus(ctx, r.cfg.K8sPod, r.cfg.K8sContainer, execContainer); err == nil {
+			initialRestartCount = preSt.RestartCount
+		}
+	}
+
+	var (
+		streamedSamples    atomic.Int64
+		podCrashedInPhase1 atomic.Bool
+		crashDetailMu      sync.Mutex
+		crashDetail        string
+		probeStreamCancel  context.CancelFunc
+		probeStreamDone    = make(chan struct{})
+	)
+
+	// Khởi chạy probe trong Pod và mở luồng stream thời gian thực về phase1-probe.jsonl
+	if r.cfg.K8sPod != "" {
+		fmt.Printf("==> Đang khởi chạy probe trong Pod %s (container: %s, port: %d) và stream thời gian thực về máy Skill...\n",
+			r.cfg.K8sPod, execContainer, r.cfg.TargetPort)
+
+		stopOldCmd := "pkill -f 'probe -port' 2>/dev/null || pkill -x probe 2>/dev/null || true"
+		_, _ = r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, stopOldCmd)
+
+		probeStartCmd := fmt.Sprintf(
+			"if command -v probe >/dev/null 2>&1; then PBIN=probe; else PBIN=/tmp/probe; fi; "+
+				": > /tmp/probe.jsonl; "+
+				"nohup $PBIN -port %d -target http://127.0.0.1:%d -out /tmp/probe.jsonl >/tmp/probe.log 2>&1 < /dev/null & "+
+				"sleep 1; pgrep -f 'probe -port' >/dev/null && echo PROBE_RUNNING || (cat /tmp/probe.log 2>/dev/null; exit 1)",
+			r.cfg.TargetPort, r.cfg.TargetPort,
+		)
+		if out, err := r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, probeStartCmd); err != nil {
+			fmt.Printf("    [CẢNH BÁO] Lỗi khởi chạy probe trong Pod (%s): %v (output: %s)\n", execContainer, err, out)
+		} else {
+			fmt.Println("    ✓ Tiến trình probe đã chạy trong Pod.")
+		}
+
+		defer func() {
+			_, _ = r.k8sClient.ExecInPod(context.Background(), r.cfg.K8sPod, r.toolContainer(),
+				"pkill -INT -f 'probe -port' 2>/dev/null || pkill -f 'probe' 2>/dev/null || true")
+		}()
+
+		// Mở luồng stream trực tiếp từng dòng từ /tmp/probe.jsonl về local probeLog
+		var streamCtx context.Context
+		streamCtx, probeStreamCancel = context.WithCancel(ctx)
+		go func() {
+			defer close(probeStreamDone)
+
+			probeFile, err := os.OpenFile(probeLog, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			if err != nil {
+				fmt.Printf("    [CẢNH BÁO] Không thể mở file %s để ghi stream probe: %v\n", probeLog, err)
+				return
+			}
+			defer probeFile.Close()
+
+			streamErr := r.k8sClient.StreamExecInPod(streamCtx, r.cfg.K8sPod, execContainer, "tail -n +1 -f /tmp/probe.jsonl", func(line string) {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
+					_, _ = probeFile.WriteString(trimmed + "\n")
+					_ = probeFile.Sync()
+					streamedSamples.Add(1)
+				}
+			})
+
+			// Nếu stream kết thúc trong khi Pha 1 vẫn đang chạy (chưa gọi probeStreamCancel),
+			// kiểm tra ngay xem có phải container ứng dụng vừa bị LivenessProbe / OOM kill không!
+			if streamCtx.Err() == nil && streamErr != nil {
+				curSt, stErr := r.k8sClient.GetPodContainerStatus(context.Background(), r.cfg.K8sPod, r.cfg.K8sContainer, execContainer)
+				if stErr == nil && (curSt.RestartCount > initialRestartCount || !curSt.DebugRunning) {
+					podCrashedInPhase1.Store(true)
+					msg := fmt.Sprintf(
+						"Container ứng dụng bị K8s kill/restart giữa Pha 1 (restartCount: %d -> %d, reason: %s, exitCode: %d)",
+						initialRestartCount, curSt.RestartCount, curSt.LastTermReason, curSt.LastTermExitCode,
+					)
+					crashDetailMu.Lock()
+					crashDetail = msg
+					crashDetailMu.Unlock()
+
+					fmt.Printf("\n================================================================================\n")
+					fmt.Printf("⚠️ [PHÁT HIỆN SẬP CONTAINER TRONG PHA 1]\n")
+					fmt.Printf("  • %s\n", msg)
+					fmt.Printf("  • Ephemeral container (%s) chia sẻ PID namespace nên đã bị SIGKILL theo.\n", execContainer)
+					fmt.Printf("  • Đã bảo toàn %d mẫu probe.jsonl theo thời gian thực tính đến giây cuối trước khi sập!\n", streamedSamples.Load())
+					fmt.Printf("  • Đang gửi tín hiệu dừng sớm Pha 1 để tổng hợp báo cáo...\n")
+					fmt.Printf("================================================================================\n")
+
+					r.stopActiveLoadgen()
+				}
+			}
+		}()
+	} else {
+		close(probeStreamDone)
+	}
+
+	time.Sleep(1 * time.Second)
+
+	// Chạy Ramp Pha 1
 	fmt.Printf("==> Bắt đầu phát tải Open-Loop (đếm lùi %ds lấy mẫu nền)...\n", r.cfg.BaselineWait)
 	if err := r.runLoadgen(ctx, r.cfg.Steps, r.cfg.StepSeconds, r.cfg.BaselineWait, r.cfg.Cooldown, rampLog, false); err != nil {
-		return fmt.Errorf("lỗi phát tải Pha 1: %w", err)
+		if !podCrashedInPhase1.Load() {
+			return fmt.Errorf("lỗi phát tải Pha 1: %w", err)
+		}
+		fmt.Printf("    [!] Phát tải Pha 1 đã dừng sớm do sự cố sập container (%v).\n", err)
+	} else {
+		fmt.Println("==> Hoàn thành phát tải Pha 1!")
 	}
-	fmt.Println("==> Hoàn thành phát tải Pha 1!")
 
-	// Thu thập file probe.jsonl
+	// Dừng probe và đóng stream
 	if r.cfg.K8sPod != "" {
-		fmt.Println("==> Đang dừng probe và tải file probe.jsonl về...")
-		_, _ = r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer,
-			"pkill -INT -f 'probe -port' 2>/dev/null || pkill -f 'probe' 2>/dev/null || true")
-		time.Sleep(1 * time.Second)
-		if err := r.k8sClient.CopyFromPod(ctx, r.cfg.K8sPod, execContainer, "/tmp/probe.jsonl", probeLog); err != nil {
-			fmt.Printf("    [CẢNH BÁO] Không thể tải file probe.jsonl: %v\n", err)
+		if !podCrashedInPhase1.Load() {
+			_, _ = r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer,
+				"pkill -INT -f 'probe -port' 2>/dev/null || pkill -f 'probe' 2>/dev/null || true")
+			time.Sleep(1 * time.Second)
+		}
+		if probeStreamCancel != nil {
+			probeStreamCancel()
+		}
+		<-probeStreamDone
+
+		// Kiểm tra lại trạng thái Pod sau Pha 1 nếu chưa ghi nhận crash
+		if !podCrashedInPhase1.Load() {
+			if postSt, err := r.k8sClient.GetPodContainerStatus(ctx, r.cfg.K8sPod, r.cfg.K8sContainer, execContainer); err == nil {
+				if postSt.RestartCount > initialRestartCount || !postSt.DebugRunning {
+					podCrashedInPhase1.Store(true)
+					crashDetailMu.Lock()
+					crashDetail = fmt.Sprintf(
+						"Container ứng dụng bị K8s kill/restart trong Pha 1 (restartCount: %d -> %d, reason: %s, exitCode: %d)",
+						initialRestartCount, postSt.RestartCount, postSt.LastTermReason, postSt.LastTermExitCode,
+					)
+					crashDetailMu.Unlock()
+				}
+			}
+		}
+
+		// Nếu vì lý do nào đó stream chưa nhận được mẫu mà debug container vẫn còn sống, thử tải trực tiếp
+		if streamedSamples.Load() == 0 && !podCrashedInPhase1.Load() {
+			fmt.Println("==> Đang tải file probe.jsonl từ Pod về...")
+			if err := r.k8sClient.CopyFromPod(ctx, r.cfg.K8sPod, execContainer, "/tmp/probe.jsonl", probeLog); err != nil {
+				fmt.Printf("    [CẢNH BÁO] Không thể tải file probe.jsonl: %v\n", err)
+			}
+		} else {
+			fmt.Printf("==> Đã thu thập và lưu an toàn %d mẫu probe tại: %s\n", streamedSamples.Load(), probeLog)
 		}
 	}
 
@@ -278,18 +393,42 @@ func (r *Runner) Run(ctx context.Context) error {
 	fmt.Println("\n==> Đang phân tích kết quả định chuẩn Pha 1...")
 	rampRecords, err := analyzer.LoadRamp(rampLog)
 	if err != nil {
-		return fmt.Errorf("không đọc được file ramp: %w", err)
+		return fmt.Errorf("không đọc được file ramp (%s): %w", rampLog, err)
 	}
 
 	var probeRecords []analyzer.ProbeRecord
 	if fileExists(probeLog) {
-		probeRecords, _ = analyzer.LoadProbe(probeLog)
+		probeRecords, err = analyzer.LoadProbe(probeLog)
+		if err != nil {
+			fmt.Printf("    [CẢNH BÁO] Lỗi đọc file probe (%s): %v\n", probeLog, err)
+		}
+	}
+	if r.cfg.K8sPod != "" && len(probeRecords) == 0 {
+		fmt.Println("    [CẢNH BÁO QUAN TRỌNG] Không có mẫu dữ liệu nào trong probe.jsonl! Các cột CPU/RAM/TCP/Health trong bảng sẽ hiển thị '-'.")
 	}
 
 	report, err := analyzer.Analyze(rampRecords, probeRecords)
 	if err != nil {
 		return fmt.Errorf("phân tích sizing thất bại: %w", err)
 	}
+
+	// Nếu container bị kill giữa Pha 1, bổ sung thông tin sự cố vào báo cáo và đảm bảo nhận diện Knee Point
+	crashDetailMu.Lock()
+	cDetail := crashDetail
+	crashDetailMu.Unlock()
+	if podCrashedInPhase1.Load() && cDetail != "" {
+		crashBanner := fmt.Sprintf(
+			"⚠️ CẢNH BÁO SỰ CỐ HẠ TẦNG TRONG PHA 1:\n   %s\n   (Dữ liệu probe.jsonl đã được bảo toàn đến thời điểm ngay trước khi container bị kill)\n\n",
+			cDetail,
+		)
+		report.ReportText = crashBanner + report.ReportText
+		if !report.HasKnee && report.LastOkRPS > 0 {
+			report.HasKnee = true
+			report.KneeRPS = report.LastOkRPS
+			report.KneeReason = cDetail
+		}
+	}
+
 	r.LastReport = report
 
 	// Ghi file report
@@ -315,10 +454,47 @@ func (r *Runner) Run(ctx context.Context) error {
 		time.Sleep(time.Duration(r.cfg.Cooldown) * time.Second)
 	}
 
+	// [GUARD PHA 2] Kiểm tra sức khỏe Pod & tự động hồi phục Debug Container nếu bị kill ở Pha 1
+	if r.cfg.K8sPod != "" {
+		fmt.Println("==> [Guard Pha 2] Đang kiểm tra trạng thái Pod và container công cụ trước khi profiling...")
+		if r.cfg.K8sMode == "debug" {
+			newPod, activeDbg, err := r.k8sClient.EnsureDebugContainerAlive(
+				ctx, r.cfg.K8sPod, r.cfg.K8sContainer, r.cfg.SidecarImage, r.cfg.K8sSelector, r.debugContainerName,
+			)
+			if err != nil {
+				return fmt.Errorf("[Guard Pha 2] Không thể thực hiện profiling do Pod không khả dụng: %w", err)
+			}
+			r.cfg.K8sPod = newPod
+			r.debugContainerName = activeDbg
+			execContainer = r.toolContainer()
+			fmt.Printf("    ✓ Guard Pha 2 OK: Pod %s sẵn sàng, container công cụ '%s' đang running.\n", r.cfg.K8sPod, execContainer)
+		} else {
+			st, err := r.k8sClient.GetPodContainerStatus(ctx, r.cfg.K8sPod, r.cfg.K8sContainer, execContainer)
+			if err != nil || !st.PodReady {
+				return fmt.Errorf("[Guard Pha 2] Pod %s chưa Ready (Waiting=%s, RestartCount=%d) — dừng Pha 2",
+					r.cfg.K8sPod, st.WaitingReason, st.RestartCount)
+			}
+			if r.cfg.K8sMode == "cp" && podCrashedInPhase1.Load() {
+				// Nếu container ứng dụng vừa restart ở chế độ cp, cần chép lại binary /tmp/probe nếu cần
+				_ = r.setupK8sTarget(ctx)
+			}
+		}
+	}
+
 	profilers := r.parseProfilers(r.cfg.ProfileType)
 	profDuration := 30
-	totalDuration := len(profilers)*(profDuration+5) + 10
+	warmupSec := 5
 
+	// Nếu ở Pha 1 container bị LivenessProbe kill (thường do ngưỡng 5s x 3 = 15s khi nghẽn CPU),
+	// tự động rút ngắn thời gian lấy mẫu xuống 12s (warmup 2s) để thu xong FlameGraph SVG trước khi LivenessProbe kịp kill!
+	if podCrashedInPhase1.Load() {
+		profDuration = 12
+		warmupSec = 2
+		fmt.Printf("    [!] Do container từng bị kill khi quá tải ở Pha 1, tự động tối ưu thời gian lấy mẫu xuống %ds (warmup %ds) để xuất xong FlameGraph trước ngưỡng LivenessProbe!\n",
+			profDuration, warmupSec)
+	}
+
+	totalDuration := len(profilers)*(profDuration+5) + warmupSec + 5
 	phase2RampLog := filepath.Join(r.cfg.OutDir, "phase2-ramp.jsonl")
 
 	// Bắn tải duy trì ở background
@@ -331,40 +507,59 @@ func (r *Runner) Run(ctx context.Context) error {
 		_ = r.runLoadgen(bgCtx, kneeStr, totalDuration, 0, 0, phase2RampLog, true)
 	}()
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(time.Duration(warmupSec) * time.Second)
 
 	generatedSVGs := []string{}
 	for _, prof := range profilers {
-		fmt.Printf("\n--> [PROFILING: %s] Đang lấy mẫu %ds...\n", prof, profDuration)
+		fmt.Printf("\n--> [PROFILING: %s] Đang lấy mẫu %ds trong container '%s'...\n", prof, profDuration, execContainer)
 		localSVG := filepath.Join(r.cfg.OutDir, fmt.Sprintf("flamegraph_knee_%.0frps_%s.svg", report.KneeRPS, prof))
 		remoteSVG := fmt.Sprintf("/tmp/flamegraph_%s.svg", prof)
 
 		if r.cfg.K8sPod != "" {
+			var profCmd string
 			if prof == "pyspy" || prof == "py-spy" {
-				pyspyCmd := fmt.Sprintf(
+				profCmd = fmt.Sprintf(
 					": > %s; PID=%d; if [ \"$PID\" -le 0 ]; then "+
 						"PID=$(pgrep -f 'uvicorn|gunicorn|python|fastapi' | head -n 1); "+
 						"[ -z \"$PID\" ] && PID=1; fi; "+
-						"py-spy record -o %s --pid $PID --duration %d --rate 100 --subprocesses || true",
+						"echo \"Target PID=$PID\"; "+
+						"py-spy record -o %s --pid $PID --duration %d --rate 100 --subprocesses",
 					remoteSVG, r.cfg.TargetPID, remoteSVG, profDuration,
 				)
-				_, _ = r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, pyspyCmd)
-				_ = r.k8sClient.CopyFromPod(ctx, r.cfg.K8sPod, execContainer, remoteSVG, localSVG)
 			} else if prof == "perf" {
-				perfCmd := fmt.Sprintf(": > %s; profile-perf %d %s %d || true", remoteSVG, profDuration, remoteSVG, r.cfg.TargetPID)
-				_, _ = r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, perfCmd)
-				_ = r.k8sClient.CopyFromPod(ctx, r.cfg.K8sPod, execContainer, remoteSVG, localSVG)
+				profCmd = fmt.Sprintf(": > %s; profile-perf %d %s %d", remoteSVG, profDuration, remoteSVG, r.cfg.TargetPID)
+			}
+
+			if profCmd != "" {
+				out, execErr := r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, profCmd)
+				if execErr != nil {
+					fmt.Printf("    [CẢNH BÁO] Lệnh profiler (%s) báo lỗi: %v\n", prof, execErr)
+					if out != "" {
+						fmt.Printf("    [Chi tiết profiler output]: %s\n", out)
+					}
+				}
+
+				if cpErr := r.k8sClient.CopyFromPod(ctx, r.cfg.K8sPod, execContainer, remoteSVG, localSVG); cpErr != nil {
+					fmt.Printf("    [ERROR] Không thể tải FlameGraph (%s) từ %s:%s về máy: %v\n",
+						prof, execContainer, remoteSVG, cpErr)
+					if out != "" && execErr == nil {
+						fmt.Printf("    [Chi tiết profiler output]: %s\n", out)
+					}
+				}
 			}
 		}
 
-		if fileExists(localSVG) {
+		if isValidSVGFile(localSVG) {
 			generatedSVGs = append(generatedSVGs, localSVG)
 			fmt.Printf("    ✓ Đã xuất FlameGraph (%s): %s\n", prof, localSVG)
+		} else {
+			fmt.Printf("    ✗ Không tạo được file FlameGraph hợp lệ cho profiler '%s'.\n", prof)
 		}
-		time.Sleep(3 * time.Second)
+		time.Sleep(2 * time.Second)
 	}
 
 	bgCancel()
+	r.stopActiveLoadgen()
 	<-bgDone
 
 	if r.cfg.LoadgenMode == "remote" && r.loadSSH != nil {
@@ -376,11 +571,35 @@ func (r *Runner) Run(ctx context.Context) error {
 	fmt.Println("✓ HOÀN TẤT TOÀN DIỆN QUY TRÌNH 2 PHA ĐỊNH CHUẨN VÀ PROFILING!")
 	fmt.Println("================================================================================")
 	fmt.Printf("Báo cáo phân tích Sizing : %s\n", reportLog)
-	for _, s := range generatedSVGs {
-		fmt.Printf("  • FlameGraph SVG: %s\n", s)
+	if len(generatedSVGs) > 0 {
+		for _, s := range generatedSVGs {
+			fmt.Printf("  • FlameGraph SVG: %s\n", s)
+		}
+	} else {
+		fmt.Println("  • FlameGraph SVG: (Không có file nào được tạo — xem cảnh báo phía trên)")
 	}
 	fmt.Println("================================================================================")
 	return nil
+}
+
+func isValidSVGFile(path string) bool {
+	if !fileExists(path) {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return false
+	}
+	return strings.Contains(string(data), "<svg")
+}
+
+// stopActiveLoadgen gửi tín hiệu SIGINT cho tiến trình capsizer-ramp đang chạy để dừng sớm an toàn và flush dữ liệu JSONL.
+func (r *Runner) stopActiveLoadgen() {
+	if r.cfg.LoadgenMode == "remote" && r.loadSSH != nil {
+		_, _ = r.loadSSH.RunCommand(context.Background(), "pkill -INT -f 'capsizer-ramp' 2>/dev/null || true")
+		return
+	}
+	_ = exec.Command("pkill", "-INT", "-f", "capsizer-ramp").Run()
 }
 
 // setupK8sTarget thiết lập container chứa công cụ trong Pod theo K8sMode (debug, sidecar, cp).
@@ -393,6 +612,7 @@ func (r *Runner) setupK8sTarget(ctx context.Context) error {
 			return err
 		}
 		r.cfg.K8sPod = newPod
+		r.debugContainerName = "capsizer-debugger"
 	case "sidecar":
 		fmt.Printf("==> [K8s Target] Sử dụng Sidecar container '%s' trong Pod %s.\n", r.toolContainer(), r.cfg.K8sPod)
 	case "cp":
@@ -406,7 +626,9 @@ func (r *Runner) setupK8sTarget(ctx context.Context) error {
 		if err := r.k8sClient.CopyToPod(ctx, probeBin, r.cfg.K8sPod, cName, "/tmp/probe"); err != nil {
 			return fmt.Errorf("không thể chép probe vào Pod: %w", err)
 		}
-		_, _ = r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, cName, "chmod +x /tmp/probe")
+		if out, err := r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, cName, "chmod +x /tmp/probe"); err != nil {
+			return fmt.Errorf("không thể cấp quyền thực thi cho /tmp/probe: %w (%s)", err, out)
+		}
 	}
 	return nil
 }
@@ -507,10 +729,9 @@ func (r *Runner) runLoadgen(ctx context.Context, steps string, stepSec, baseWait
 		if out != "" {
 			fmt.Println(out)
 		}
-		if err == nil {
-			if dlErr := r.loadSSH.DownloadFile(ctx, remoteLog, outPath); dlErr != nil {
-				return fmt.Errorf("không thể tải file kết quả ramp từ máy phát tải: %w", dlErr)
-			}
+		// Luôn cố gắng tải remoteLog về ngay cả khi tiến trình dừng sớm để không mất dữ liệu
+		if dlErr := r.loadSSH.DownloadFile(context.Background(), remoteLog, outPath); dlErr != nil && err == nil {
+			return fmt.Errorf("không thể tải file kết quả ramp từ máy phát tải: %w", dlErr)
 		}
 		return err
 	}

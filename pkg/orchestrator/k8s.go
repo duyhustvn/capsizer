@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -316,9 +318,105 @@ func (k *K8sClient) SetupDebugContainer(ctx context.Context, podName, containerN
 		}
 	}
 
-	// Tạo các hồ sơ securityContext tạm trên máy chạy kubectl:
-	// QUAN TRỌNG: Phải có 'runAsNonRoot: false' để ghi đè pod.spec.securityContext.runAsNonRoot=true,
-	// nếu thiếu sẽ bị Kubelet chặn với lỗi: "container's runAsUser breaks non-root policy".
+	if err := k.attachDebugContainerWithName(ctx, podName, targetContainer, sidecarImage, debugContainerName); err != nil {
+		return podName, err
+	}
+	return podName, nil
+}
+
+// WaitForNewPodReady chờ một Pod mới (khác với oldPod) xuất hiện và đạt trạng thái Ready.
+func (k *K8sClient) WaitForNewPodReady(ctx context.Context, selector, oldPod string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+
+		out, err := k.RunKubectl(ctx, "get", "pods", "-n", k.namespace, "-l", selector,
+			"--field-selector=status.phase=Running", "-o", "jsonpath={.items[*].metadata.name}")
+		if err == nil && strings.TrimSpace(out) != "" {
+			for _, candidate := range strings.Fields(out) {
+				if candidate != "" && candidate != oldPod {
+					ready, _ := k.RunKubectl(ctx, "get", "pod", candidate, "-n", k.namespace,
+						"-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}")
+					if strings.EqualFold(strings.TrimSpace(ready), "true") {
+						return candidate, nil
+					}
+				}
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return "", fmt.Errorf("hết thời gian chờ Pod mới sẵn sàng thay thế %s", oldPod)
+}
+
+// PodContainerStatus chứa trạng thái sức khỏe của Pod, container ứng dụng và debug container.
+type PodContainerStatus struct {
+	PodPhase         string
+	PodReady         bool
+	RestartCount     int
+	LastTermReason   string
+	LastTermExitCode int
+	WaitingReason    string
+	DebugRunning     bool
+	DebugStateRaw    string
+}
+
+// GetPodContainerStatus truy vấn trạng thái hiện tại của Pod, số lần restart của app và trạng thái debug container.
+func (k *K8sClient) GetPodContainerStatus(ctx context.Context, podName, appContainer, debugContainer string) (*PodContainerStatus, error) {
+	st := &PodContainerStatus{}
+	if podName == "" {
+		return st, nil
+	}
+
+	// Truy vấn gộp các trường qua jsonpath phân tách bằng '|'
+	jp := fmt.Sprintf(
+		"{.status.phase}|"+
+			"{.status.conditions[?(@.type==\"Ready\")].status}|"+
+			"{.status.containerStatuses[0].restartCount}|"+
+			"{.status.containerStatuses[0].lastState.terminated.reason}|"+
+			"{.status.containerStatuses[0].lastState.terminated.exitCode}|"+
+			"{.status.containerStatuses[0].state.waiting.reason}|"+
+			"{.status.ephemeralContainerStatuses[?(@.name=='%s')].state}",
+		debugContainer,
+	)
+
+	out, err := k.RunKubectl(ctx, "get", "pod", podName, "-n", k.namespace, "-o", "jsonpath="+jp)
+	if err != nil {
+		return st, err
+	}
+
+	parts := strings.SplitN(strings.TrimSpace(out), "|", 7)
+	if len(parts) >= 1 {
+		st.PodPhase = strings.TrimSpace(parts[0])
+	}
+	if len(parts) >= 2 {
+		st.PodReady = strings.EqualFold(strings.TrimSpace(parts[1]), "true")
+	}
+	if len(parts) >= 3 {
+		st.RestartCount, _ = strconv.Atoi(strings.TrimSpace(parts[2]))
+	}
+	if len(parts) >= 4 {
+		st.LastTermReason = strings.TrimSpace(parts[3])
+	}
+	if len(parts) >= 5 {
+		st.LastTermExitCode, _ = strconv.Atoi(strings.TrimSpace(parts[4]))
+	}
+	if len(parts) >= 6 {
+		st.WaitingReason = strings.TrimSpace(parts[5])
+	}
+	if len(parts) >= 7 {
+		st.DebugStateRaw = strings.TrimSpace(parts[6])
+		st.DebugRunning = strings.Contains(st.DebugStateRaw, "running")
+	}
+
+	return st, nil
+}
+
+// attachDebugContainerWithName gắn một ephemeral debug container với tên chỉ định vào Pod.
+func (k *K8sClient) attachDebugContainerWithName(ctx context.Context, podName, targetContainer, sidecarImage, debugContainerName string) error {
 	fullRootYAML := "/tmp/capsizer-debug-root.yaml"
 	minRootYAML := "/tmp/capsizer-debug-root-min.yaml"
 	baselineRootYAML := "/tmp/capsizer-debug-root-baseline.yaml"
@@ -365,7 +463,6 @@ func (k *K8sClient) SetupDebugContainer(ctx context.Context, podName, containerN
 		baseArgs = append(baseArgs, fmt.Sprintf("--target=%s", targetContainer))
 	}
 
-	// Thử lần lượt từ quyền đầy đủ (sysadmin + SYS_PTRACE/SYS_ADMIN) -> tối thiểu (SYS_PTRACE) -> baseline (runAsUser:0, runAsNonRoot:false)
 	attempts := [][]string{
 		append(append([]string{}, baseArgs...), fmt.Sprintf("--custom=%s", fullRootYAML), "--profile=sysadmin", "--", "sh", "-c", "sleep infinity"),
 		append(append([]string{}, baseArgs...), fmt.Sprintf("--custom=%s", minRootYAML), "--", "sh", "-c", "sleep infinity"),
@@ -383,8 +480,6 @@ func (k *K8sClient) SetupDebugContainer(ctx context.Context, podName, containerN
 		}
 	}
 
-	// Nếu Namespace bật PSA enforce=restricted chặn hoàn toàn runAsUser=0 ngay từ API Server,
-	// tự động fallback sang non-root UID (ví dụ 1000) để Pha 1 (probe) vẫn hoạt động bình thường.
 	if !attached {
 		nonRootYAML := "/tmp/capsizer-debug-nonroot.yaml"
 		nonRootCmd := fmt.Sprintf(
@@ -408,53 +503,98 @@ func (k *K8sClient) SetupDebugContainer(ctx context.Context, podName, containerN
 			fmt.Println("    [CẢNH BÁO] Namespace chặn quyền root (PSA restricted); đã gắn debug container ở chế độ non-root (UID 1000).")
 			attached = true
 		} else {
-			return podName, fmt.Errorf("lỗi gắn ephemeral debug container: %v (lỗi trước đó: %v)", err, lastErr)
+			return fmt.Errorf("lỗi gắn ephemeral debug container %s: %v (lỗi trước đó: %v)", debugContainerName, err, lastErr)
 		}
 	}
 
-	// Đợi container running
 	for i := 0; i < 30; i++ {
 		time.Sleep(2 * time.Second)
 		dbgState, _ := k.RunKubectl(ctx, "get", "pod", podName, "-n", k.namespace,
 			fmt.Sprintf("-o=jsonpath={.status.ephemeralContainerStatuses[?(@.name=='%s')].state}", debugContainerName))
 		if strings.Contains(dbgState, "running") {
 			fmt.Printf("    ✓ Ephemeral container '%s' đã sẵn sàng (running)!\n", debugContainerName)
-			return podName, nil
+			return nil
 		}
 		if strings.Contains(dbgState, "CreateContainerConfigError") || strings.Contains(dbgState, "CreateContainerError") {
-			return podName, fmt.Errorf("ephemeral container '%s' bị Kubelet từ chối khởi tạo: %s", debugContainerName, strings.TrimSpace(dbgState))
+			return fmt.Errorf("ephemeral container '%s' bị Kubelet từ chối khởi tạo: %s", debugContainerName, strings.TrimSpace(dbgState))
 		}
 	}
 
-	return podName, fmt.Errorf("ephemeral container %s không đạt trạng thái running", debugContainerName)
+	return fmt.Errorf("ephemeral container %s không đạt trạng thái running", debugContainerName)
 }
 
-// WaitForNewPodReady chờ một Pod mới (khác với oldPod) xuất hiện và đạt trạng thái Ready.
-func (k *K8sClient) WaitForNewPodReady(ctx context.Context, selector, oldPod string, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		default:
-		}
+// EnsureDebugContainerAlive kiểm tra Pod và debug container trước Pha 2;
+// nếu app container bị restart ở Pha 1 làm chết debug container cũ, tự động chờ Pod Ready và gắn lại debug container mới.
+func (k *K8sClient) EnsureDebugContainerAlive(ctx context.Context, podName, containerName, sidecarImage, selector, currentDebugContainer string) (string, string, error) {
+	if currentDebugContainer == "" {
+		currentDebugContainer = "capsizer-debugger"
+	}
+	if sidecarImage == "" {
+		sidecarImage = "docker.io/duyle95/profiling-sidecar:latest"
+	}
 
-		out, err := k.RunKubectl(ctx, "get", "pods", "-n", k.namespace, "-l", selector,
-			"--field-selector=status.phase=Running", "-o", "jsonpath={.items[*].metadata.name}")
-		if err == nil && strings.TrimSpace(out) != "" {
-			for _, candidate := range strings.Fields(out) {
-				if candidate != "" && candidate != oldPod {
-					ready, _ := k.RunKubectl(ctx, "get", "pod", candidate, "-n", k.namespace,
-						"-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}")
-					if strings.EqualFold(strings.TrimSpace(ready), "true") {
-						return candidate, nil
-					}
-				}
+	st, err := k.GetPodContainerStatus(ctx, podName, containerName, currentDebugContainer)
+	if err == nil && st.PodReady && st.DebugRunning {
+		return podName, currentDebugContainer, nil
+	}
+
+	if err == nil {
+		fmt.Printf("    [Guard Pha 2] Trạng thái hiện tại của Pod %s: Ready=%v, RestartCount=%d, LastTerm=%s(exit=%d), Waiting=%s, DebugRunning=%v\n",
+			podName, st.PodReady, st.RestartCount, st.LastTermReason, st.LastTermExitCode, st.WaitingReason, st.DebugRunning)
+	}
+
+	// 1. Nếu Pod đang restart hoặc chưa Ready, chờ tối đa 60s để Pod hồi phục (hoặc phát hiện CrashLoopBackOff)
+	if st == nil || !st.PodReady {
+		fmt.Printf("    • Đang chờ Pod %s hồi phục trạng thái Ready (tối đa 60s)...\n", podName)
+		recovered := false
+		for i := 0; i < 30; i++ {
+			time.Sleep(2 * time.Second)
+			curSt, err := k.GetPodContainerStatus(ctx, podName, containerName, currentDebugContainer)
+			if err == nil && curSt.PodReady {
+				st = curSt
+				recovered = true
+				fmt.Printf("    ✓ Pod %s đã hồi phục Ready!\n", podName)
+				break
+			}
+			if err == nil && curSt.WaitingReason == "CrashLoopBackOff" && i >= 10 {
+				return podName, currentDebugContainer, fmt.Errorf(
+					"Pod %s đang rơi vào CrashLoopBackOff (restartCount=%d, lastReason=%s, exitCode=%d) — dừng Pha 2",
+					podName, curSt.RestartCount, curSt.LastTermReason, curSt.LastTermExitCode)
 			}
 		}
-		time.Sleep(2 * time.Second)
+		if !recovered {
+			if selector != "" {
+				if newPod, err := k.WaitForPodReady(ctx, selector, 30*time.Second); err == nil && newPod != "" {
+					podName = newPod
+				} else {
+					return podName, currentDebugContainer, fmt.Errorf("Pod %s không hồi phục Ready sau sự cố ở Pha 1", podName)
+				}
+			} else {
+				return podName, currentDebugContainer, fmt.Errorf("Pod %s không hồi phục Ready sau sự cố ở Pha 1", podName)
+			}
+		}
 	}
-	return "", fmt.Errorf("hết thời gian chờ Pod mới sẵn sàng thay thế %s", oldPod)
+
+	// Kiểm tra lại xem trên Pod hiện tại debug container có đang chạy không
+	st, _ = k.GetPodContainerStatus(ctx, podName, containerName, currentDebugContainer)
+	if st != nil && st.DebugRunning {
+		return podName, currentDebugContainer, nil
+	}
+
+	// 2. Nếu debug container cũ đã chết (terminated do app container bị Liveness/OOM kill ở Pha 1),
+	// gắn một ephemeral debug container mới với tên mới nhắm vào PID namespace mới của app container!
+	targetContainer, _ := k.GetContainerName(ctx, podName, containerName)
+	newDebugName := fmt.Sprintf("capsizer-debugger-%d", time.Now().Unix()%10000)
+	fmt.Printf("    • Đang gắn Ephemeral Debug Container mới '%s' vào PID namespace mới của Pod %s...\n", newDebugName, podName)
+	if err := k.attachDebugContainerWithName(ctx, podName, targetContainer, sidecarImage, newDebugName); err == nil {
+		return podName, newDebugName, nil
+	} else {
+		fmt.Printf("    [!] Không thể gắn thêm '%s' trực tiếp (%v). Chuyển sang tái tạo Pod sạch...\n", newDebugName, err)
+	}
+
+	// Fallback: tái tạo Pod mới hoàn toàn
+	newPod, err := k.SetupDebugContainer(ctx, podName, containerName, sidecarImage, selector)
+	return newPod, "capsizer-debugger", err
 }
 
 // ExecInPod thực thi lệnh shell bên trong container của Pod.
@@ -465,6 +605,64 @@ func (k *K8sClient) ExecInPod(ctx context.Context, podName, containerName, cmd s
 	}
 	args = append(args, "--", "sh", "-c", cmd)
 	return k.RunKubectl(ctx, args...)
+}
+
+// StreamExecInPod thực thi lệnh bên trong container của Pod và đọc luồng stdout theo thời gian thực (từng dòng).
+func (k *K8sClient) StreamExecInPod(ctx context.Context, podName, containerName, cmd string, onLine func(string)) error {
+	cmdArr := []string{}
+	if k.useSudo {
+		cmdArr = append(cmdArr, "sudo")
+	}
+	cmdArr = append(cmdArr, "kubectl")
+	if k.kubeconfigPath != "" {
+		cmdArr = append(cmdArr, fmt.Sprintf("--kubeconfig=%s", k.kubeconfigPath))
+	}
+	if k.contextName != "" {
+		cmdArr = append(cmdArr, fmt.Sprintf("--context=%s", k.contextName))
+	}
+	cmdArr = append(cmdArr, "exec", "-n", k.namespace, podName)
+	if containerName != "" {
+		cmdArr = append(cmdArr, "-c", containerName)
+	}
+	cmdArr = append(cmdArr, "--", "sh", "-c", cmd)
+
+	if k.sshClient != nil {
+		quoted := make([]string, len(cmdArr))
+		for i, a := range cmdArr {
+			quoted[i] = quoteShellArg(a)
+		}
+		fullCmd := strings.Join(quoted, " ")
+		return k.sshClient.StreamCommand(ctx, fullCmd, onLine)
+	}
+
+	execCmd := exec.CommandContext(ctx, cmdArr[0], cmdArr[1:]...)
+	stdout, err := execCmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	var stderr bytes.Buffer
+	execCmd.Stderr = &stderr
+
+	if err := execCmd.Start(); err != nil {
+		return err
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		if onLine != nil {
+			onLine(scanner.Text())
+		}
+	}
+
+	waitErr := execCmd.Wait()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if waitErr != nil {
+		return fmt.Errorf("kubectl exec stream thất bại: %w (%s)", waitErr, strings.TrimSpace(stderr.String()))
+	}
+	return scanner.Err()
 }
 
 // CopyFromPod đọc nội dung file từ bên trong Pod và ghi trực tiếp về máy local
