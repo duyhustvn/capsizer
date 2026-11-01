@@ -124,8 +124,8 @@ func AnalyzeMemory(baseRAM *float64, rows []EvalRow) *MemoryRecommendation {
 	// Khuyến nghị K8s Sizing:
 	// - Request: Đảm bảo đủ cho Peak tải quan sát được
 	// - Limit: Thêm 25% - 30% headroom để tránh bị OOM-Killed khi có spike đột ngột
-	recReq := math.Ceil(maxPeak*1.1 / 64.0) * 64.0 // Làm tròn lên bội số 64MB
-	recLim := math.Ceil(maxPeak*1.3 / 64.0) * 64.0 // Làm tròn lên bội số 64MB
+	recReq := math.Ceil(maxPeak*1.1/64.0) * 64.0 // Làm tròn lên bội số 64MB
+	recLim := math.Ceil(maxPeak*1.3/64.0) * 64.0 // Làm tròn lên bội số 64MB
 
 	return &MemoryRecommendation{
 		BaseMB:           baseVal,

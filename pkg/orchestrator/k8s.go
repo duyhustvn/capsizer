@@ -718,8 +718,11 @@ func (k *K8sClient) CopyToPod(ctx context.Context, localPath, podName, container
 }
 
 func quoteShellArg(arg string) string {
-	if strings.ContainsAny(arg, " \t\n\"'$()[]{}*?&;|<>\\`~#") {
-		return strconv.Quote(arg)
+	if arg == "" {
+		return "''"
+	}
+	if strings.ContainsAny(arg, " \t\n\"'$()[]{}*?&;|<>\\`~#!") {
+		return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
 	}
 	return arg
 }

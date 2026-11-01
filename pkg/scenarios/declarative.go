@@ -291,8 +291,8 @@ func loadJSONDataset(name string, filePath string) ([]any, error) {
 // 2. Ký tự thư mục home '~' (vd: ~/data/users.csv)
 // 3. Biến môi trường hệ thống (vd: $DATA_DIR/users.csv, ${DATA_DIR}/items.json)
 // 4. Đường dẫn tương đối (vd: queries.txt, ./data/users.csv, ../shared/items.json)
-//    - Ưu tiên 1: Tương đối theo thư mục kịch bản baseDir
-//    - Ưu tiên 2: Tương đối theo thư mục làm việc hiện tại (working directory)
+//   - Ưu tiên 1: Tương đối theo thư mục kịch bản baseDir
+//   - Ưu tiên 2: Tương đối theo thư mục làm việc hiện tại (working directory)
 func resolveFilePath(rawPath string, baseDir string) (string, error) {
 	if strings.TrimSpace(rawPath) == "" {
 		return "", errors.New("đường dẫn file rỗng")

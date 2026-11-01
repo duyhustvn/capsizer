@@ -116,10 +116,10 @@ func main() {
 		// ---------------------------------------------------------------------
 		// THAM SỐ TƯƠNG THÍCH NGƯỢC (LEGACY / CONVENIENCE ALIASES)
 		// ---------------------------------------------------------------------
-		methodLegacy      = flag.String("method", "", "[Legacy alias] HTTP method cho kịch bản REST")
-		bodyLegacy        = flag.String("body", "", "[Legacy alias] chuỗi body gửi kèm cho request")
-		bodyFileLegacy    = flag.String("body-file", "", "[Legacy alias] file chứa body payload")
-		cacheBustLegacy   = flag.Bool("cache-bust", false, "[Legacy alias] thêm tham số timestamp ngẫu nhiên chống cache")
+		methodLegacy    = flag.String("method", "", "[Legacy alias] HTTP method cho kịch bản REST")
+		bodyLegacy      = flag.String("body", "", "[Legacy alias] chuỗi body gửi kèm cho request")
+		bodyFileLegacy  = flag.String("body-file", "", "[Legacy alias] file chứa body payload")
+		cacheBustLegacy = flag.Bool("cache-bust", false, "[Legacy alias] thêm tham số timestamp ngẫu nhiên chống cache")
 	)
 
 	var headers headerList

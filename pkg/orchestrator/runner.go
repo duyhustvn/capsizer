@@ -224,6 +224,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		if err := r.setupK8sTarget(ctx); err != nil {
 			return err
 		}
+		r.waitAppStable(ctx, r.toolContainer(), 3, 90*time.Second)
 	}
 
 	// 4. Đồng bộ máy phát tải từ xa nếu mode=remote
@@ -265,14 +266,14 @@ func (r *Runner) Run(ctx context.Context) error {
 		fmt.Printf("==> Đang khởi chạy probe trong Pod %s (container: %s, port: %d) và stream thời gian thực về máy Skill...\n",
 			r.cfg.K8sPod, execContainer, r.cfg.TargetPort)
 
-		stopOldCmd := "pkill -f 'probe -port' 2>/dev/null || pkill -x probe 2>/dev/null || true"
+		stopOldCmd := "pkill -INT -x probe 2>/dev/null || pkill -x probe 2>/dev/null || true"
 		_, _ = r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, stopOldCmd)
 
 		probeStartCmd := fmt.Sprintf(
 			"if [ -x /tmp/probe ]; then PBIN=/tmp/probe; elif command -v probe >/dev/null 2>&1; then PBIN=probe; else PBIN=/tmp/probe; fi; "+
 				": > /tmp/probe.jsonl; "+
 				"nohup $PBIN -port %d -target http://127.0.0.1:%d -out /tmp/probe.jsonl >/tmp/probe.log 2>&1 < /dev/null & "+
-				"sleep 1; pgrep -f 'probe -port' >/dev/null && echo PROBE_RUNNING || (cat /tmp/probe.log 2>/dev/null; exit 1)",
+				"sleep 2; pgrep -x probe >/dev/null && echo PROBE_RUNNING || (cat /tmp/probe.log 2>/dev/null; exit 1)",
 			r.cfg.TargetPort, r.cfg.TargetPort,
 		)
 		if out, err := r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, probeStartCmd); err != nil {
@@ -283,12 +284,13 @@ func (r *Runner) Run(ctx context.Context) error {
 
 		defer func() {
 			_, _ = r.k8sClient.ExecInPod(context.Background(), r.cfg.K8sPod, r.toolContainer(),
-				"pkill -INT -f 'probe -port' 2>/dev/null || pkill -f 'probe' 2>/dev/null || true")
+				"pkill -INT -x probe 2>/dev/null || pkill -x probe 2>/dev/null || true")
 		}()
 
 		// Mở luồng stream trực tiếp từng dòng từ /tmp/probe.jsonl về local probeLog (kèm cơ chế tự động retry + chống trùng dòng)
 		var streamCtx context.Context
 		streamCtx, probeStreamCancel = context.WithCancel(ctx)
+		defer probeStreamCancel()
 		go func() {
 			defer close(probeStreamDone)
 
@@ -403,7 +405,7 @@ func (r *Runner) Run(ctx context.Context) error {
 
 				// 2. Đảm bảo tiến trình probe trong container vẫn đang chạy
 				ensureCmd := fmt.Sprintf(
-					"if ! pgrep -f 'probe -port' >/dev/null 2>&1; then "+
+					"if ! pgrep -x probe >/dev/null 2>&1; then "+
 						"if [ -x /tmp/probe ]; then PBIN=/tmp/probe; else PBIN=probe; fi; "+
 						"nohup $PBIN -port %d -target http://127.0.0.1:%d -out /tmp/probe.jsonl >>/tmp/probe.log 2>&1 < /dev/null & "+
 						"fi",
@@ -446,7 +448,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	if r.cfg.K8sPod != "" {
 		if !podCrashedInPhase1.Load() {
 			_, _ = r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer,
-				"pkill -INT -f 'probe -port' 2>/dev/null || pkill -f 'probe' 2>/dev/null || true")
+				"pkill -INT -x probe 2>/dev/null || pkill -x probe 2>/dev/null || true")
 			time.Sleep(1 * time.Second)
 		}
 		if probeStreamCancel != nil {
@@ -570,6 +572,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				_ = r.setupK8sTarget(ctx)
 			}
 		}
+		r.waitAppStable(ctx, execContainer, 2, 60*time.Second)
 	}
 
 	profilers := r.parseProfilers(r.cfg.ProfileType)
@@ -607,18 +610,25 @@ func (r *Runner) Run(ctx context.Context) error {
 		remoteSVG := fmt.Sprintf("/tmp/flamegraph_%s.svg", prof)
 
 		if r.cfg.K8sPod != "" {
+			pidResolveSnippet := fmt.Sprintf(
+				"PID=%d; if [ \"$PID\" -le 0 ]; then "+
+					"PID=$(pgrep -f 'uvicorn|gunicorn|python|fastapi' | grep -vw \"$$\" | head -n 1); "+
+					"fi; "+
+					"case \"$PID\" in ''|*[!0-9]*) PID=1 ;; esac; "+
+					"echo \"Target PID=$PID\"",
+				r.cfg.TargetPID,
+			)
 			var profCmd string
 			if prof == "pyspy" || prof == "py-spy" {
 				profCmd = fmt.Sprintf(
-					": > %s; PID=%d; if [ \"$PID\" -le 0 ]; then "+
-						"PID=$(pgrep -f 'uvicorn|gunicorn|python|fastapi' | head -n 1); "+
-						"[ -z \"$PID\" ] && PID=1; fi; "+
-						"echo \"Target PID=$PID\"; "+
-						"py-spy record -o %s --pid $PID --duration %d --rate 100 --subprocesses",
-					remoteSVG, r.cfg.TargetPID, remoteSVG, profDuration,
+					": > %s; %s; py-spy record -o %s --pid \"$PID\" --duration %d --rate 100 --subprocesses",
+					remoteSVG, pidResolveSnippet, remoteSVG, profDuration,
 				)
 			} else if prof == "perf" {
-				profCmd = fmt.Sprintf(": > %s; profile-perf %d %s %d", remoteSVG, profDuration, remoteSVG, r.cfg.TargetPID)
+				profCmd = fmt.Sprintf(
+					": > %s; %s; profile-perf -p \"$PID\" -d %d -o %s",
+					remoteSVG, pidResolveSnippet, profDuration, remoteSVG,
+				)
 			}
 
 			if profCmd != "" {
@@ -736,6 +746,62 @@ func (r *Runner) setupK8sTarget(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// waitAppStable chờ ứng dụng mục tiêu trong Pod phản hồi /health/live HTTP 200 ổn định liên tiếp
+// (tránh bắn tải hoặc profiling ngay khi Pod vừa báo Ready nhưng ứng dụng bên trong vẫn đang warm-up ngầm).
+func (r *Runner) waitAppStable(ctx context.Context, execContainer string, requiredStreak int, timeout time.Duration) {
+	if r.cfg.K8sPod == "" || requiredStreak <= 0 || timeout <= 0 {
+		return
+	}
+	fmt.Printf("==> [Health Gate] Đang chờ ứng dụng (port %d) phản hồi /health/live 200 ổn định (%d lần liên tiếp, tối đa %ds)...\n",
+		r.cfg.TargetPort, requiredStreak, int(timeout.Seconds()))
+
+	checkCmd := fmt.Sprintf(
+		"if [ -x /tmp/probe ]; then PBIN=/tmp/probe; elif command -v probe >/dev/null 2>&1; then PBIN=probe; else PBIN=/tmp/probe; fi; "+
+			"$PBIN -port %d -target http://127.0.0.1:%d -health-timeout 3 -once 2>/dev/null",
+		r.cfg.TargetPort, r.cfg.TargetPort,
+	)
+
+	deadline := time.Now().Add(timeout)
+	streak := 0
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return
+		}
+		cCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		out, err := r.k8sClient.ExecInPod(cCtx, r.cfg.K8sPod, execContainer, checkCmd)
+		cancel()
+
+		compact := strings.Map(func(ru rune) rune {
+			if ru == ' ' || ru == '\t' || ru == '\n' || ru == '\r' {
+				return -1
+			}
+			return ru
+		}, out)
+
+		if err == nil && strings.Contains(compact, `"health_code":200`) {
+			streak++
+			if streak >= requiredStreak {
+				fmt.Printf("    ✓ Ứng dụng đã ổn định (%d/%d lần /health/live = 200 OK).\n", streak, requiredStreak)
+				return
+			}
+		} else {
+			if streak > 0 {
+				fmt.Printf("    [!] /health/live nhấp nháy, reset streak (%d -> 0)...\n", streak)
+			}
+			streak = 0
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	fmt.Printf("    [CẢNH BÁO] Hết thời gian chờ %ds nhưng ứng dụng chưa đạt %d lần /health/live 200 liên tiếp (streak: %d/%d). Tiếp tục chạy...\n",
+		int(timeout.Seconds()), requiredStreak, streak, requiredStreak)
 }
 
 func (r *Runner) ensureLinuxBinary(name, pkgPath string) (string, error) {

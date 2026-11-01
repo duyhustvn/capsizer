@@ -265,7 +265,6 @@ func ResolveQueries(queriesFile string, envFile string) []string {
 	return nil
 }
 
-
 type User struct {
 	ID    string
 	Token string

@@ -1210,7 +1210,7 @@ echo "==> Hoàn thành phát tải Pha 1!"
 # Dừng probe và thu thập log
 if [[ -n "$POD_NAME" ]]; then
   echo "==> Đang dừng probe và tải file log probe.jsonl về..."
-  exec_in_target "pkill -f 'probe' || true"
+  exec_in_target "pkill -INT -x probe 2>/dev/null || pkill -x probe 2>/dev/null || true"
   sleep 1
   copy_from_target "/tmp/probe.jsonl" "$PROBE_LOG"
 else
@@ -1290,12 +1290,12 @@ for prof in "${PROFILER_LIST[@]}"; do
 
   if [[ -n "$POD_NAME" ]]; then
     if [[ "$prof" == "pyspy" ]]; then
-      echo "    Chạy py-spy record (30s, rate 100Hz, đọc Python stack)..."
-      exec_in_target "py-spy record -o /tmp/flamegraph_${prof}.svg -d ${PROF_DURATION} --rate 100 --subprocesses || true"
+      echo "    Chạy py-spy record (${PROF_DURATION}s, rate 100Hz, đọc Python stack)..."
+      exec_in_target ": > /tmp/flamegraph_${prof}.svg; PID=\$(pgrep -f 'uvicorn|gunicorn|python|fastapi' | grep -vw \"\$\$\" | head -n 1); case \"\$PID\" in ''|*[!0-9]*) PID=1 ;; esac; py-spy record -o /tmp/flamegraph_${prof}.svg --pid \"\$PID\" --duration ${PROF_DURATION} --rate 100 --subprocesses || true"
       copy_from_target "/tmp/flamegraph_${prof}.svg" "$local_svg"
     elif [[ "$prof" == "perf" ]]; then
-      echo "    Chạy profile-perf (30s, rate 99Hz, đọc Kernel & C++ stack)..."
-      exec_in_target "profile-perf ${PROF_DURATION} /tmp/flamegraph_${prof}.svg || true"
+      echo "    Chạy profile-perf (${PROF_DURATION}s, rate 99Hz, đọc Kernel & C++ stack)..."
+      exec_in_target ": > /tmp/flamegraph_${prof}.svg; PID=\$(pgrep -f 'uvicorn|gunicorn|python|fastapi' | grep -vw \"\$\$\" | head -n 1); case \"\$PID\" in ''|*[!0-9]*) PID=1 ;; esac; profile-perf -p \"\$PID\" -d ${PROF_DURATION} -o /tmp/flamegraph_${prof}.svg || true"
       copy_from_target "/tmp/flamegraph_${prof}.svg" "$local_svg"
     else
       echo "    [CẢNH BÁO] Không hỗ trợ profiler '${prof}'. Bỏ qua."

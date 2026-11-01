@@ -40,7 +40,7 @@ type StepResult struct {
 
 // StatusUpdate chứa thông tin tiến độ thời gian thực của step đang chạy.
 type StatusUpdate struct {
-	Phase         int     // 0: RAMPING, 1: SETTLING
+	Phase         int // 0: RAMPING, 1: SETTLING
 	StepIndex     int
 	TotalSteps    int
 	RPS           float64

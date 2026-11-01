@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -133,5 +134,28 @@ func TestSSHClient_RespectsSSHConfigWhenUserAndPortEmpty(t *testing.T) {
 	}
 	if client.DisplayTarget() != "k8s-prod-alias" {
 		t.Errorf("DisplayTarget() = %q; want 'k8s-prod-alias'", client.DisplayTarget())
+	}
+}
+
+func TestQuoteShellArg_PreservesVariablesAndSingleQuotesInPOSIXShell(t *testing.T) {
+	inputs := []string{
+		"",
+		"simple-arg",
+		`if [ -x /tmp/probe ]; then PBIN=/tmp/probe; fi; nohup $PBIN -port 8000`,
+		`: > /tmp/flamegraph_pyspy.svg; PID=0; if [ "$PID" -le 0 ]; then PID=$(pgrep -f 'uvicorn|gunicorn|python|fastapi' | grep -vw "$$" | head -n 1); fi; case "$PID" in ''|*[!0-9]*) PID=1 ;; esac; echo "Target PID=$PID"`,
+		`{"query": "test $HOME 'single' \"double\" ` + "`backtick`" + ` $(id)"}`,
+	}
+
+	for _, in := range inputs {
+		quoted := quoteShellArg(in)
+		// Mô phỏng remote SSH shell: chạy sh -c "printf '%s' <quoted>"
+		// Nếu quoteShellArg chuẩn POSIX nháy đơn, stdout của printf phải trùng khớp 100% với chuỗi gốc (không bị expand $PBIN, $PID, $(...), $$).
+		out, err := exec.Command("sh", "-c", "printf '%s' "+quoted).CombinedOutput()
+		if err != nil {
+			t.Fatalf("sh -c failed for input %q (quoted: %s): %v (%s)", in, quoted, err, string(out))
+		}
+		if string(out) != in {
+			t.Errorf("quoteShellArg(%q) expanded by outer shell:\n  got : %q\n  want: %q", in, string(out), in)
+		}
 	}
 }

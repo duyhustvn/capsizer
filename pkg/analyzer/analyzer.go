@@ -153,9 +153,9 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 		s := ProbeSlice(probe, w.T0, w.T1)
 
 		var (
-			cores, cMs, thrPct                     *float64
-			acceptq, healthP99, fdmax, thrd        *float64
-			acptSamples                            int
+			cores, cMs, thrPct              *float64
+			acceptq, healthP99, fdmax, thrd *float64
+			acptSamples                     int
 		)
 
 		// Phân tích RAM trong step
@@ -280,8 +280,20 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 			HealthP99:  healthP99,
 			AccQueue:   accInt,
 			Throttle:   thrPct,
-			FDs:        func() *int { if fdmax == nil { return nil }; v := int(*fdmax); return &v }(),
-			Threads:    func() *int { if thrd == nil { return nil }; v := int(*thrd); return &v }(),
+			FDs: func() *int {
+				if fdmax == nil {
+					return nil
+				}
+				v := int(*fdmax)
+				return &v
+			}(),
+			Threads: func() *int {
+				if thrd == nil {
+					return nil
+				}
+				v := int(*thrd)
+				return &v
+			}(),
 			Ok:         isOk,
 			KneeReason: strings.Join(reasons, ", "),
 		})
