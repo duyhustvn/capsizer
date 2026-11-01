@@ -47,18 +47,20 @@ SKIP_VERIFY="${SKIP_VERIFY:-false}"
 # ------------------------------------------------------------------------------
 LOADGEN_MODE="${LOADGEN_MODE:-local}" # 'local' hoặc 'remote'
 LOADGEN_HOST="${REMOTE_HOST:-${LOADGEN_HOST:-}}"
-LOADGEN_USER="${REMOTE_USER:-${LOADGEN_USER:-$(whoami)}}"
-LOADGEN_PORT="${REMOTE_PORT:-${LOADGEN_PORT:-22}}"
+LOADGEN_USER="${REMOTE_USER:-${LOADGEN_USER:-}}"
+LOADGEN_PORT="${REMOTE_PORT:-${LOADGEN_PORT:-}}"
 LOADGEN_KEY="${REMOTE_KEY:-${LOADGEN_KEY:-}}"
+LOADGEN_JUMP="${REMOTE_JUMP:-${LOADGEN_JUMP:-}}"
 LOADGEN_DIR="${REMOTE_DIR:-${LOADGEN_DIR:-~/capsizer-loadtest}}"
 
 # ------------------------------------------------------------------------------
 # Machine 3: Server cụm Kubernetes (K8s Master/Bastion qua SSH hoặc local)
 # ------------------------------------------------------------------------------
-K8S_SSH_HOST="${K8S_SSH_HOST:-}"      # IP hoặc host của Server cụm K8s (để trống nếu chạy local kubectl)
-K8S_SSH_USER="${K8S_SSH_USER:-$(whoami)}"
-K8S_SSH_PORT="${K8S_SSH_PORT:-22}"
+K8S_SSH_HOST="${K8S_SSH_HOST:-}"      # IP hoặc Host alias trong ~/.ssh/config
+K8S_SSH_USER="${K8S_SSH_USER:-}"
+K8S_SSH_PORT="${K8S_SSH_PORT:-}"
 K8S_SSH_KEY="${K8S_SSH_KEY:-}"
+K8S_SSH_JUMP="${K8S_SSH_JUMP:-}"
 K8S_USE_SUDO="${K8S_USE_SUDO:-true}"  # Chạy 'sudo kubectl' trên server cụm
 
 POD_NAME="${K8S_POD:-}"
@@ -325,27 +327,43 @@ fi
 # ==============================================================================
 # HÀM KẾT NỐI VÀ ĐIỀU PHỐI SSH SERVER CỤM K8S (MACHINE 3)
 # ==============================================================================
-K8S_SSH_OPTS=(-p "$K8S_SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
-K8S_SCP_OPTS=(-P "$K8S_SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+K8S_SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+K8S_SCP_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+if [[ -n "$K8S_SSH_PORT" ]]; then
+  K8S_SSH_OPTS+=(-p "$K8S_SSH_PORT")
+  K8S_SCP_OPTS+=(-P "$K8S_SSH_PORT")
+fi
 if [[ -n "$K8S_SSH_KEY" ]]; then
   K8S_SSH_OPTS+=(-i "$K8S_SSH_KEY")
   K8S_SCP_OPTS+=(-i "$K8S_SSH_KEY")
 fi
+if [[ -n "$K8S_SSH_JUMP" ]]; then
+  K8S_SSH_OPTS+=(-J "$K8S_SSH_JUMP")
+  K8S_SCP_OPTS+=(-J "$K8S_SSH_JUMP")
+fi
+
+k8s_ssh_target() {
+  if [[ -n "$K8S_SSH_USER" && "$K8S_SSH_HOST" != *@* ]]; then
+    echo "${K8S_SSH_USER}@${K8S_SSH_HOST}"
+  else
+    echo "${K8S_SSH_HOST}"
+  fi
+}
 
 run_k8s_ssh() {
-  ssh "${K8S_SSH_OPTS[@]}" "${K8S_SSH_USER}@${K8S_SSH_HOST}" "$@"
+  ssh "${K8S_SSH_OPTS[@]}" "$(k8s_ssh_target)" "$@"
 }
 
 run_k8s_scp_to() {
   local src="$1"
   local dst="$2"
-  scp "${K8S_SCP_OPTS[@]}" "$src" "${K8S_SSH_USER}@${K8S_SSH_HOST}:$dst"
+  scp "${K8S_SCP_OPTS[@]}" "$src" "$(k8s_ssh_target):$dst"
 }
 
 run_k8s_scp_from() {
   local src="$1"
   local dst="$2"
-  scp "${K8S_SCP_OPTS[@]}" "${K8S_SSH_USER}@${K8S_SSH_HOST}:$src" "$dst"
+  scp "${K8S_SCP_OPTS[@]}" "$(k8s_ssh_target):$src" "$dst"
 }
 
 # ==============================================================================
@@ -585,27 +603,43 @@ trap cleanup EXIT INT TERM
 # ==============================================================================
 # HÀM KẾT NỐI VÀ ĐIỀU PHỐI MÁY PHÁT TẢI (MACHINE 2: LOAD GENERATOR)
 # ==============================================================================
-LOADGEN_SSH_OPTS=(-p "$LOADGEN_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
-LOADGEN_SCP_OPTS=(-P "$LOADGEN_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+LOADGEN_SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+LOADGEN_SCP_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+if [[ -n "$LOADGEN_PORT" ]]; then
+  LOADGEN_SSH_OPTS+=(-p "$LOADGEN_PORT")
+  LOADGEN_SCP_OPTS+=(-P "$LOADGEN_PORT")
+fi
 if [[ -n "$LOADGEN_KEY" ]]; then
   LOADGEN_SSH_OPTS+=(-i "$LOADGEN_KEY")
   LOADGEN_SCP_OPTS+=(-i "$LOADGEN_KEY")
 fi
+if [[ -n "$LOADGEN_JUMP" ]]; then
+  LOADGEN_SSH_OPTS+=(-J "$LOADGEN_JUMP")
+  LOADGEN_SCP_OPTS+=(-J "$LOADGEN_JUMP")
+fi
+
+loadgen_ssh_target() {
+  if [[ -n "$LOADGEN_USER" && "$LOADGEN_HOST" != *@* ]]; then
+    echo "${LOADGEN_USER}@${LOADGEN_HOST}"
+  else
+    echo "${LOADGEN_HOST}"
+  fi
+}
 
 run_loadgen_ssh() {
-  ssh "${LOADGEN_SSH_OPTS[@]}" "${LOADGEN_USER}@${LOADGEN_HOST}" "$@"
+  ssh "${LOADGEN_SSH_OPTS[@]}" "$(loadgen_ssh_target)" "$@"
 }
 
 run_loadgen_scp_to() {
   local src="$1"
   local dst="$2"
-  scp "${LOADGEN_SCP_OPTS[@]}" "$src" "${LOADGEN_USER}@${LOADGEN_HOST}:$dst"
+  scp "${LOADGEN_SCP_OPTS[@]}" "$src" "$(loadgen_ssh_target):$dst"
 }
 
 run_loadgen_scp_from() {
   local src="$1"
   local dst="$2"
-  scp "${LOADGEN_SCP_OPTS[@]}" "${LOADGEN_USER}@${LOADGEN_HOST}:$src" "$dst"
+  scp "${LOADGEN_SCP_OPTS[@]}" "$(loadgen_ssh_target):$src" "$dst"
 }
 
 # ==============================================================================

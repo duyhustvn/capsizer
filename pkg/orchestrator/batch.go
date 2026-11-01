@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -19,15 +20,23 @@ type BatchResult struct {
 
 // RunBatch chạy tự động tuần tự nhiều kịch bản và tổng hợp kết quả.
 func RunBatch(ctx context.Context, baseCfg *Config, scenarios []string) error {
+	return RunBatchWithOverrides(ctx, baseCfg, scenarios, nil)
+}
+
+// RunBatchWithOverrides chạy tự động tuần tự nhiều kịch bản, giữ nguyên các cờ CLI ghi đè.
+func RunBatchWithOverrides(ctx context.Context, baseCfg *Config, scenarios []string, applyOverrides func(*Config)) error {
 	if len(scenarios) == 0 {
-		// Tự động quét thư mục scenarios/
-		entries, err := os.ReadDir("scenarios")
+		scenariosDir := "scenarios"
+		if !dirExists(scenariosDir) && baseCfg.ProjectRoot != "" {
+			scenariosDir = filepath.Join(baseCfg.ProjectRoot, "scenarios")
+		}
+		entries, err := os.ReadDir(scenariosDir)
 		if err != nil {
 			return fmt.Errorf("không đọc được thư mục scenarios: %w", err)
 		}
 		for _, e := range entries {
 			if e.IsDir() {
-				scDir := filepath.Join("scenarios", e.Name())
+				scDir := filepath.Join(scenariosDir, e.Name())
 				if fileExists(filepath.Join(scDir, "scenario.json")) || fileExists(filepath.Join(scDir, "scenario.env")) {
 					scenarios = append(scenarios, e.Name())
 				}
@@ -60,9 +69,11 @@ func RunBatch(ctx context.Context, baseCfg *Config, scenarios []string) error {
 		scOut := filepath.Join(batchDir, sc)
 		_ = os.MkdirAll(scOut, 0755)
 
-		// Sao chép cấu hình nền cho kịch bản này
+		// Khởi tạo cấu hình độc lập cho kịch bản này từ cấu hình hạ tầng nền
 		scCfg := *baseCfg
-		scCfg.OutDir = scOut
+		scCfg.PortExplicit = false
+		scCfg.K8sPod = ""
+		scCfg.K8sSelector = ""
 		if err := scCfg.LoadScenarioPackage(sc); err != nil {
 			fmt.Printf("[ERROR] Nạp kịch bản %s thất bại: %v\n", sc, err)
 			results = append(results, BatchResult{
@@ -71,6 +82,11 @@ func RunBatch(ctx context.Context, baseCfg *Config, scenarios []string) error {
 			})
 			continue
 		}
+		if applyOverrides != nil {
+			applyOverrides(&scCfg)
+		}
+		scCfg.OutDir = scOut
+		scCfg.Finalize()
 
 		runner, err := NewRunner(&scCfg)
 		if err != nil {
@@ -97,12 +113,20 @@ func RunBatch(ctx context.Context, baseCfg *Config, scenarios []string) error {
 			ReportPath: filepath.Join(scOut, "phase1-report.txt"),
 		}
 
-		// Đọc kết quả từ file report nếu có
-		if fileExists(res.ReportPath) {
+		if runner.LastReport != nil {
+			if runner.LastReport.HasKnee && runner.LastReport.KneeRPS > 0 {
+				res.KneePoint = fmt.Sprintf("%.1f req/s", runner.LastReport.KneeRPS)
+			} else {
+				res.KneePoint = "Khỏe (No Knee)"
+			}
+			if runner.LastReport.LastP95Ms > 0 {
+				res.P95Latency = fmt.Sprintf("%.1fms", runner.LastReport.LastP95Ms)
+			}
+		} else if fileExists(res.ReportPath) {
 			data, err := os.ReadFile(res.ReportPath)
 			if err == nil {
 				text := string(data)
-				if stringsContains(text, "Điểm gãy quan sát được") {
+				if strings.Contains(text, "Điểm gãy quan sát được") {
 					res.KneePoint = "Phát hiện Knee"
 				} else {
 					res.KneePoint = "Khỏe (No Knee)"
@@ -121,9 +145,10 @@ func RunBatch(ctx context.Context, baseCfg *Config, scenarios []string) error {
 	printHeader := func() {
 		header := fmt.Sprintf("%-18s | %-12s | %-15s | %-12s | %-12s | %-10s\n",
 			"SCENARIO", "PROFILE", "KNEE POINT", "P95 LATENCY", "STATUS", "REPORT LINK")
-		fmt.Println(header)
+		sep := strings.Repeat("-", 88) + "\n"
+		fmt.Print(header + sep)
 		if f != nil {
-			_, _ = f.WriteString(header)
+			_, _ = f.WriteString(header + sep)
 		}
 	}
 
@@ -147,17 +172,4 @@ func RunBatch(ctx context.Context, baseCfg *Config, scenarios []string) error {
 	fmt.Println("================================================================================")
 
 	return nil
-}
-
-func stringsContains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 || (len(s) > 0 && len(substr) > 0 && containsHelper(s, substr)))
-}
-
-func containsHelper(s, substr string) bool {
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

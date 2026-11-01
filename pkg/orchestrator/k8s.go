@@ -3,7 +3,9 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -11,11 +13,11 @@ import (
 
 // K8sClient điều phối cụm Kubernetes qua SSH (Machine 3) hoặc kubectl cục bộ.
 type K8sClient struct {
-	sshClient       *SSHClient
-	useSudo         bool
-	namespace       string
-	kubeconfigPath  string
-	contextName     string
+	sshClient      *SSHClient
+	useSudo        bool
+	namespace      string
+	kubeconfigPath string
+	contextName    string
 }
 
 // NewK8sClient khởi tạo client Kubernetes.
@@ -30,6 +32,19 @@ func NewK8sClient(sshClient *SSHClient, useSudo bool, namespace, kubeconfig, con
 		kubeconfigPath: kubeconfig,
 		contextName:    contextName,
 	}
+}
+
+// RunHostCommand thực thi lệnh shell trên máy chạy kubectl (Machine 3 qua SSH hoặc Local).
+func (k *K8sClient) RunHostCommand(ctx context.Context, cmd string) (string, error) {
+	if k.sshClient != nil {
+		return k.sshClient.RunCommand(ctx, cmd)
+	}
+	execCmd := exec.CommandContext(ctx, "sh", "-c", cmd)
+	out, err := execCmd.CombinedOutput()
+	if err != nil {
+		return strings.TrimSpace(string(out)), fmt.Errorf("lệnh host thất bại: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // RunKubectl thực thi một lệnh kubectl (cục bộ hoặc qua SSH).
@@ -248,11 +263,17 @@ func (k *K8sClient) WaitForPodReady(ctx context.Context, selector string, timeou
 	return "", fmt.Errorf("hết thời gian chờ Pod sẵn sàng khớp với selector %s", selector)
 }
 
-// SetupDebugContainer gắn Ephemeral Debug Container vào Pod mục tiêu.
-func (k *K8sClient) SetupDebugContainer(ctx context.Context, podName, containerName, sidecarImage string) error {
+// SetupDebugContainer gắn Ephemeral Debug Container (capsizer-debugger) vào Pod mục tiêu.
+// Trả về tên Pod thực tế (có thể đổi sang Pod mới nếu Pod cũ có debug container bị terminated).
+func (k *K8sClient) SetupDebugContainer(ctx context.Context, podName, containerName, sidecarImage, selector string) (string, error) {
 	debugContainerName := "capsizer-debugger"
 	if sidecarImage == "" {
 		sidecarImage = "docker.io/duyle95/profiling-sidecar:latest"
+	}
+
+	targetContainer, err := k.GetContainerName(ctx, podName, containerName)
+	if err != nil {
+		targetContainer = containerName
 	}
 
 	// Kiểm tra xem debug container đã tồn tại chưa
@@ -262,23 +283,52 @@ func (k *K8sClient) SetupDebugContainer(ctx context.Context, podName, containerN
 		dbgState, _ := k.RunKubectl(ctx, "get", "pod", podName, "-n", k.namespace,
 			fmt.Sprintf("-o=jsonpath={.status.ephemeralContainerStatuses[?(@.name=='%s')].state}", debugContainerName))
 		if strings.Contains(dbgState, "running") {
-			return nil
+			fmt.Printf("    ✓ Ephemeral container '%s' đã chạy sẵn trong Pod %s.\n", debugContainerName, podName)
+			return podName, nil
+		}
+		if strings.Contains(dbgState, "terminated") && selector != "" {
+			fmt.Printf("    [!] Ephemeral container '%s' cũ đã dừng (terminated). Đang tái tạo Pod sạch...\n", debugContainerName)
+			_, _ = k.RunKubectl(ctx, "delete", "pod", podName, "-n", k.namespace, "--wait=true")
+			newPod, err := k.WaitForPodReady(ctx, selector, 120*time.Second)
+			if err != nil {
+				return podName, fmt.Errorf("không thể chờ Pod mới sau khi xóa Pod cũ: %w", err)
+			}
+			podName = newPod
+			fmt.Printf("    ✓ Pod mới đã sẵn sàng: %s\n", podName)
 		}
 	}
+
+	// Tạo file cấu hình securityContext root tạm trên máy chạy kubectl
+	customYAMLPath := "/tmp/capsizer-debug-root.yaml"
+	_, _ = k.RunHostCommand(ctx, fmt.Sprintf("printf 'securityContext:\\n  runAsUser: 0\\n  runAsGroup: 0\\n' > %s", customYAMLPath))
 
 	debugArgs := []string{
 		"debug", podName, "-n", k.namespace,
 		fmt.Sprintf("--image=%s", sidecarImage),
-		fmt.Sprintf("--custom-name=%s", debugContainerName),
-		"--share-processes",
 	}
-	if containerName != "" {
-		debugArgs = append(debugArgs, fmt.Sprintf("--target=%s", containerName))
+	if targetContainer != "" {
+		debugArgs = append(debugArgs, fmt.Sprintf("--target=%s", targetContainer))
 	}
+	debugArgsWithCustom := append([]string{}, debugArgs...)
+	debugArgsWithCustom = append(debugArgsWithCustom,
+		"-c", debugContainerName,
+		"--attach=false",
+		fmt.Sprintf("--custom=%s", customYAMLPath),
+		"--profile=sysadmin",
+		"--", "sh", "-c", "sleep infinity",
+	)
 
-	_, err := k.RunKubectl(ctx, debugArgs...)
-	if err != nil {
-		return fmt.Errorf("lỗi gắn ephemeral debug container: %w", err)
+	if _, err := k.RunKubectl(ctx, debugArgsWithCustom...); err != nil {
+		// Fallback nếu phiên bản kubectl không hỗ trợ --custom hoặc --profile
+		debugArgsFallback := append([]string{}, debugArgs...)
+		debugArgsFallback = append(debugArgsFallback,
+			"-c", debugContainerName,
+			"--attach=false",
+			"--", "sh", "-c", "sleep infinity",
+		)
+		if _, err2 := k.RunKubectl(ctx, debugArgsFallback...); err2 != nil {
+			return podName, fmt.Errorf("lỗi gắn ephemeral debug container: %w", err2)
+		}
 	}
 
 	// Đợi container running
@@ -287,11 +337,12 @@ func (k *K8sClient) SetupDebugContainer(ctx context.Context, podName, containerN
 		dbgState, _ := k.RunKubectl(ctx, "get", "pod", podName, "-n", k.namespace,
 			fmt.Sprintf("-o=jsonpath={.status.ephemeralContainerStatuses[?(@.name=='%s')].state}", debugContainerName))
 		if strings.Contains(dbgState, "running") {
-			return nil
+			fmt.Printf("    ✓ Ephemeral container '%s' đã sẵn sàng (running)!\n", debugContainerName)
+			return podName, nil
 		}
 	}
 
-	return fmt.Errorf("ephemeral container %s không đạt trạng thái running", debugContainerName)
+	return podName, fmt.Errorf("ephemeral container %s không đạt trạng thái running", debugContainerName)
 }
 
 // ExecInPod thực thi lệnh shell bên trong container của Pod.
@@ -304,30 +355,38 @@ func (k *K8sClient) ExecInPod(ctx context.Context, podName, containerName, cmd s
 	return k.RunKubectl(ctx, args...)
 }
 
-// CopyFromPod sao chép file từ Pod về máy local.
+// CopyFromPod đọc nội dung file từ bên trong Pod và ghi trực tiếp về máy local
+// qua luồng stdout của kubectl exec (không tạo file tạm và không dùng lệnh xóa trên Server K8s).
 func (k *K8sClient) CopyFromPod(ctx context.Context, podName, containerName, remotePath, localPath string) error {
-	args := []string{"cp"}
-	src := fmt.Sprintf("%s/%s:%s", k.namespace, podName, remotePath)
-	args = append(args, src)
+	content, err := k.ExecInPod(ctx, podName, containerName, fmt.Sprintf("cat %s", quoteShellArg(remotePath)))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(content) == "" {
+		return fmt.Errorf("file %s trong Pod %s rỗng hoặc không tồn tại", remotePath, podName)
+	}
+	_ = os.MkdirAll(filepath.Dir(localPath), 0755)
+	return os.WriteFile(localPath, []byte(content+"\n"), 0644)
+}
+
+// CopyToPod sao chép file từ máy local vào bên trong Pod.
+func (k *K8sClient) CopyToPod(ctx context.Context, localPath, podName, containerName, remotePath string) error {
+	dst := fmt.Sprintf("%s/%s:%s", k.namespace, podName, remotePath)
 
 	if k.sshClient != nil {
-		// Tạo file tạm trên server K8s trước, sau đó SCP về máy Skill
-		srvTmp := fmt.Sprintf("/tmp/_capsizer_cp_%d.tmp", time.Now().UnixNano())
-		args = append(args, srvTmp)
+		srvStaging := "/tmp/capsizer-staging-bin"
+		if err := k.sshClient.UploadFile(ctx, localPath, srvStaging); err != nil {
+			return err
+		}
+		args := []string{"cp", srvStaging, dst}
 		if containerName != "" {
 			args = append(args, "-c", containerName)
 		}
-		if _, err := k.RunKubectl(ctx, args...); err != nil {
-			return err
-		}
-		defer func() {
-			_, _ = k.RunKubectl(ctx, "rm", "-f", srvTmp)
-		}()
-		return k.sshClient.DownloadFile(ctx, srvTmp, localPath)
+		_, err := k.RunKubectl(ctx, args...)
+		return err
 	}
 
-	// Trực tiếp trên máy local
-	args = append(args, localPath)
+	args := []string{"cp", localPath, dst}
 	if containerName != "" {
 		args = append(args, "-c", containerName)
 	}

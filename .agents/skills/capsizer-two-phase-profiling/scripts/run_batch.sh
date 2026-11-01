@@ -75,7 +75,7 @@ for sc in "${TARGET_SCENARIOS[@]}"; do
   REPORT_FILE="$SC_OUT/phase1-report.txt"
   PROF_STR="pyspy"
   if [[ -f "$SCENARIOS_DIR/$sc/scenario.env" ]]; then
-    prof_val=$(grep -E '^PROFILE_TYPE=' "$SCENARIOS_DIR/$sc/scenario.env" | head -n 1 | cut -d'=' -f2 | tr -d '"'\'' ' || true)
+    prof_val=$(grep -E '^PROFILE_TYPE=' "$SCENARIOS_DIR/$sc/scenario.env" | head -n 1 | cut -d'=' -f2- | sed 's/#.*//' | tr -d '"'\'' ' || true)
     [[ -n "$prof_val" ]] && PROF_STR="$prof_val"
   fi
   KNEE_STR="None"

@@ -62,27 +62,33 @@ func LoadDotEnv(path string) map[string]string {
 		}
 		parts := strings.SplitN(line, "=", 2)
 		k := strings.TrimSpace(parts[0])
+		k = strings.TrimSpace(strings.TrimPrefix(k, "export "))
 		v := strings.TrimSpace(parts[1])
 
-		// Xử lý chuỗi multiline nằm trong dấu ngoặc kép hoặc đơn
-		if (strings.HasPrefix(v, "\"") && !(strings.HasSuffix(v, "\"") && len(v) > 1)) ||
-			(strings.HasPrefix(v, "'") && !(strings.HasSuffix(v, "'") && len(v) > 1)) {
-			quoteChar := string(v[0])
-			valParts := []string{v[1:]}
-			for i < len(lines) {
-				nextLine := lines[i]
-				i++
-				if strings.HasSuffix(strings.TrimRight(nextLine, "\r"), quoteChar) {
-					trimmed := strings.TrimRight(nextLine, "\r")
-					valParts = append(valParts, trimmed[:len(trimmed)-1])
-					break
+		// Xử lý giá trị nằm trong dấu ngoặc kép hoặc đơn (hỗ trợ cả inline comment sau dấu đóng ngoặc và multiline)
+		if len(v) > 0 && (v[0] == '"' || v[0] == '\'') {
+			quoteChar := v[0]
+			closeIdx := findClosingQuote(v[1:], quoteChar)
+			if closeIdx >= 0 {
+				// Đóng ngoặc ngay trên cùng 1 dòng (bỏ qua phần inline comment phía sau nếu có)
+				v = v[1 : 1+closeIdx]
+			} else {
+				// Chuỗi multiline thực sự
+				valParts := []string{v[1:]}
+				for i < len(lines) {
+					nextLine := strings.TrimRight(lines[i], "\r")
+					i++
+					if cIdx := findClosingQuote(nextLine, quoteChar); cIdx >= 0 {
+						valParts = append(valParts, nextLine[:cIdx])
+						break
+					}
+					valParts = append(valParts, nextLine)
 				}
-				valParts = append(valParts, strings.TrimRight(nextLine, "\r"))
+				v = strings.Join(valParts, "\n")
 			}
-			v = strings.Join(valParts, "\n")
-		} else if (strings.HasPrefix(v, "\"") && strings.HasSuffix(v, "\"")) ||
-			(strings.HasPrefix(v, "'") && strings.HasSuffix(v, "'")) {
-			v = v[1 : len(v)-1]
+		} else {
+			// Giá trị không bọc ngoặc: cắt bỏ inline comment (# đứng đầu hoặc sau khoảng trắng)
+			v = stripInlineComment(v)
 		}
 
 		v = strings.ReplaceAll(v, "\\n", "\n")
@@ -92,6 +98,30 @@ func LoadDotEnv(path string) map[string]string {
 		}
 	}
 	return envVars
+}
+
+// findClosingQuote tìm vị trí dấu đóng ngoặc không bị escape.
+func findClosingQuote(s string, quote byte) int {
+	for i := 0; i < len(s); i++ {
+		if quote == '"' && s[i] == '\\' && i+1 < len(s) {
+			i++
+			continue
+		}
+		if s[i] == quote {
+			return i
+		}
+	}
+	return -1
+}
+
+// stripInlineComment loại bỏ phần comment # trên dòng không bọc ngoặc.
+func stripInlineComment(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '#' && (i == 0 || s[i-1] == ' ' || s[i-1] == '\t') {
+			return strings.TrimSpace(s[:i])
+		}
+	}
+	return strings.TrimSpace(s)
 }
 
 // ParseQueries phân tích chuỗi câu hỏi từ .env (hỗ trợ JSON array, xuống dòng, | hoặc ;).
