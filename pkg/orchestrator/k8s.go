@@ -88,7 +88,7 @@ func (k *K8sClient) ClusterInfo(ctx context.Context) (string, error) {
 	return k.RunKubectl(ctx, "cluster-info")
 }
 
-// ResolveTargetPod tự động tìm Pod đang chạy theo nhãn selector.
+// ResolveTargetPod tự động tìm Pod đang chạy theo nhãn selector (bỏ qua các Pod đang Terminating).
 func (k *K8sClient) ResolveTargetPod(ctx context.Context, selector, explicitPod string) (string, error) {
 	if explicitPod != "" {
 		return explicitPod, nil
@@ -98,18 +98,31 @@ func (k *K8sClient) ResolveTargetPod(ctx context.Context, selector, explicitPod 
 	}
 
 	out, err := k.RunKubectl(ctx, "get", "pods", "-n", k.namespace, "-l", selector,
-		"--field-selector=status.phase=Running", "-o", "jsonpath={.items[0].metadata.name}")
+		"-o", `jsonpath={range .items[*]}{.metadata.name}|{.metadata.deletionTimestamp}|{.status.phase}{"\n"}{end}`)
 	if err == nil && strings.TrimSpace(out) != "" {
-		return strings.TrimSpace(out), nil
+		var fallbackPod string
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			parts := strings.Split(strings.TrimSpace(line), "|")
+			if len(parts) < 3 || parts[0] == "" {
+				continue
+			}
+			podName, delTS, phase := parts[0], parts[1], parts[2]
+			if delTS != "" {
+				continue // Bỏ qua Pod đang Terminating
+			}
+			if phase == "Running" {
+				return podName, nil
+			}
+			if fallbackPod == "" {
+				fallbackPod = podName
+			}
+		}
+		if fallbackPod != "" {
+			return fallbackPod, nil
+		}
 	}
 
-	// Fallback nếu không có phase=Running
-	out, err = k.RunKubectl(ctx, "get", "pods", "-n", k.namespace, "-l", selector,
-		"-o", "jsonpath={.items[0].metadata.name}")
-	if err != nil || strings.TrimSpace(out) == "" {
-		return "", fmt.Errorf("không tìm thấy Pod nào khớp với selector '%s' trong namespace '%s'", selector, k.namespace)
-	}
-	return strings.TrimSpace(out), nil
+	return "", fmt.Errorf("không tìm thấy Pod nào đang hoạt động khớp với selector '%s' trong namespace '%s'", selector, k.namespace)
 }
 
 // DetectTargetWorkload tự động suy ra Deployment / StatefulSet quản lý Pod qua ownerReferences.

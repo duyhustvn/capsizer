@@ -74,6 +74,8 @@ func (c *SSHClient) commonOpts() []string {
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "LogLevel=ERROR",
 		"-o", "ConnectTimeout=10",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
 		"-o", "ControlMaster=auto",
 		"-o", "ControlPath=" + c.controlPath,
 		"-o", "ControlPersist=5m",

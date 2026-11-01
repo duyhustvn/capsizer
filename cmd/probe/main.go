@@ -33,7 +33,62 @@ var tcpStates = map[string]string{
 	"0B": "CLOSING",
 }
 
-const cg2Path = "/sys/fs/cgroup"
+var cg2Path = "/sys/fs/cgroup"
+
+// resolveAppCgroupPath tự động tìm đường dẫn cgroup của container ứng dụng mục tiêu
+// (đặc biệt quan trọng khi probe chạy trong Ephemeral Debug Container hoặc Sidecar có cgroup riêng).
+func resolveAppCgroupPath(procPattern string) string {
+	pids := []int{}
+	if ws := workerSample(procPattern); ws != nil {
+		if procs, ok := ws["procs"].([]ProcInfo); ok {
+			for _, p := range procs {
+				if p.PID > 0 && p.PID != os.Getpid() {
+					pids = append(pids, p.PID)
+				}
+			}
+		}
+	}
+	pids = append(pids, 1)
+
+	hasCgroupMetrics := func(dir string) bool {
+		if readFile(filepath.Join(dir, "memory.current")) != "" ||
+			readFile(filepath.Join(dir, "cpu.max")) != "" ||
+			readFile(filepath.Join(dir, "memory/memory.usage_in_bytes")) != "" ||
+			readFile(filepath.Join(dir, "cpu/cpu.cfs_quota_us")) != "" {
+			return true
+		}
+		return false
+	}
+
+	for _, pid := range pids {
+		// 1. Kiểm tra qua mount namespace của tiến trình đích: /proc/<pid>/root/sys/fs/cgroup
+		procRootCg := fmt.Sprintf("/proc/%d/root/sys/fs/cgroup", pid)
+		if hasCgroupMetrics(procRootCg) {
+			return procRootCg
+		}
+
+		// 2. Kiểm tra qua đường dẫn tương đối trong /proc/<pid>/cgroup (dành cho cgroup v2 host root)
+		cgContent := readFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+		for _, line := range strings.Split(cgContent, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "0::/") {
+				rel := strings.TrimPrefix(line, "0::/")
+				if rel != "" && !strings.HasPrefix(rel, "..") {
+					cand1 := filepath.Join("/sys/fs/cgroup", rel)
+					if hasCgroupMetrics(cand1) {
+						return cand1
+					}
+					cand2 := filepath.Join(procRootCg, rel)
+					if hasCgroupMetrics(cand2) {
+						return cand2
+					}
+				}
+			}
+		}
+	}
+
+	return "/sys/fs/cgroup"
+}
 
 // readFile reads the full content of a file, returning an empty string on error.
 func readFile(path string) string {
@@ -590,6 +645,9 @@ func snapshot(opts *options) map[string]any {
 	}
 
 	if !opts.noCgroup {
+		if cg2Path == "/sys/fs/cgroup" {
+			cg2Path = resolveAppCgroupPath(opts.procPattern)
+		}
 		usageUsec, nrPeriods, nrThrottled, throttledUsec := cpuSample()
 		s["usage_usec"] = usageUsec
 		s["nr_periods"] = nrPeriods
@@ -621,6 +679,10 @@ func main() {
 
 	flag.Parse()
 
+	if !opts.noCgroup {
+		cg2Path = resolveAppCgroupPath(opts.procPattern)
+	}
+
 	quota := cpuQuotaCores()
 	numCPU := runtime.NumCPU()
 	defExecWorkers := numCPU + 4
@@ -631,6 +693,7 @@ func main() {
 	meta := map[string]any{
 		"type":                         "probe_meta",
 		"t":                            float64(time.Now().UnixNano()) / 1e9,
+		"cgroup_path":                  cg2Path,
 		"cpu_quota_cores":              quota,
 		"nproc_visible":                numCPU,
 		"default_executor_max_workers": defExecWorkers,

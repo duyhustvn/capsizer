@@ -269,7 +269,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		_, _ = r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, stopOldCmd)
 
 		probeStartCmd := fmt.Sprintf(
-			"if command -v probe >/dev/null 2>&1; then PBIN=probe; else PBIN=/tmp/probe; fi; "+
+			"if [ -x /tmp/probe ]; then PBIN=/tmp/probe; elif command -v probe >/dev/null 2>&1; then PBIN=probe; else PBIN=/tmp/probe; fi; "+
 				": > /tmp/probe.jsonl; "+
 				"nohup $PBIN -port %d -target http://127.0.0.1:%d -out /tmp/probe.jsonl >/tmp/probe.log 2>&1 < /dev/null & "+
 				"sleep 1; pgrep -f 'probe -port' >/dev/null && echo PROBE_RUNNING || (cat /tmp/probe.log 2>/dev/null; exit 1)",
@@ -286,7 +286,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				"pkill -INT -f 'probe -port' 2>/dev/null || pkill -f 'probe' 2>/dev/null || true")
 		}()
 
-		// Mở luồng stream trực tiếp từng dòng từ /tmp/probe.jsonl về local probeLog
+		// Mở luồng stream trực tiếp từng dòng từ /tmp/probe.jsonl về local probeLog (kèm cơ chế tự động retry + chống trùng dòng)
 		var streamCtx context.Context
 		streamCtx, probeStreamCancel = context.WithCancel(ctx)
 		go func() {
@@ -299,39 +299,130 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			defer probeFile.Close()
 
-			streamErr := r.k8sClient.StreamExecInPod(streamCtx, r.cfg.K8sPod, execContainer, "tail -n +1 -f /tmp/probe.jsonl", func(line string) {
-				trimmed := strings.TrimSpace(line)
-				if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
-					_, _ = probeFile.WriteString(trimmed + "\n")
-					_ = probeFile.Sync()
-					streamedSamples.Add(1)
-				}
-			})
+			var probeMu sync.Mutex
+			seenLines := make(map[string]bool)
 
-			// Nếu stream kết thúc trong khi Pha 1 vẫn đang chạy (chưa gọi probeStreamCancel),
-			// kiểm tra ngay xem có phải container ứng dụng vừa bị LivenessProbe / OOM kill không!
-			if streamCtx.Err() == nil && streamErr != nil {
+			writeProbeLine := func(line string) {
+				trimmed := strings.TrimSpace(line)
+				if !strings.HasPrefix(trimmed, "{") || !strings.HasSuffix(trimmed, "}") {
+					return
+				}
+				probeMu.Lock()
+				if seenLines[trimmed] {
+					probeMu.Unlock()
+					return
+				}
+				seenLines[trimmed] = true
+				_, _ = probeFile.WriteString(trimmed + "\n")
+				_ = probeFile.Sync()
+				probeMu.Unlock()
+
+				count := streamedSamples.Add(1)
+				if count == 1 {
+					fmt.Println("    ✓ Luồng stream probe đã kết nối và nhận mẫu đầu tiên thành công.")
+				}
+			}
+
+			syncSnapshot := func(sCtx context.Context) {
+				cCtx, cancel := context.WithTimeout(sCtx, 8*time.Second)
+				defer cancel()
+				if snapOut, snapErr := r.k8sClient.ExecInPod(cCtx, r.cfg.K8sPod, execContainer, "cat /tmp/probe.jsonl 2>/dev/null || true"); snapErr == nil && snapOut != "" {
+					for _, l := range strings.Split(snapOut, "\n") {
+						writeProbeLine(l)
+					}
+				}
+			}
+
+			handleCrashDetected := func(curSt *PodContainerStatus) {
+				if podCrashedInPhase1.Swap(true) {
+					return
+				}
+				msg := fmt.Sprintf(
+					"Container ứng dụng bị K8s kill/restart giữa Pha 1 (restartCount: %d -> %d, reason: %s, exitCode: %d)",
+					initialRestartCount, curSt.RestartCount, curSt.LastTermReason, curSt.LastTermExitCode,
+				)
+				crashDetailMu.Lock()
+				crashDetail = msg
+				crashDetailMu.Unlock()
+
+				fmt.Printf("\n================================================================================\n")
+				fmt.Printf("⚠️ [PHÁT HIỆN SẬP CONTAINER TRONG PHA 1]\n")
+				fmt.Printf("  • %s\n", msg)
+				fmt.Printf("  • Ephemeral container (%s) chia sẻ PID namespace nên đã bị SIGKILL theo.\n", execContainer)
+				fmt.Printf("  • Đã bảo toàn %d mẫu probe.jsonl theo thời gian thực tính đến giây cuối trước khi sập!\n", streamedSamples.Load())
+				fmt.Printf("  • Đang gửi tín hiệu dừng sớm Pha 1 để tổng hợp báo cáo...\n")
+				fmt.Printf("================================================================================\n")
+
+				probeStreamCancel()
+				r.stopActiveLoadgen()
+			}
+
+			// Goroutine phụ trợ chạy định kỳ mỗi 10s:
+			// 1) Đồng bộ dự phòng /tmp/probe.jsonl (phòng trường hợp tail -f bị treo/buffer qua ProxyCommand mà không báo EOF)
+			// 2) Kiểm tra trạng thái container (phòng trường hợp container chết nhưng phiên SSH stream bị treo không thoát)
+			go func() {
+				ticker := time.NewTicker(10 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-streamCtx.Done():
+						return
+					case <-ticker.C:
+						chkCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+						curSt, stErr := r.k8sClient.GetPodContainerStatus(chkCtx, r.cfg.K8sPod, r.cfg.K8sContainer, execContainer)
+						cancel()
+						if stErr == nil && (curSt.RestartCount > initialRestartCount || !curSt.DebugRunning) {
+							handleCrashDetected(curSt)
+							return
+						}
+						syncSnapshot(streamCtx)
+					}
+				}
+			}()
+
+			for attempt := 1; streamCtx.Err() == nil; attempt++ {
+				streamErr := r.k8sClient.StreamExecInPod(streamCtx, r.cfg.K8sPod, execContainer, "tail -n +1 -f /tmp/probe.jsonl", writeProbeLine)
+				if streamCtx.Err() != nil {
+					break
+				}
+
+				// Luôn in rõ nguyên nhân khi stream bị ngắt (không bao giờ chết im lặng)
+				fmt.Printf("\n    [CẢNH BÁO Stream Probe] Luồng stream bị ngắt (lần %d, đã lưu %d mẫu): %v\n",
+					attempt, streamedSamples.Load(), streamErr)
+
+				// Kiểm tra ngay xem có phải container ứng dụng vừa bị LivenessProbe / OOM kill không
 				curSt, stErr := r.k8sClient.GetPodContainerStatus(context.Background(), r.cfg.K8sPod, r.cfg.K8sContainer, execContainer)
 				if stErr == nil && (curSt.RestartCount > initialRestartCount || !curSt.DebugRunning) {
-					podCrashedInPhase1.Store(true)
-					msg := fmt.Sprintf(
-						"Container ứng dụng bị K8s kill/restart giữa Pha 1 (restartCount: %d -> %d, reason: %s, exitCode: %d)",
-						initialRestartCount, curSt.RestartCount, curSt.LastTermReason, curSt.LastTermExitCode,
-					)
-					crashDetailMu.Lock()
-					crashDetail = msg
-					crashDetailMu.Unlock()
-
-					fmt.Printf("\n================================================================================\n")
-					fmt.Printf("⚠️ [PHÁT HIỆN SẬP CONTAINER TRONG PHA 1]\n")
-					fmt.Printf("  • %s\n", msg)
-					fmt.Printf("  • Ephemeral container (%s) chia sẻ PID namespace nên đã bị SIGKILL theo.\n", execContainer)
-					fmt.Printf("  • Đã bảo toàn %d mẫu probe.jsonl theo thời gian thực tính đến giây cuối trước khi sập!\n", streamedSamples.Load())
-					fmt.Printf("  • Đang gửi tín hiệu dừng sớm Pha 1 để tổng hợp báo cáo...\n")
-					fmt.Printf("================================================================================\n")
-
-					r.stopActiveLoadgen()
+					handleCrashDetected(curSt)
+					return
 				}
+
+				// Nếu Pod và debug container vẫn sống khỏe mà stream bị ngắt (do nghẽn mạng / SSH / API):
+				// 1. Đồng bộ ngay toàn bộ các dòng hiện có trong /tmp/probe.jsonl
+				syncSnapshot(streamCtx)
+
+				// 2. Đảm bảo tiến trình probe trong container vẫn đang chạy
+				ensureCmd := fmt.Sprintf(
+					"if ! pgrep -f 'probe -port' >/dev/null 2>&1; then "+
+						"if [ -x /tmp/probe ]; then PBIN=/tmp/probe; else PBIN=probe; fi; "+
+						"nohup $PBIN -port %d -target http://127.0.0.1:%d -out /tmp/probe.jsonl >>/tmp/probe.log 2>&1 < /dev/null & "+
+						"fi",
+					r.cfg.TargetPort, r.cfg.TargetPort,
+				)
+				_, _ = r.k8sClient.ExecInPod(streamCtx, r.cfg.K8sPod, execContainer, ensureCmd)
+
+				// 3. Chờ backoff 2s trước khi kết nối lại stream
+				select {
+				case <-streamCtx.Done():
+					return
+				case <-time.After(2 * time.Second):
+					fmt.Printf("    • Đang kết nối lại luồng stream probe (lần %d)...\n", attempt+1)
+				}
+			}
+
+			// Khi Pha 1 kết thúc bình thường (không crash), vét lần cuối toàn bộ /tmp/probe.jsonl
+			if !podCrashedInPhase1.Load() {
+				syncSnapshot(context.Background())
 			}
 		}()
 	} else {
@@ -616,17 +707,31 @@ func (r *Runner) setupK8sTarget(ctx context.Context) error {
 	case "sidecar":
 		fmt.Printf("==> [K8s Target] Sử dụng Sidecar container '%s' trong Pod %s.\n", r.toolContainer(), r.cfg.K8sPod)
 	case "cp":
-		fmt.Printf("==> [K8s Target] Biên dịch tĩnh và chép công cụ probe vào Pod %s...\n", r.cfg.K8sPod)
-		probeBin, err := r.ensureLinuxBinary("probe", "./cmd/probe")
-		if err != nil {
-			return err
-		}
 		cName, _ := r.k8sClient.GetContainerName(ctx, r.cfg.K8sPod, r.cfg.K8sContainer)
 		r.cfg.K8sContainer = cName
-		if err := r.k8sClient.CopyToPod(ctx, probeBin, r.cfg.K8sPod, cName, "/tmp/probe"); err != nil {
+	}
+
+	// Luôn biên dịch tĩnh và đồng bộ bản probe mới nhất (hỗ trợ đọc cgroup của app container qua /proc/<pid>/root/sys/fs/cgroup)
+	// vào /tmp/probe của container công cụ để không phụ thuộc bản probe cũ đóng gói trong image sidecar.
+	execContainer := r.toolContainer()
+	fmt.Printf("==> [K8s Target] Đồng bộ binary probe mới nhất vào %s/%s (/tmp/probe)...\n", r.cfg.K8sPod, execContainer)
+	probeBin, err := r.ensureLinuxBinary("probe", "./cmd/probe")
+	if err != nil {
+		if r.cfg.K8sMode == "cp" {
+			return err
+		}
+		fmt.Printf("    [CẢNH BÁO] Không biên dịch được probe mới (%v), dùng bản có sẵn trong image.\n", err)
+		return nil
+	}
+	if err := r.k8sClient.CopyToPod(ctx, probeBin, r.cfg.K8sPod, execContainer, "/tmp/probe"); err != nil {
+		if r.cfg.K8sMode == "cp" {
 			return fmt.Errorf("không thể chép probe vào Pod: %w", err)
 		}
-		if out, err := r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, cName, "chmod +x /tmp/probe"); err != nil {
+		fmt.Printf("    [CẢNH BÁO] Không thể cập nhật /tmp/probe (%v), dùng bản có sẵn trong image.\n", err)
+		return nil
+	}
+	if out, err := r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, "chmod +x /tmp/probe"); err != nil {
+		if r.cfg.K8sMode == "cp" {
 			return fmt.Errorf("không thể cấp quyền thực thi cho /tmp/probe: %w (%s)", err, out)
 		}
 	}
