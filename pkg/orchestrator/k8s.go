@@ -264,7 +264,7 @@ func (k *K8sClient) WaitForPodReady(ctx context.Context, selector string, timeou
 }
 
 // SetupDebugContainer gắn Ephemeral Debug Container (capsizer-debugger) vào Pod mục tiêu.
-// Trả về tên Pod thực tế (có thể đổi sang Pod mới nếu Pod cũ có debug container bị terminated).
+// Trả về tên Pod thực tế (có thể đổi sang Pod mới nếu Pod cũ có debug container bị lỗi hoặc terminated).
 func (k *K8sClient) SetupDebugContainer(ctx context.Context, podName, containerName, sidecarImage, selector string) (string, error) {
 	debugContainerName := "capsizer-debugger"
 	if sidecarImage == "" {
@@ -274,6 +274,18 @@ func (k *K8sClient) SetupDebugContainer(ctx context.Context, podName, containerN
 	targetContainer, err := k.GetContainerName(ctx, podName, containerName)
 	if err != nil {
 		targetContainer = containerName
+	}
+
+	// Kiểm tra chính sách PSA của Namespace và securityContext của Pod
+	psaEnforce, _ := k.RunKubectl(ctx, "get", "ns", k.namespace,
+		"-o", "jsonpath={.metadata.labels.pod-security\\.kubernetes\\.io/enforce}")
+	podSecCtx, _ := k.RunKubectl(ctx, "get", "pod", podName, "-n", k.namespace,
+		"-o", "jsonpath={.spec.securityContext}")
+	ctrSecCtx, _ := k.RunKubectl(ctx, "get", "pod", podName, "-n", k.namespace,
+		"-o", "jsonpath={.spec.containers[0].securityContext}")
+	if strings.TrimSpace(psaEnforce) != "" || (strings.TrimSpace(podSecCtx) != "" && strings.TrimSpace(podSecCtx) != "{}") {
+		fmt.Printf("    • Chính sách bảo mật: Namespace PSA enforce='%s' | Pod securityContext=%s | Container securityContext=%s\n",
+			strings.TrimSpace(psaEnforce), strings.TrimSpace(podSecCtx), strings.TrimSpace(ctrSecCtx))
 	}
 
 	// Kiểm tra xem debug container đã tồn tại chưa
@@ -286,48 +298,117 @@ func (k *K8sClient) SetupDebugContainer(ctx context.Context, podName, containerN
 			fmt.Printf("    ✓ Ephemeral container '%s' đã chạy sẵn trong Pod %s.\n", debugContainerName, podName)
 			return podName, nil
 		}
-		if strings.Contains(dbgState, "terminated") && selector != "" {
-			fmt.Printf("    [!] Ephemeral container '%s' cũ đã dừng (terminated). Đang tái tạo Pod sạch...\n", debugContainerName)
-			_, _ = k.RunKubectl(ctx, "delete", "pod", podName, "-n", k.namespace, "--wait=true")
-			newPod, err := k.WaitForPodReady(ctx, selector, 120*time.Second)
+		// Nếu container debug cũ bị terminated HOẶC kẹt ở CreateContainerConfigError / CreateContainerError
+		if selector != "" {
+			fmt.Printf("    [!] Ephemeral container '%s' cũ trên Pod %s không khả dụng (%s). Đang tái tạo Pod sạch...\n",
+				debugContainerName, podName, strings.TrimSpace(dbgState))
+			oldPod := podName
+			_, _ = k.RunKubectl(ctx, "delete", "pod", oldPod, "-n", k.namespace, "--wait=false")
+			newPod, err := k.WaitForNewPodReady(ctx, selector, oldPod, 120*time.Second)
 			if err != nil {
-				return podName, fmt.Errorf("không thể chờ Pod mới sau khi xóa Pod cũ: %w", err)
+				return podName, fmt.Errorf("không thể chờ Pod mới sau khi xóa Pod cũ %s: %w", oldPod, err)
 			}
 			podName = newPod
 			fmt.Printf("    ✓ Pod mới đã sẵn sàng: %s\n", podName)
+		} else {
+			return podName, fmt.Errorf("ephemeral container '%s' trên Pod %s đang lỗi (%s); hãy truyền --selector hoặc xóa Pod để tạo lại",
+				debugContainerName, podName, strings.TrimSpace(dbgState))
 		}
 	}
 
-	// Tạo file cấu hình securityContext root tạm trên máy chạy kubectl
-	customYAMLPath := "/tmp/capsizer-debug-root.yaml"
-	_, _ = k.RunHostCommand(ctx, fmt.Sprintf("printf 'securityContext:\\n  runAsUser: 0\\n  runAsGroup: 0\\n' > %s", customYAMLPath))
+	// Tạo các hồ sơ securityContext tạm trên máy chạy kubectl:
+	// QUAN TRỌNG: Phải có 'runAsNonRoot: false' để ghi đè pod.spec.securityContext.runAsNonRoot=true,
+	// nếu thiếu sẽ bị Kubelet chặn với lỗi: "container's runAsUser breaks non-root policy".
+	fullRootYAML := "/tmp/capsizer-debug-root.yaml"
+	minRootYAML := "/tmp/capsizer-debug-root-min.yaml"
+	baselineRootYAML := "/tmp/capsizer-debug-root-baseline.yaml"
 
-	debugArgs := []string{
+	prepCmd := fmt.Sprintf(
+		"cat << 'EOF' > %s\n"+
+			"securityContext:\n"+
+			"  runAsUser: 0\n"+
+			"  runAsGroup: 0\n"+
+			"  runAsNonRoot: false\n"+
+			"  allowPrivilegeEscalation: true\n"+
+			"  capabilities:\n"+
+			"    add:\n"+
+			"      - SYS_PTRACE\n"+
+			"      - SYS_ADMIN\n"+
+			"EOF\n"+
+			"cat << 'EOF' > %s\n"+
+			"securityContext:\n"+
+			"  runAsUser: 0\n"+
+			"  runAsGroup: 0\n"+
+			"  runAsNonRoot: false\n"+
+			"  allowPrivilegeEscalation: true\n"+
+			"  capabilities:\n"+
+			"    add:\n"+
+			"      - SYS_PTRACE\n"+
+			"EOF\n"+
+			"cat << 'EOF' > %s\n"+
+			"securityContext:\n"+
+			"  runAsUser: 0\n"+
+			"  runAsGroup: 0\n"+
+			"  runAsNonRoot: false\n"+
+			"EOF",
+		fullRootYAML, minRootYAML, baselineRootYAML,
+	)
+	_, _ = k.RunHostCommand(ctx, prepCmd)
+
+	baseArgs := []string{
 		"debug", podName, "-n", k.namespace,
+		"--attach=false",
+		"-c", debugContainerName,
 		fmt.Sprintf("--image=%s", sidecarImage),
 	}
 	if targetContainer != "" {
-		debugArgs = append(debugArgs, fmt.Sprintf("--target=%s", targetContainer))
+		baseArgs = append(baseArgs, fmt.Sprintf("--target=%s", targetContainer))
 	}
-	debugArgsWithCustom := append([]string{}, debugArgs...)
-	debugArgsWithCustom = append(debugArgsWithCustom,
-		"-c", debugContainerName,
-		"--attach=false",
-		fmt.Sprintf("--custom=%s", customYAMLPath),
-		"--profile=sysadmin",
-		"--", "sh", "-c", "sleep infinity",
-	)
 
-	if _, err := k.RunKubectl(ctx, debugArgsWithCustom...); err != nil {
-		// Fallback nếu phiên bản kubectl không hỗ trợ --custom hoặc --profile
-		debugArgsFallback := append([]string{}, debugArgs...)
-		debugArgsFallback = append(debugArgsFallback,
-			"-c", debugContainerName,
-			"--attach=false",
-			"--", "sh", "-c", "sleep infinity",
+	// Thử lần lượt từ quyền đầy đủ (sysadmin + SYS_PTRACE/SYS_ADMIN) -> tối thiểu (SYS_PTRACE) -> baseline (runAsUser:0, runAsNonRoot:false)
+	attempts := [][]string{
+		append(append([]string{}, baseArgs...), fmt.Sprintf("--custom=%s", fullRootYAML), "--profile=sysadmin", "--", "sh", "-c", "sleep infinity"),
+		append(append([]string{}, baseArgs...), fmt.Sprintf("--custom=%s", minRootYAML), "--", "sh", "-c", "sleep infinity"),
+		append(append([]string{}, baseArgs...), fmt.Sprintf("--custom=%s", baselineRootYAML), "--", "sh", "-c", "sleep infinity"),
+	}
+
+	var lastErr error
+	attached := false
+	for _, args := range attempts {
+		if _, err := k.RunKubectl(ctx, args...); err == nil {
+			attached = true
+			break
+		} else {
+			lastErr = err
+		}
+	}
+
+	// Nếu Namespace bật PSA enforce=restricted chặn hoàn toàn runAsUser=0 ngay từ API Server,
+	// tự động fallback sang non-root UID (ví dụ 1000) để Pha 1 (probe) vẫn hoạt động bình thường.
+	if !attached {
+		nonRootYAML := "/tmp/capsizer-debug-nonroot.yaml"
+		nonRootCmd := fmt.Sprintf(
+			"cat << 'EOF' > %s\n"+
+				"securityContext:\n"+
+				"  runAsUser: 1000\n"+
+				"  runAsGroup: 1000\n"+
+				"  runAsNonRoot: true\n"+
+				"  allowPrivilegeEscalation: false\n"+
+				"  capabilities:\n"+
+				"    drop:\n"+
+				"      - ALL\n"+
+				"  seccompProfile:\n"+
+				"    type: RuntimeDefault\n"+
+				"EOF",
+			nonRootYAML,
 		)
-		if _, err2 := k.RunKubectl(ctx, debugArgsFallback...); err2 != nil {
-			return podName, fmt.Errorf("lỗi gắn ephemeral debug container: %w", err2)
+		_, _ = k.RunHostCommand(ctx, nonRootCmd)
+		nonRootArgs := append(append([]string{}, baseArgs...), fmt.Sprintf("--custom=%s", nonRootYAML), "--", "sh", "-c", "sleep infinity")
+		if _, err := k.RunKubectl(ctx, nonRootArgs...); err == nil {
+			fmt.Println("    [CẢNH BÁO] Namespace chặn quyền root (PSA restricted); đã gắn debug container ở chế độ non-root (UID 1000).")
+			attached = true
+		} else {
+			return podName, fmt.Errorf("lỗi gắn ephemeral debug container: %v (lỗi trước đó: %v)", err, lastErr)
 		}
 	}
 
@@ -340,9 +421,40 @@ func (k *K8sClient) SetupDebugContainer(ctx context.Context, podName, containerN
 			fmt.Printf("    ✓ Ephemeral container '%s' đã sẵn sàng (running)!\n", debugContainerName)
 			return podName, nil
 		}
+		if strings.Contains(dbgState, "CreateContainerConfigError") || strings.Contains(dbgState, "CreateContainerError") {
+			return podName, fmt.Errorf("ephemeral container '%s' bị Kubelet từ chối khởi tạo: %s", debugContainerName, strings.TrimSpace(dbgState))
+		}
 	}
 
 	return podName, fmt.Errorf("ephemeral container %s không đạt trạng thái running", debugContainerName)
+}
+
+// WaitForNewPodReady chờ một Pod mới (khác với oldPod) xuất hiện và đạt trạng thái Ready.
+func (k *K8sClient) WaitForNewPodReady(ctx context.Context, selector, oldPod string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+
+		out, err := k.RunKubectl(ctx, "get", "pods", "-n", k.namespace, "-l", selector,
+			"--field-selector=status.phase=Running", "-o", "jsonpath={.items[*].metadata.name}")
+		if err == nil && strings.TrimSpace(out) != "" {
+			for _, candidate := range strings.Fields(out) {
+				if candidate != "" && candidate != oldPod {
+					ready, _ := k.RunKubectl(ctx, "get", "pod", candidate, "-n", k.namespace,
+						"-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}")
+					if strings.EqualFold(strings.TrimSpace(ready), "true") {
+						return candidate, nil
+					}
+				}
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return "", fmt.Errorf("hết thời gian chờ Pod mới sẵn sàng thay thế %s", oldPod)
 }
 
 // ExecInPod thực thi lệnh shell bên trong container của Pod.

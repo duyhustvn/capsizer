@@ -1004,6 +1004,7 @@ setup_k8s_debug_container() {
     echo "    Đang tạo cấu hình debug-root.yaml (runAsUser: 0, runAsNonRoot: false, SYS_PTRACE, SYS_ADMIN)..."
     local debug_yaml="/tmp/capsizer-debug-root.yaml"
     local debug_min_yaml="/tmp/capsizer-debug-root-min.yaml"
+    local debug_base_yaml="/tmp/capsizer-debug-root-baseline.yaml"
     local yaml_content="securityContext:
   runAsUser: 0
   runAsGroup: 0
@@ -1015,11 +1016,16 @@ setup_k8s_debug_container() {
       - SYS_ADMIN"
     local min_yaml_content="securityContext:
   runAsUser: 0
+  runAsGroup: 0
   runAsNonRoot: false
   allowPrivilegeEscalation: true
   capabilities:
     add:
       - SYS_PTRACE"
+    local base_yaml_content="securityContext:
+  runAsUser: 0
+  runAsGroup: 0
+  runAsNonRoot: false"
 
     if [[ -n "$K8S_SSH_HOST" ]]; then
       run_k8s_ssh "cat << 'EOF' > '$debug_yaml'
@@ -1027,10 +1033,14 @@ $yaml_content
 EOF
 cat << 'EOF' > '$debug_min_yaml'
 $min_yaml_content
+EOF
+cat << 'EOF' > '$debug_base_yaml'
+$base_yaml_content
 EOF"
     else
       printf "%s\n" "$yaml_content" > "$debug_yaml"
       printf "%s\n" "$min_yaml_content" > "$debug_min_yaml"
+      printf "%s\n" "$base_yaml_content" > "$debug_base_yaml"
     fi
 
     echo "    Đang đính kèm container debug ($DEBUG_CONTAINER_NAME) với debug-root.yaml..."
@@ -1054,7 +1064,7 @@ EOF"
       -c "$DEBUG_CONTAINER_NAME" \
       --image="$SIDECAR_IMAGE" \
       $TARGET_FLAG \
-      --profile=sysadmin \
+      --custom="$debug_base_yaml" \
       -- sh -c "sleep infinity" || true
 
     echo "    Đang chờ container $DEBUG_CONTAINER_NAME chuyển sang trạng thái Running..."
