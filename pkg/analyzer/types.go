@@ -87,6 +87,7 @@ type EvalRow struct {
 	PeakRAMMB   *float64
 	DeltaRAMMB  *float64
 	HealthP99   *float64
+	Conns       *int
 	AccQueue    *int
 	Throttle    *float64
 	Threads     *int

@@ -1,10 +1,12 @@
 package analyzer
 
 import (
+	"strings"
 	"testing"
 )
 
 func floatPtr(v float64) *float64 { return &v }
+func intPtr(v int) *int           { return &v }
 func strPtr(s string) *string     { return &s }
 
 func TestAnalyze_Run6ColdStartAndSteadyStateKnee(t *testing.T) {
@@ -78,5 +80,55 @@ func TestAnalyze_Run6ColdStartAndSteadyStateKnee(t *testing.T) {
 	}
 	if report.ProfileRPS != 8.0 {
 		t.Errorf("ProfileRPS = %.1f; want 8.0", report.ProfileRPS)
+	}
+}
+
+func TestAnalyze_ConnectionsAndPhase2Summary(t *testing.T) {
+	stepSec := 10.0
+	ramp := []RampRecord{
+		{Type: "run_meta", StepSeconds: floatPtr(stepSec)},
+		{Type: "step_start", RPS: 4.0, T: 10.0},
+		{Type: "req", RPS: 4.0, TStart: floatPtr(11.0), T: 11.2, Ok: true, TtftMs: floatPtr(200.0)},
+		{Type: "step_end", RPS: 4.0, T: 20.0},
+	}
+
+	probe := []ProbeRecord{
+		{Type: "probe_meta", T: 0.0, CPUQuotaCores: floatPtr(1.0)},
+		{
+			T:           12.0,
+			UsageUsec:   floatPtr(1_000_000),
+			NrPeriods:   floatPtr(100),
+			NrThrottled: floatPtr(5),
+			TCP: &ProbeTCP{
+				AcceptQueue: intPtr(0),
+				States:      map[string]int{"ESTAB": 18, "TIME_WAIT": 10, "CLOSE_WAIT": 2},
+			},
+		},
+		{
+			T:           18.0,
+			UsageUsec:   floatPtr(4_000_000),
+			NrPeriods:   floatPtr(160),
+			NrThrottled: floatPtr(8),
+			TCP: &ProbeTCP{
+				AcceptQueue: intPtr(0),
+				States:      map[string]int{"ESTAB": 20, "TIME_WAIT": 12, "CLOSE_WAIT": 2},
+			},
+		},
+	}
+
+	report, err := Analyze(ramp, probe)
+	if err != nil {
+		t.Fatalf("Analyze failed: %v", err)
+	}
+	if !strings.Contains(report.ReportText, "conns") {
+		t.Errorf("expected report header to include 'conns', got:\n%s", report.ReportText)
+	}
+	if !strings.Contains(report.ReportText, "ĐỊNH CHUẨN KẾT NỐI") || !strings.Contains(report.ReportText, "20 socket") {
+		t.Errorf("expected report to include section 3 with 20 ESTAB sockets, got:\n%s", report.ReportText)
+	}
+
+	p2Summary := SummarizePhase2Probe(probe)
+	if !strings.Contains(p2Summary, "Đỉnh=20") {
+		t.Errorf("expected SummarizePhase2Probe to include peak 20 ESTAB sockets, got:\n%s", p2Summary)
 	}
 }

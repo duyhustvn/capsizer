@@ -83,9 +83,9 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 		}
 	}
 
-	println(strings.Repeat("=", 142))
+	println(strings.Repeat("=", 149))
 	println("                             CAPSIZER - KẾT QUẢ ĐỊNH CHUẨN HIỆU NĂNG & NĂNG LỰC")
-	println(strings.Repeat("=", 142))
+	println(strings.Repeat("=", 149))
 	if meta != nil {
 		if quota != nil {
 			if *quota == math.Trunc(*quota) {
@@ -126,12 +126,12 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 
 	println()
 
-	// In header bảng kết quả (có bổ sung cột RAM)
-	cols := fmt.Sprintf("%6s %7s %5s %4s %8s %8s %6s %7s %7s %7s %7s %6s %6s %8s %5s  verdict",
+	// In header bảng kết quả (có bổ sung cột RAM và Conns)
+	cols := fmt.Sprintf("%6s %7s %5s %4s %8s %8s %6s %7s %7s %7s %7s %6s %6s %6s %8s %5s  verdict",
 		"offer", "achiev", "ok", "err", "ttftP50", "ttftP95",
-		"cores", "C_ms", "ramMB", "pkRAM", "dRAM", "thr%", "acptQ", "hlthP99", "thrd")
+		"cores", "C_ms", "ramMB", "pkRAM", "dRAM", "thr%", "conns", "acptQ", "hlthP99", "thrd")
 	println(cols)
-	println(strings.Repeat("-", 142))
+	println(strings.Repeat("-", 149))
 
 	var rows []EvalRow
 	var noisy []float64
@@ -155,6 +155,7 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 		var (
 			cores, cMs, thrPct              *float64
 			acceptq, healthP99, fdmax, thrd *float64
+			estabConnsP99                   *float64
 			acptSamples                     int
 		)
 
@@ -187,12 +188,17 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 				thrPct = &vThr
 			}
 
-			var accVals, hlthVals, fdVals, thrdVals []float64
+			var accVals, hlthVals, fdVals, thrdVals, estabVals []float64
 			for _, x := range s {
-				if x.TCP != nil && x.TCP.AcceptQueue != nil {
-					accVals = append(accVals, float64(*x.TCP.AcceptQueue))
-					if *x.TCP.AcceptQueue >= KneeAcceptQueue {
-						acptSamples++
+				if x.TCP != nil {
+					if x.TCP.AcceptQueue != nil {
+						accVals = append(accVals, float64(*x.TCP.AcceptQueue))
+						if *x.TCP.AcceptQueue >= KneeAcceptQueue {
+							acptSamples++
+						}
+					}
+					if x.TCP.States != nil {
+						estabVals = append(estabVals, float64(x.TCP.States["ESTAB"]))
 					}
 				}
 				if x.HealthMs != nil {
@@ -221,6 +227,9 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 			if len(thrdVals) > 0 {
 				thrd = Pct(thrdVals, 99)
 			}
+			if len(estabVals) > 0 {
+				estabConnsP99 = Pct(estabVals, 99)
+			}
 		}
 
 		achieved := float64(len(okReqs)) / dur
@@ -232,10 +241,14 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 			}
 		}
 
-		var accInt *int
+		var accInt, connInt *int
 		if acceptq != nil {
 			v := int(*acceptq)
 			accInt = &v
+		}
+		if estabConnsP99 != nil {
+			v := int(*estabConnsP99)
+			connInt = &v
 		}
 
 		rows = append(rows, EvalRow{
@@ -255,6 +268,7 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 			PeakRAMMB:   memStats.PeakMB,
 			DeltaRAMMB:  memStats.DeltaMB,
 			HealthP99:   healthP99,
+			Conns:       connInt,
 			AccQueue:    accInt,
 			Throttle:    thrPct,
 			FDs: func() *int {
@@ -353,7 +367,11 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 		r.Ok = isOk
 		r.KneeReason = strings.Join(reasons, ", ")
 
-		var accFloat, thrdFloat *float64
+		var connFloat, accFloat, thrdFloat *float64
+		if r.Conns != nil {
+			v := float64(*r.Conns)
+			connFloat = &v
+		}
 		if r.AccQueue != nil {
 			v := float64(*r.AccQueue)
 			accFloat = &v
@@ -363,7 +381,7 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 			thrdFloat = &v
 		}
 
-		printf("%6s %7s %5d %4d %8s %8s %6s %7s %7s %7s %7s %6s %6s %8s %5s  %s\n",
+		printf("%6s %7s %5d %4d %8s %8s %6s %7s %7s %7s %7s %6s %6s %6s %8s %5s  %s\n",
 			FmtNum(&r.RPS, 1),
 			FmtNum(&r.Achieved, 1),
 			r.OkCount,
@@ -376,6 +394,7 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 			FmtNum(r.PeakRAMMB, 0),
 			FmtNum(r.DeltaRAMMB, 0),
 			FmtNum(r.Throttle, 1),
+			FmtNum(connFloat, 0),
 			FmtNum(accFloat, 0),
 			FmtNum(r.HealthP99, 0),
 			FmtNum(thrdFloat, 0),
@@ -383,9 +402,9 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 		)
 	}
 
-	println(strings.Repeat("=", 142))
+	println(strings.Repeat("=", 149))
 	println("                                           KẾT LUẬN & ĐỊNH CHUẨN")
-	println(strings.Repeat("=", 142))
+	println(strings.Repeat("=", 149))
 
 	// 1. Phân tích CPU
 	println("▶ 1. ĐỊNH CHUẨN CPU & THROUGHPUT:")
@@ -457,7 +476,7 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 		printf("  • Điểm gãy quan sát được            : %g req/s (Nguyên nhân: %s)\n", knees[0].RPS, knees[0].KneeReason)
 	}
 
-	// 2. Phân tích RAM (BỔ SUNG MỚI)
+	// 2. Phân tích RAM
 	println("\n▶ 2. ĐỊNH CHUẨN BỘ NHỚ (RAM / MEMORY):")
 	memRec := AnalyzeMemory(baselineRAM, rows)
 	if memRec != nil {
@@ -473,6 +492,64 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 		}
 	} else {
 		println("  • Không có dữ liệu đo RAM trong file probe (chưa đọc được memory cgroup).")
+	}
+
+	// 3. Phân tích Kết nối & Socket TCP (từ /proc/net/tcp & /proc/<pid>/fd trong probe)
+	println("\n▶ 3. ĐỊNH CHUẨN KẾT NỐI & SOCKET TCP (/proc/net/tcp):")
+	var (
+		hasTCPConns                      bool
+		maxEstab, maxAcptQ               int
+		maxTimeWait, maxCloseWait, maxFD int
+		maxSynRecv, maxSynSent           int
+	)
+	for _, s := range probe {
+		if s.Type == "probe_meta" {
+			continue
+		}
+		if s.TCP != nil {
+			if s.TCP.AcceptQueue != nil && *s.TCP.AcceptQueue > maxAcptQ {
+				maxAcptQ = *s.TCP.AcceptQueue
+			}
+			if s.TCP.States != nil {
+				hasTCPConns = true
+				if v, ok := s.TCP.States["ESTAB"]; ok && v > maxEstab {
+					maxEstab = v
+				}
+				if v, ok := s.TCP.States["TIME_WAIT"]; ok && v > maxTimeWait {
+					maxTimeWait = v
+				}
+				if v, ok := s.TCP.States["CLOSE_WAIT"]; ok && v > maxCloseWait {
+					maxCloseWait = v
+				}
+				if v, ok := s.TCP.States["SYN_RECV"]; ok && v > maxSynRecv {
+					maxSynRecv = v
+				}
+				if v, ok := s.TCP.States["SYN_SENT"]; ok && v > maxSynSent {
+					maxSynSent = v
+				}
+			}
+		}
+		if s.Workers != nil && s.Workers.FDsMax != nil && *s.Workers.FDsMax > maxFD {
+			maxFD = *s.Workers.FDsMax
+		}
+	}
+	if hasTCPConns {
+		printf("  • Kết nối TCP ESTABLISHED đỉnh : %d socket (TIME_WAIT: %d, CLOSE_WAIT: %d, SYN_RECV: %d, AcceptQueue: %d)\n",
+			maxEstab, maxTimeWait, maxCloseWait, maxSynRecv, maxAcptQ)
+		if maxFD > 0 {
+			printf("  • File Descriptors tối đa      : %d FDs / worker\n", maxFD)
+		}
+		if maxCloseWait > 15 {
+			printf("    ⚠️ CẢNH BÁO RÒ RỈ SOCKET: Phát hiện CLOSE_WAIT cao (%d). Ứng dụng có nguy cơ quên gọi close() kết nối.\n", maxCloseWait)
+		}
+		if maxTimeWait > 500 {
+			printf("    ⚠️ CẢNH BÁO CHURN KẾT NỐI: TIME_WAIT cao (%d). Kiểm tra lại HTTP Keep-Alive / Connection Pool.\n", maxTimeWait)
+		}
+		if maxSynRecv > 10 || maxSynSent > 10 {
+			printf("    ⚠️ CẢNH BÁO NGHẼN HANDSHAKE: SYN_RECV=%d, SYN_SENT=%d.\n", maxSynRecv, maxSynSent)
+		}
+	} else {
+		println("  • Không có dữ liệu đo kết nối trong file probe.")
 	}
 
 	println()
@@ -523,4 +600,91 @@ func RunAnalysisTo(ramp []RampRecord, probe []ProbeRecord, out io.Writer) (*Anal
 	}
 
 	return report, nil
+}
+
+// SummarizePhase2Probe tổng hợp nhanh dữ liệu probe (CPU, RAM, TCP Socket States từ /proc/net/tcp, FDs)
+// thu thập được song song trong suốt quá trình chạy Profiling Pha 2 (py-spy / perf).
+func SummarizePhase2Probe(probe []ProbeRecord) string {
+	var samples []ProbeRecord
+	for _, s := range probe {
+		if s.Type != "probe_meta" {
+			samples = append(samples, s)
+		}
+	}
+	if len(samples) == 0 {
+		return ""
+	}
+
+	var buf strings.Builder
+	printf := func(format string, a ...interface{}) { fmt.Fprintf(&buf, format, a...) }
+
+	spanS := 0.0
+	if len(samples) >= 2 {
+		spanS = samples[len(samples)-1].T - samples[0].T
+	}
+
+	var cores, thrPct *float64
+	if spanS > 0 {
+		spanUsec := spanS * 1_000_000.0
+		if dUsage := Delta(samples, func(x ProbeRecord) *float64 { return x.UsageUsec }); dUsage != nil {
+			v := *dUsage / spanUsec
+			cores = &v
+		}
+		dThr := Delta(samples, func(x ProbeRecord) *float64 { return x.NrThrottled })
+		dPer := Delta(samples, func(x ProbeRecord) *float64 { return x.NrPeriods })
+		if dThr != nil && dPer != nil && *dPer != 0 {
+			v := 100.0 * (*dThr) / (*dPer)
+			thrPct = &v
+		}
+	}
+
+	memStats := StepRAM(samples, nil)
+
+	var (
+		estabVals, accVals, hlthVals []float64
+		maxEstab, maxTW, maxCW       int
+		hasTCP                       bool
+	)
+	for _, x := range samples {
+		if x.TCP != nil {
+			if x.TCP.AcceptQueue != nil {
+				accVals = append(accVals, float64(*x.TCP.AcceptQueue))
+			}
+			if x.TCP.States != nil {
+				hasTCP = true
+				est := x.TCP.States["ESTAB"]
+				estabVals = append(estabVals, float64(est))
+				if est > maxEstab {
+					maxEstab = est
+				}
+				if v, ok := x.TCP.States["TIME_WAIT"]; ok && v > maxTW {
+					maxTW = v
+				}
+				if v, ok := x.TCP.States["CLOSE_WAIT"]; ok && v > maxCW {
+					maxCW = v
+				}
+			}
+		}
+		if x.HealthMs != nil {
+			hlthVals = append(hlthVals, *x.HealthMs)
+		}
+	}
+
+	printf("  • Mẫu thu thập Pha 2  : %d mẫu (trong %.0fs profiling)\n", len(samples), spanS)
+	if cores != nil || thrPct != nil || memStats.PeakMB != nil {
+		printf("  • Tài nguyên Pha 2    : CPU=%s core | Throttle=%s%% | RAM đỉnh=%s MB\n",
+			FmtNum(cores, 2), FmtNum(thrPct, 1), FmtNum(memStats.PeakMB, 0))
+	}
+	if hasTCP {
+		estP50 := Pct(estabVals, 50)
+		estP99 := Pct(estabVals, 99)
+		accP99 := Pct(accVals, 99)
+		printf("  • Kết nối TCP (/proc) : ESTAB p50=%s, p99=%s (Đỉnh=%d) | AcceptQ p99=%s | TIME_WAIT=%d | CLOSE_WAIT=%d\n",
+			FmtNum(estP50, 0), FmtNum(estP99, 0), maxEstab, FmtNum(accP99, 0), maxTW, maxCW)
+	}
+	if len(hlthVals) > 0 {
+		printf("  • Health /health/live : p99=%s ms\n", FmtNum(Pct(hlthVals, 99), 0))
+	}
+
+	return buf.String()
 }

@@ -135,5 +135,6 @@ go build -o bin/capsizer ./cmd/capsizer
 
 ### Trường hợp 4: Đọc và Phân tích Kết quả sau khi chạy
 Sau khi `./bin/capsizer` hoàn tất, Agent đọc trực tiếp các tạo phẩm trong thư mục kết quả (`benchmark-results/<run_id>/`):
-1. `phase1-report.txt`: Bảng phân tích theo từng bậc RPS (`p50`, `p95`, `p99`, `CPU cores`, `throttle%`, `ramMB`, `LISTEN queue`, `/health/live`), chẩn đoán cơ chế gây nghẽn, điểm gãy (`Knee Point`) và công thức tính số bản sao (Replicas / Workers) cần thiết.
-2. `flamegraph_knee_<RPS>rps_pyspy.svg` & `flamegraph_knee_<RPS>rps_perf.svg`: Biểu đồ FlameGraph tại bậc tải gãy để chỉ ra chính xác hàm Python / C-extension / Kernel gây nghẽn CPU.
+1. `phase1-report.txt`: Bảng phân tích theo từng bậc RPS (`p50`, `p95`, `p99`, `CPU cores`, `throttle%`, `ramMB`, `conns`, `LISTEN queue`, `/health/live`), chẩn đoán cơ chế gây nghẽn, điểm gãy (`Knee Point`), phân tích kết nối TCP (`ESTAB`, `TIME_WAIT`, `CLOSE_WAIT`) từ `/proc/net/tcp`, kèm công thức tính số bản sao (Replicas / Workers) cần thiết.
+2. `phase2-probe.jsonl` & `connections_knee_<RPS>rps.txt`: Dữ liệu probe chạy song song trong suốt thời gian Profiling Pha 2 và báo cáo chi tiết trạng thái socket mạng bằng `analyze-connections` (`ss`).
+3. `flamegraph_knee_<RPS>rps_pyspy.svg` & `flamegraph_knee_<RPS>rps_perf.svg`: Biểu đồ FlameGraph tại bậc tải gãy để chỉ ra chính xác hàm Python / C-extension / Kernel gây nghẽn CPU.

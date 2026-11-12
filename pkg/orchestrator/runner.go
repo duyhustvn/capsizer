@@ -295,9 +295,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		probeStartCmd := fmt.Sprintf(
 			"if [ -x /tmp/probe ]; then PBIN=/tmp/probe; elif command -v probe >/dev/null 2>&1; then PBIN=probe; else PBIN=/tmp/probe; fi; "+
 				": > /tmp/probe.jsonl; "+
-				"nohup $PBIN -port %d -target http://127.0.0.1:%d -out /tmp/probe.jsonl >/tmp/probe.log 2>&1 < /dev/null & "+
+				"nohup $PBIN %s >/tmp/probe.log 2>&1 < /dev/null & "+
 				"sleep 2; pgrep -x probe >/dev/null && echo PROBE_RUNNING || (cat /tmp/probe.log 2>/dev/null; exit 1)",
-			r.cfg.TargetPort, r.cfg.TargetPort,
+			r.buildProbeArgs("/tmp/probe.jsonl"),
 		)
 		if out, err := r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, probeStartCmd); err != nil {
 			fmt.Printf("    [CẢNH BÁO] Lỗi khởi chạy probe trong Pod (%s): %v (output: %s)\n", execContainer, err, out)
@@ -430,9 +430,9 @@ func (r *Runner) Run(ctx context.Context) error {
 				ensureCmd := fmt.Sprintf(
 					"if ! pgrep -x probe >/dev/null 2>&1; then "+
 						"if [ -x /tmp/probe ]; then PBIN=/tmp/probe; else PBIN=probe; fi; "+
-						"nohup $PBIN -port %d -target http://127.0.0.1:%d -out /tmp/probe.jsonl >>/tmp/probe.log 2>&1 < /dev/null & "+
+						"nohup $PBIN %s >>/tmp/probe.log 2>&1 < /dev/null & "+
 						"fi",
-					r.cfg.TargetPort, r.cfg.TargetPort,
+					r.buildProbeArgs("/tmp/probe.jsonl"),
 				)
 				_, _ = r.k8sClient.ExecInPod(streamCtx, r.cfg.K8sPod, execContainer, ensureCmd)
 
@@ -673,6 +673,102 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	totalDuration := len(profilers)*(profDuration+5) + warmupSec + 5
 	phase2RampLog := filepath.Join(r.cfg.OutDir, "phase2-ramp.jsonl")
+	phase2ProbeLog := filepath.Join(r.cfg.OutDir, "phase2-probe.jsonl")
+
+	// Khởi chạy probe song song trong Pha 2 để đo CPU, RAM, TCP & Active Connections trong code suốt thời gian profiling
+	var (
+		p2StreamCancel  context.CancelFunc
+		p2StreamDone    = make(chan struct{})
+		p2StreamSamples atomic.Int64
+	)
+	if r.cfg.K8sPod != "" {
+		fmt.Printf("==> [Probe Pha 2] Khởi chạy probe song song trong Pod %s để giám sát Connections/CPU/RAM lúc profiling...\n", r.cfg.K8sPod)
+		_, _ = r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer,
+			"pkill -INT -x probe 2>/dev/null || pkill -x probe 2>/dev/null || true")
+
+		p2StartCmd := fmt.Sprintf(
+			"if [ -x /tmp/probe ]; then PBIN=/tmp/probe; elif command -v probe >/dev/null 2>&1; then PBIN=probe; else PBIN=/tmp/probe; fi; "+
+				": > /tmp/probe-phase2.jsonl; "+
+				"nohup $PBIN %s >/tmp/probe-phase2.log 2>&1 < /dev/null & "+
+				"sleep 1; pgrep -x probe >/dev/null && echo PROBE_P2_RUNNING || (cat /tmp/probe-phase2.log 2>/dev/null; exit 1)",
+			r.buildProbeArgs("/tmp/probe-phase2.jsonl"),
+		)
+		if out, err := r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, p2StartCmd); err != nil {
+			fmt.Printf("    [CẢNH BÁO] Lỗi khởi chạy probe Pha 2 (%s): %v (%s)\n", execContainer, err, out)
+		} else {
+			fmt.Println("    ✓ Tiến trình probe Pha 2 đã chạy song song cùng Profiler.")
+		}
+
+		var p2StreamCtx context.Context
+		p2StreamCtx, p2StreamCancel = context.WithCancel(ctx)
+		defer p2StreamCancel()
+
+		go func() {
+			defer close(p2StreamDone)
+			p2File, err := os.OpenFile(phase2ProbeLog, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			if err != nil {
+				return
+			}
+			defer p2File.Close()
+
+			var mu sync.Mutex
+			seen := make(map[string]bool)
+			writeLine := func(line string) {
+				trimmed := strings.TrimSpace(line)
+				if !strings.HasPrefix(trimmed, "{") || !strings.HasSuffix(trimmed, "}") {
+					return
+				}
+				mu.Lock()
+				if seen[trimmed] {
+					mu.Unlock()
+					return
+				}
+				seen[trimmed] = true
+				_, _ = p2File.WriteString(trimmed + "\n")
+				_ = p2File.Sync()
+				mu.Unlock()
+				p2StreamSamples.Add(1)
+			}
+
+			syncP2 := func(sCtx context.Context) {
+				cCtx, cancel := context.WithTimeout(sCtx, 6*time.Second)
+				defer cancel()
+				if snapOut, snapErr := r.k8sClient.ExecInPod(cCtx, r.cfg.K8sPod, execContainer, "cat /tmp/probe-phase2.jsonl 2>/dev/null || true"); snapErr == nil && snapOut != "" {
+					for _, l := range strings.Split(snapOut, "\n") {
+						writeLine(l)
+					}
+				}
+			}
+
+			go func() {
+				ticker := time.NewTicker(5 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-p2StreamCtx.Done():
+						return
+					case <-ticker.C:
+						syncP2(p2StreamCtx)
+					}
+				}
+			}()
+
+			for p2StreamCtx.Err() == nil {
+				_ = r.k8sClient.StreamExecInPod(p2StreamCtx, r.cfg.K8sPod, execContainer, "tail -n +1 -f /tmp/probe-phase2.jsonl", writeLine)
+				if p2StreamCtx.Err() != nil {
+					break
+				}
+				syncP2(p2StreamCtx)
+				select {
+				case <-p2StreamCtx.Done():
+				case <-time.After(2 * time.Second):
+				}
+			}
+			syncP2(context.Background())
+		}()
+	} else {
+		close(p2StreamDone)
+	}
 
 	// Bắn tải duy trì ở background
 	bgCtx, bgCancel := context.WithCancel(ctx)
@@ -686,6 +782,19 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	time.Sleep(time.Duration(warmupSec) * time.Second)
 
+	// Chụp báo cáo chi tiết kết nối mạng (analyze-connections.sh bằng ss) ngay khi Pod đang chịu tải tại Knee RPS
+	connReportPath := filepath.Join(r.cfg.OutDir, fmt.Sprintf("connections_knee_%.0frps.txt", profRPS))
+	if r.cfg.K8sPod != "" {
+		fmt.Printf("\n--> [ANALYZE CONNECTIONS] Đang chụp trạng thái Socket & Queue bằng analyze-connections (tại %.1f req/s)...\n", profRPS)
+		connCmd := "if command -v analyze-connections >/dev/null 2>&1; then analyze-connections; " +
+			"elif [ -x /usr/local/bin/analyze-connections.sh ]; then /usr/local/bin/analyze-connections.sh; " +
+			"elif command -v ss >/dev/null 2>&1; then ss -s; echo ''; ss -tan; fi"
+		if connOut, connErr := r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer, connCmd); connErr == nil && strings.TrimSpace(connOut) != "" {
+			_ = os.WriteFile(connReportPath, []byte(connOut+"\n"), 0644)
+			fmt.Printf("    ✓ Đã xuất báo cáo kết nối mạng (ss): %s\n", connReportPath)
+		}
+	}
+
 	generatedSVGs := []string{}
 	for _, prof := range profilers {
 		fmt.Printf("\n--> [PROFILING: %s] Đang lấy mẫu %ds trong container '%s' (tại %.1f req/s)...\n", prof, profDuration, execContainer, profRPS)
@@ -695,7 +804,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		if r.cfg.K8sPod != "" {
 			pidResolveSnippet := fmt.Sprintf(
 				"PID=%d; if [ \"$PID\" -le 0 ]; then "+
-					"PID=$(pgrep -f 'uvicorn|gunicorn|python|fastapi' | grep -vw \"$$\" | head -n 1); "+
+					"PID=$(pgrep -f 'uvicorn|gunicorn|python|fastapi' | grep -v '/tmp/probe' | grep -vw \"$$\" | head -n 1); "+
 					"fi; "+
 					"case \"$PID\" in ''|*[!0-9]*) PID=1 ;; esac; "+
 					"echo \"Target PID=$PID\"",
@@ -746,15 +855,46 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.stopActiveLoadgen()
 	<-bgDone
 
+	if r.cfg.K8sPod != "" {
+		_, _ = r.k8sClient.ExecInPod(ctx, r.cfg.K8sPod, execContainer,
+			"pkill -INT -x probe 2>/dev/null || pkill -x probe 2>/dev/null || true")
+		if p2StreamCancel != nil {
+			p2StreamCancel()
+		}
+		<-p2StreamDone
+		if p2StreamSamples.Load() == 0 {
+			_ = r.k8sClient.CopyFromPod(ctx, r.cfg.K8sPod, execContainer, "/tmp/probe-phase2.jsonl", phase2ProbeLog)
+		}
+	}
+
 	if r.cfg.LoadgenMode == "remote" && r.loadSSH != nil {
 		remoteLog := fmt.Sprintf("%s/current-ramp.jsonl", r.cfg.LoadgenDir)
 		_ = r.loadSSH.DownloadFile(ctx, remoteLog, phase2RampLog)
+	}
+
+	var p2ProbeSummary string
+	if fileExists(phase2ProbeLog) {
+		if p2Recs, p2Err := analyzer.LoadProbe(phase2ProbeLog); p2Err == nil && len(p2Recs) > 0 {
+			p2ProbeSummary = analyzer.SummarizePhase2Probe(p2Recs)
+			if p2ProbeSummary != "" {
+				p2Block := fmt.Sprintf("\n▶ 4. GIÁM SÁT PROBE & KẾT NỐI TRONG PHA 2 PROFILING (TẠI %.1f REQ/S):\n%s", profRPS, p2ProbeSummary)
+				report.ReportText += p2Block
+				_ = os.WriteFile(reportLog, []byte(report.ReportText), 0644)
+				fmt.Print(p2Block)
+			}
+		}
 	}
 
 	fmt.Println("\n================================================================================")
 	fmt.Println("✓ HOÀN TẤT TOÀN DIỆN QUY TRÌNH 2 PHA ĐỊNH CHUẨN VÀ PROFILING!")
 	fmt.Println("================================================================================")
 	fmt.Printf("Báo cáo phân tích Sizing : %s\n", reportLog)
+	if fileExists(phase2ProbeLog) {
+		fmt.Printf("Log Probe Pha 2          : %s\n", phase2ProbeLog)
+	}
+	if fileExists(connReportPath) {
+		fmt.Printf("Báo cáo Socket (ss)      : %s\n", connReportPath)
+	}
 	if len(generatedSVGs) > 0 {
 		for _, s := range generatedSVGs {
 			fmt.Printf("  • FlameGraph SVG: %s\n", s)
@@ -764,6 +904,12 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	fmt.Println("================================================================================")
 	return nil
+}
+
+// buildProbeArgs tạo chuỗi tham số khởi chạy binary probe.
+func (r *Runner) buildProbeArgs(outFile string) string {
+	return fmt.Sprintf("-port %d -target http://127.0.0.1:%d -out %s",
+		r.cfg.TargetPort, r.cfg.TargetPort, outFile)
 }
 
 func isValidSVGFile(path string) bool {
