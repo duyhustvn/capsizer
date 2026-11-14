@@ -1095,16 +1095,48 @@ func (r *Runner) ensureLinuxBinary(name, pkgPath string) (string, error) {
 		root = "."
 	}
 	binDir := filepath.Join(root, "bin")
-	_ = os.MkdirAll(binDir, 0755)
 	outBin := filepath.Join(binDir, name+"-linux-amd64")
 
-	cmd := exec.Command("go", "build", "-ldflags=-s -w", "-o", outBin, pkgPath)
-	cmd.Dir = root
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("biên dịch %s thất bại: %w (%s)", name, err, strings.TrimSpace(string(out)))
+	// Nếu đang chạy trong thư mục có mã nguồn (go.mod) và máy có cài Go, ưu tiên biên dịch bản mới nhất
+	if fileExists(filepath.Join(root, "go.mod")) {
+		if _, err := exec.LookPath("go"); err == nil {
+			_ = os.MkdirAll(binDir, 0755)
+			cmd := exec.Command("go", "build", "-ldflags=-s -w", "-o", outBin, pkgPath)
+			cmd.Dir = root
+			cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
+			if _, err := cmd.CombinedOutput(); err == nil && fileExists(outBin) {
+				return outBin, nil
+			}
+		}
 	}
-	return outBin, nil
+
+	// Fallback khi mang sang máy khác không có source code / không cài Go:
+	// Tự động dò tìm binary tĩnh đã biên dịch sẵn trong ./bin/, cạnh file thực thi, hoặc trong $PATH (/usr/bin)
+	candidates := []string{
+		outBin,
+		filepath.Join(binDir, name),
+		filepath.Join(binDir, "capsizer-"+name),
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(exeDir, name+"-linux-amd64"),
+			filepath.Join(exeDir, name),
+			filepath.Join(exeDir, "capsizer-"+name),
+		)
+	}
+	for _, cand := range candidates {
+		if fileExists(cand) {
+			return cand, nil
+		}
+	}
+	for _, lookName := range []string{name + "-linux-amd64", "capsizer-" + name, name} {
+		if pathBin, err := exec.LookPath(lookName); err == nil {
+			return pathBin, nil
+		}
+	}
+
+	return "", fmt.Errorf("không tìm thấy binary %s đã biên dịch sẵn (và máy hiện tại không có source code go.mod để tự build)", name)
 }
 
 func (r *Runner) ensureLocalRampBinary() (string, error) {
@@ -1115,6 +1147,12 @@ func (r *Runner) ensureLocalRampBinary() (string, error) {
 	localBin := filepath.Join(root, "bin", "capsizer-ramp")
 	if fileExists(localBin) {
 		return localBin, nil
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeSibling := filepath.Join(filepath.Dir(exe), "capsizer-ramp")
+		if fileExists(exeSibling) {
+			return exeSibling, nil
+		}
 	}
 	if pathBin, err := exec.LookPath("capsizer-ramp"); err == nil {
 		return pathBin, nil

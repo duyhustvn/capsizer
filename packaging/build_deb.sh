@@ -21,23 +21,25 @@ mkdir -p "${BUILD_ROOT}/DEBIAN"
 mkdir -p "${BUILD_ROOT}/usr/bin"
 mkdir -p "${BUILD_ROOT}/etc/capsizer"
 
-echo "==> 1. Biên dịch tĩnh toàn bộ 3 binary (Go CGO_ENABLED=0)..."
+echo "==> 1. Biên dịch tĩnh toàn bộ 4 binary (Go CGO_ENABLED=0)..."
 (
   cd "$PROJECT_ROOT"
-  echo "    [1/3] Biên dịch capsizer-ramp (Open-Loop Load Engine)..."
+  echo "    [1/4] Biên dịch capsizer (2-Phase Orchestrator CLI)..."
+  CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -ldflags="-s -w" -o "${BUILD_ROOT}/usr/bin/capsizer" ./cmd/capsizer
+
+  echo "    [2/4] Biên dịch capsizer-ramp (Open-Loop Load Engine)..."
   CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -ldflags="-s -w" -o "${BUILD_ROOT}/usr/bin/capsizer-ramp" ./cmd/ramp
 
-  echo "    [2/3] Biên dịch capsizer-probe (Kernel/cgroup System Daemon)..."
+  echo "    [3/4] Biên dịch capsizer-probe (Kernel/cgroup System Daemon)..."
   CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -ldflags="-s -w" -o "${BUILD_ROOT}/usr/bin/capsizer-probe" ./cmd/probe
 
-  echo "    [3/3] Biên dịch capsizer-report (Capacity Sizing Analyzer)..."
+  echo "    [4/4] Biên dịch capsizer-report (Capacity Sizing Analyzer)..."
   CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -ldflags="-s -w" -o "${BUILD_ROOT}/usr/bin/capsizer-report" ./cmd/report
 )
 
 # Tạo alias tiện ích trong /usr/bin/
 (
   cd "${BUILD_ROOT}/usr/bin"
-  ln -sf capsizer-ramp capsizer
   ln -sf capsizer-probe probe
   ln -sf capsizer-report report
 )
